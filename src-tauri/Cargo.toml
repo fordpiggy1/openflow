@@ -1,0 +1,30 @@
+[package]
+name = "openflow"
+version = "0.1.0"
+description = "Open-source voice transcription"
+authors = ["laisyio"]
+edition = "2021"
+
+[lib]
+name = "openflow_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cpal = "0.15"
+hound = "3.5"
+reqwest = { version = "0.12", features = ["multipart", "json"] }
+tokio = { version = "1", features = ["full"] }
+arboard = "3"
+base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+rodio = { version = "0.19", default-features = false, features = ["wav"] }
