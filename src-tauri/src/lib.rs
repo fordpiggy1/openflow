@@ -1,22 +1,27 @@
 mod audio;
 mod db;
+mod plugins;
 mod transcribe;
 
 use audio::AudioRecorder;
 use db::{Database, Transcription};
+use plugins::{PluginInfo, PluginManager};
 use std::sync::Mutex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use transcribe::Provider;
 
 struct AppState {
     recorder: AudioRecorder,
     db: Database,
+    plugin_manager: PluginManager,
     recording: Mutex<bool>,
     last_transcription: Mutex<Option<String>>,
 }
 
+// Settings commands
 #[tauri::command]
 fn set_api_key(state: State<AppState>, key: String) -> Result<(), String> {
     state.db.set_setting("api_key", &key)
@@ -37,6 +42,7 @@ fn set_setting(state: State<AppState>, key: String, value: String) -> Result<(),
     state.db.set_setting(&key, &value)
 }
 
+// History commands
 #[tauri::command]
 fn get_history(state: State<AppState>, limit: Option<usize>) -> Result<Vec<Transcription>, String> {
     state.db.get_history(limit.unwrap_or(50))
@@ -47,6 +53,7 @@ fn search_history(state: State<AppState>, query: String) -> Result<Vec<Transcrip
     state.db.search_history(&query, 50)
 }
 
+// Recording commands
 #[tauri::command]
 fn start_recording(state: State<AppState>) -> Result<(), String> {
     state.recorder.start()
@@ -60,16 +67,21 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<Tra
     let api_key = state.db.get_setting("api_key")
         .ok_or("No API key set. Add your Groq API key in settings.")?;
     let language = state.db.get_setting("language");
+    let provider_str = state.db.get_setting("provider").unwrap_or_else(|| "groq".to_string());
+    let provider = Provider::from_str(&provider_str);
+    let format_enabled = state.db.get_setting("format_enabled")
+        .map(|v| v != "false")
+        .unwrap_or(true);
 
-    let raw_text = transcribe::transcribe_audio(
-        wav_bytes,
-        &api_key,
-        language.as_deref(),
-    ).await?;
+    let raw_text = transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider).await?;
 
-    let formatted = match transcribe::format_text(&raw_text, &api_key, None).await {
-        Ok(text) => text,
-        Err(_) => raw_text.clone(),
+    let formatted = if format_enabled {
+        match transcribe::format_text(&raw_text, &api_key, None, &provider, None).await {
+            Ok(text) => text,
+            Err(_) => raw_text.clone(),
+        }
+    } else {
+        raw_text.clone()
     };
 
     if let Err(e) = paste_to_clipboard(&formatted) {
@@ -81,7 +93,7 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<Tra
         id: uuid::Uuid::new_v4().to_string(),
         raw_text,
         formatted_text: Some(formatted.clone()),
-        provider: "groq".to_string(),
+        provider: provider_str,
         duration_ms: Some(duration_ms),
         context_type: None,
         window_title: None,
@@ -106,6 +118,27 @@ fn copy_last_transcription(state: State<AppState>) -> Result<(), String> {
         Some(text) => paste_to_clipboard(text),
         None => Err("No previous transcription".to_string()),
     }
+}
+
+// Plugin commands
+#[tauri::command]
+fn list_plugins(state: State<AppState>) -> Vec<PluginInfo> {
+    state.plugin_manager.list_plugins()
+}
+
+#[tauri::command]
+fn enable_plugin(state: State<AppState>, id: String) -> Result<(), String> {
+    state.plugin_manager.enable_plugin(&id)
+}
+
+#[tauri::command]
+fn disable_plugin(state: State<AppState>, id: String) -> Result<(), String> {
+    state.plugin_manager.disable_plugin(&id)
+}
+
+#[tauri::command]
+fn install_plugin(state: State<AppState>, manifest: String) -> Result<PluginInfo, String> {
+    state.plugin_manager.install_plugin(&manifest)
 }
 
 fn paste_to_clipboard(text: &str) -> Result<(), String> {
@@ -165,8 +198,13 @@ fn handle_hotkey_release(app: &AppHandle) {
         };
 
         let language = state.db.get_setting("language");
+        let provider_str = state.db.get_setting("provider").unwrap_or_else(|| "groq".to_string());
+        let provider = Provider::from_str(&provider_str);
+        let format_enabled = state.db.get_setting("format_enabled")
+            .map(|v| v != "false")
+            .unwrap_or(true);
 
-        let raw_text = match transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref()).await {
+        let raw_text = match transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider).await {
             Ok(t) => t,
             Err(e) => {
                 let _ = app_handle.emit("transcription-error", &e);
@@ -175,9 +213,13 @@ fn handle_hotkey_release(app: &AppHandle) {
             }
         };
 
-        let formatted = match transcribe::format_text(&raw_text, &api_key, None).await {
-            Ok(text) => text,
-            Err(_) => raw_text.clone(),
+        let formatted = if format_enabled {
+            match transcribe::format_text(&raw_text, &api_key, None, &provider, None).await {
+                Ok(text) => text,
+                Err(_) => raw_text.clone(),
+            }
+        } else {
+            raw_text.clone()
         };
 
         let _ = paste_to_clipboard(&formatted);
@@ -187,7 +229,7 @@ fn handle_hotkey_release(app: &AppHandle) {
             id: uuid::Uuid::new_v4().to_string(),
             raw_text,
             formatted_text: Some(formatted.clone()),
-            provider: "groq".to_string(),
+            provider: provider_str,
             duration_ms: Some(duration_ms),
             context_type: None,
             window_title: None,
@@ -253,11 +295,11 @@ pub fn run() {
             app.manage(AppState {
                 recorder: AudioRecorder::new(),
                 db,
+                plugin_manager: PluginManager::new(),
                 recording: Mutex::new(false),
                 last_transcription: Mutex::new(None),
             });
 
-            // Register hotkeys
             let record_shortcut = Shortcut::new(
                 Some(Modifiers::CONTROL | Modifiers::SHIFT),
                 Code::Space,
@@ -271,7 +313,6 @@ pub fn run() {
             app.global_shortcut().register(recopy_shortcut)
                 .unwrap_or_else(|e| eprintln!("Recopy hotkey failed: {}", e));
 
-            // System tray
             let show = MenuItemBuilder::with_id("show", "Show OpenFlow").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
@@ -287,9 +328,7 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     }
-                    "quit" => {
-                        app.exit(0);
-                    }
+                    "quit" => { app.exit(0); }
                     _ => {}
                 })
                 .build(app)?;
@@ -313,6 +352,10 @@ pub fn run() {
             start_recording,
             stop_recording_and_transcribe,
             copy_last_transcription,
+            list_plugins,
+            enable_plugin,
+            disable_plugin,
+            install_plugin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-type Screen = "onboarding" | "main" | "history" | "settings";
+type Screen = "onboarding" | "main" | "history" | "settings" | "plugins";
 type RecordingState = "idle" | "recording" | "transcribing";
 
 interface Transcription {
@@ -17,6 +17,19 @@ interface Transcription {
   created_at: string;
 }
 
+interface PluginInfo {
+  manifest: {
+    id: string;
+    name: string;
+    version: string;
+    description: string;
+    author: string | null;
+    hooks: string[];
+  };
+  enabled: boolean;
+  path: string;
+}
+
 function App() {
   const [screen, setScreen] = useState<Screen>("onboarding");
   const [apiKey, setApiKey] = useState("");
@@ -26,101 +39,55 @@ function App() {
   const [history, setHistory] = useState<Transcription[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [language, setLanguage] = useState("auto");
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [provider, setProvider] = useState("groq");
+  const [theme, setTheme] = useState<"dark" | "light">("light");
   const [formatEnabled, setFormatEnabled] = useState(true);
   const [notification, setNotification] = useState("");
+  const [plugins, setPlugins] = useState<PluginInfo[]>([]);
 
   useEffect(() => {
     invoke<string | null>("get_api_key").then((key) => {
-      if (key) {
-        setApiKey(key);
-        setScreen("main");
-      }
+      if (key) { setApiKey(key); setScreen("main"); }
     });
-    invoke<string | null>("get_setting", { key: "language" }).then((val) => {
-      if (val) setLanguage(val);
-    });
-    invoke<string | null>("get_setting", { key: "theme" }).then((val) => {
-      if (val) setTheme(val as "dark" | "light");
-    });
-    invoke<string | null>("get_setting", { key: "format_enabled" }).then((val) => {
-      if (val === "false") setFormatEnabled(false);
-    });
+    invoke<string | null>("get_setting", { key: "language" }).then((v) => { if (v) setLanguage(v); });
+    invoke<string | null>("get_setting", { key: "provider" }).then((v) => { if (v) setProvider(v); });
+    invoke<string | null>("get_setting", { key: "theme" }).then((v) => { if (v) setTheme(v as "dark" | "light"); });
+    invoke<string | null>("get_setting", { key: "format_enabled" }).then((v) => { if (v === "false") setFormatEnabled(false); });
     loadHistory();
   }, []);
 
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-  }, [theme]);
+  useEffect(() => { document.documentElement.setAttribute("data-theme", theme); }, [theme]);
 
   useEffect(() => {
-    const unlisten1 = listen<string>("recording-state", (event) => {
-      setStatus(event.payload as RecordingState);
-    });
-    const unlisten2 = listen<Transcription>("transcription-result", (event) => {
-      const t = event.payload;
+    const u1 = listen<string>("recording-state", (e) => setStatus(e.payload as RecordingState));
+    const u2 = listen<Transcription>("transcription-result", (e) => {
+      const t = e.payload;
       setLastTranscription(t.formatted_text || t.raw_text);
       setHistory((prev) => [t, ...prev].slice(0, 50));
       setError("");
     });
-    const unlisten3 = listen<string>("transcription-error", (event) => {
-      setError(event.payload);
-    });
-    const unlisten4 = listen<string>("recopy-success", (event) => {
-      showNotification(event.payload);
-    });
-
-    return () => {
-      unlisten1.then((f) => f());
-      unlisten2.then((f) => f());
-      unlisten3.then((f) => f());
-      unlisten4.then((f) => f());
-    };
+    const u3 = listen<string>("transcription-error", (e) => setError(e.payload));
+    const u4 = listen<string>("recopy-success", (e) => showNotification(e.payload));
+    return () => { u1.then(f => f()); u2.then(f => f()); u3.then(f => f()); u4.then(f => f()); };
   }, []);
 
-  const showNotification = (msg: string) => {
-    setNotification(msg);
-    setTimeout(() => setNotification(""), 2000);
-  };
-
-  const loadHistory = async () => {
-    try {
-      const h = await invoke<Transcription[]>("get_history", { limit: 50 });
-      setHistory(h);
-    } catch {}
-  };
+  const showNotification = (msg: string) => { setNotification(msg); setTimeout(() => setNotification(""), 2000); };
+  const loadHistory = async () => { try { setHistory(await invoke<Transcription[]>("get_history", { limit: 50 })); } catch {} };
+  const loadPlugins = async () => { try { setPlugins(await invoke<PluginInfo[]>("list_plugins")); } catch {} };
 
   const handleSearch = async () => {
-    if (!searchQuery.trim()) {
-      loadHistory();
-      return;
-    }
-    try {
-      const h = await invoke<Transcription[]>("search_history", { query: searchQuery });
-      setHistory(h);
-    } catch {}
+    if (!searchQuery.trim()) { loadHistory(); return; }
+    try { setHistory(await invoke<Transcription[]>("search_history", { query: searchQuery })); } catch {}
   };
 
   const handleSaveKey = async () => {
     if (!apiKey.trim()) return;
-    try {
-      await invoke("set_api_key", { key: apiKey.trim() });
-      setScreen("main");
-      setError("");
-    } catch (e) {
-      setError(String(e));
-    }
+    try { await invoke("set_api_key", { key: apiKey.trim() }); setScreen("main"); setError(""); } catch (e) { setError(String(e)); }
   };
 
   const handleStartRecording = async () => {
-    setError("");
-    setStatus("recording");
-    try {
-      await invoke("start_recording");
-    } catch (e) {
-      setError(String(e));
-      setStatus("idle");
-    }
+    setError(""); setStatus("recording");
+    try { await invoke("start_recording"); } catch (e) { setError(String(e)); setStatus("idle"); }
   };
 
   const handleStopRecording = async () => {
@@ -129,49 +96,38 @@ function App() {
       const result = await invoke<Transcription>("stop_recording_and_transcribe");
       setLastTranscription(result.formatted_text || result.raw_text);
       setHistory((prev) => [result, ...prev].slice(0, 50));
-      setStatus("idle");
-      setError("");
-    } catch (e) {
-      setError(String(e));
-      setStatus("idle");
-    }
+      setStatus("idle"); setError("");
+    } catch (e) { setError(String(e)); setStatus("idle"); }
   };
 
-  const handleLanguageChange = async (lang: string) => {
-    setLanguage(lang);
-    const value = lang === "auto" ? "" : lang;
-    await invoke("set_setting", { key: "language", value });
-  };
+  const saveSetting = async (key: string, value: string) => { await invoke("set_setting", { key, value }); };
 
-  const handleThemeToggle = async () => {
-    const newTheme = theme === "dark" ? "light" : "dark";
-    setTheme(newTheme);
-    await invoke("set_setting", { key: "theme", value: newTheme });
-  };
-
-  const handleFormatToggle = async () => {
-    const newVal = !formatEnabled;
-    setFormatEnabled(newVal);
-    await invoke("set_setting", { key: "format_enabled", value: String(newVal) });
-  };
-
-  // Onboarding
+  // ONBOARDING
   if (screen === "onboarding") {
     return (
       <main className="container">
         <h1>OpenFlow</h1>
         <p className="subtitle">Open-source voice transcription</p>
         <div className="onboarding">
-          <p>Enter your Groq API key to get started.</p>
+          <p>Enter your API key to get started.</p>
+          <div className="provider-select">
+            <label className="label">Provider</label>
+            <select value={provider} onChange={(e) => { setProvider(e.target.value); saveSetting("provider", e.target.value); }}>
+              <option value="groq">Groq (recommended)</option>
+              <option value="openai">OpenAI</option>
+              <option value="deepgram">Deepgram</option>
+            </select>
+          </div>
           <p className="hint">
-            Get one free at{" "}
-            <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a>
+            {provider === "groq" && <>Get a free key at <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a></>}
+            {provider === "openai" && <>Get a key at <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com</a></>}
+            {provider === "deepgram" && <>Get a key at <a href="https://console.deepgram.com" target="_blank">console.deepgram.com</a></>}
           </p>
           <input
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            placeholder="gsk_..."
+            placeholder={provider === "groq" ? "gsk_..." : provider === "openai" ? "sk-..." : "..."}
             onKeyDown={(e) => e.key === "Enter" && handleSaveKey()}
           />
           <button onClick={handleSaveKey} disabled={!apiKey.trim()}>Save & Continue</button>
@@ -181,7 +137,7 @@ function App() {
     );
   }
 
-  // History
+  // HISTORY
   if (screen === "history") {
     return (
       <main className="container history-screen">
@@ -191,29 +147,17 @@ function App() {
           <div />
         </div>
         <div className="search-row">
-          <input
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search transcriptions..."
-            onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-          />
+          <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search transcriptions..." onKeyDown={(e) => e.key === "Enter" && handleSearch()} />
         </div>
         <div className="history-list">
           {history.length === 0 && <p className="empty">No transcriptions yet</p>}
           {history.map((item) => (
-            <div
-              key={item.id}
-              className="history-card"
-              onClick={() => {
-                const text = item.formatted_text || item.raw_text;
-                navigator.clipboard.writeText(text);
-                showNotification("Copied!");
-              }}
-            >
+            <div key={item.id} className="history-card" onClick={() => { navigator.clipboard.writeText(item.formatted_text || item.raw_text); showNotification("Copied!"); }}>
               <p className="history-card-text">{item.formatted_text || item.raw_text}</p>
               <div className="history-card-meta">
                 <span>{new Date(item.created_at).toLocaleString()}</span>
                 {item.duration_ms && <span>{(item.duration_ms / 1000).toFixed(1)}s</span>}
+                <span>{item.provider}</span>
                 {item.language && <span>{item.language}</span>}
               </div>
             </div>
@@ -223,7 +167,45 @@ function App() {
     );
   }
 
-  // Settings
+  // PLUGINS
+  if (screen === "plugins") {
+    return (
+      <main className="container settings-screen">
+        <div className="nav-row">
+          <button className="nav-btn" onClick={() => setScreen("settings")}>Back</button>
+          <h2>Plugins</h2>
+          <div />
+        </div>
+        <div className="settings-list">
+          {plugins.length === 0 && (
+            <div className="empty">
+              <p>No plugins installed</p>
+              <p className="hint" style={{ marginTop: 8 }}>
+                Plugins live in <code>~/.openflow/plugins/</code>. Each plugin is a folder with a <code>manifest.json</code>.
+              </p>
+            </div>
+          )}
+          {plugins.map((p) => (
+            <div key={p.manifest.id} className="setting-item">
+              <div>
+                <label>{p.manifest.name} <span className="setting-value">{p.manifest.version}</span></label>
+                <p className="hint" style={{ textAlign: "left", marginTop: 4 }}>{p.manifest.description}</p>
+              </div>
+              <button className="toggle-btn" onClick={async () => {
+                if (p.enabled) { await invoke("disable_plugin", { id: p.manifest.id }); }
+                else { await invoke("enable_plugin", { id: p.manifest.id }); }
+                loadPlugins();
+              }}>
+                {p.enabled ? "Enabled" : "Disabled"}
+              </button>
+            </div>
+          ))}
+        </div>
+      </main>
+    );
+  }
+
+  // SETTINGS
   if (screen === "settings") {
     return (
       <main className="container settings-screen">
@@ -234,17 +216,20 @@ function App() {
         </div>
         <div className="settings-list">
           <div className="setting-item">
+            <label>Provider</label>
+            <select value={provider} onChange={(e) => { setProvider(e.target.value); saveSetting("provider", e.target.value); }}>
+              <option value="groq">Groq</option>
+              <option value="openai">OpenAI</option>
+              <option value="deepgram">Deepgram</option>
+            </select>
+          </div>
+          <div className="setting-item">
             <label>API Key</label>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              onBlur={() => apiKey && invoke("set_api_key", { key: apiKey })}
-            />
+            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} onBlur={() => apiKey && invoke("set_api_key", { key: apiKey })} />
           </div>
           <div className="setting-item">
             <label>Language</label>
-            <select value={language} onChange={(e) => handleLanguageChange(e.target.value)}>
+            <select value={language} onChange={(e) => { setLanguage(e.target.value); saveSetting("language", e.target.value === "auto" ? "" : e.target.value); }}>
               <option value="auto">Auto-detect</option>
               <option value="en">English</option>
               <option value="es">Spanish</option>
@@ -263,13 +248,13 @@ function App() {
           </div>
           <div className="setting-item">
             <label>LLM Formatting</label>
-            <button className="toggle-btn" onClick={handleFormatToggle}>
+            <button className="toggle-btn" onClick={() => { const v = !formatEnabled; setFormatEnabled(v); saveSetting("format_enabled", String(v)); }}>
               {formatEnabled ? "On" : "Off"}
             </button>
           </div>
           <div className="setting-item">
             <label>Theme</label>
-            <button className="toggle-btn" onClick={handleThemeToggle}>
+            <button className="toggle-btn" onClick={() => { const t = theme === "dark" ? "light" : "dark"; setTheme(t); saveSetting("theme", t); }}>
               {theme === "dark" ? "Dark" : "Light"}
             </button>
           </div>
@@ -281,18 +266,22 @@ function App() {
             <label>Re-copy Hotkey</label>
             <span className="setting-value">Ctrl+Shift+V</span>
           </div>
+          <div className="setting-item">
+            <label>Plugins</label>
+            <button className="nav-btn" onClick={() => { loadPlugins(); setScreen("plugins"); }}>Manage</button>
+          </div>
         </div>
       </main>
     );
   }
 
-  // Main
+  // MAIN
   return (
     <main className="container">
       {notification && <div className="toast">{notification}</div>}
 
       <div className="top-row">
-        <button className="icon-btn" onClick={() => setScreen("history")}>
+        <button className="icon-btn" onClick={() => { loadHistory(); setScreen("history"); }}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
           </svg>
