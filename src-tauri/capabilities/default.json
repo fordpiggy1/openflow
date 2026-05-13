@@ -5,6 +5,12 @@
   "permissions": [
     "core:default",
     "core:window:default",
+    "core:window:allow-set-position",
+    "core:window:allow-set-size",
+    "core:window:allow-outer-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-current-monitor",
+    "core:window:allow-primary-monitor",
     "core:event:default",
     "shell:allow-open",
     "global-shortcut:default"

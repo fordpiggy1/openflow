@@ -124,6 +124,10 @@
       let isDragging = false;
       let dragStartX, dragStartY;
 
+      // Screen dimensions (set once, used for snap calculations)
+      const sw = window.screen.width;
+      const sh = window.screen.height;
+
       const POSITIONS = {
         'top-left':      { x: 0, y: 0 },
         'top-center':    { x: 0.5, y: 0 },
@@ -136,65 +140,70 @@
       };
 
       async function init() {
-        const { listen } = await import('https://unpkg.com/@tauri-apps/api@2/event');
-        const { getCurrentWindow } = await import('https://unpkg.com/@tauri-apps/api@2/window');
-        const { invoke } = await import('https://unpkg.com/@tauri-apps/api@2/core');
+        const tauriEvent = await import('/node_modules/@tauri-apps/api/event.js').catch(() =>
+          import('https://unpkg.com/@tauri-apps/api@2/event')
+        );
+        const tauriWindow = await import('/node_modules/@tauri-apps/api/window.js').catch(() =>
+          import('https://unpkg.com/@tauri-apps/api@2/window')
+        );
+        const tauriCore = await import('/node_modules/@tauri-apps/api/core.js').catch(() =>
+          import('https://unpkg.com/@tauri-apps/api@2/core')
+        );
 
+        const { listen } = tauriEvent;
+        const { getCurrentWindow } = tauriWindow;
+        const { invoke } = tauriCore;
         const win = getCurrentWindow();
 
         try {
           const saved = await invoke('get_setting', { key: 'overlay_position' });
-          if (saved && POSITIONS[saved]) {
-            position = saved;
-          }
+          if (saved && POSITIONS[saved]) position = saved;
         } catch {}
 
         overlay.setAttribute('data-pos', position);
-        await snapToPosition(win, position);
+        snapToPosition(win, position, 28);
 
-        listen('recording-state', async (event) => {
+        listen('recording-state', (event) => {
           const status = event.payload;
           overlay.setAttribute('data-status', status);
-
-          const isExpanded = status === 'recording' || status === 'transcribing';
-          const w = isExpanded ? 110 : 28;
-          await win.setSize({ type: 'Logical', width: w, height: 28 });
-          await snapToPosition(win, position);
+          const w = (status === 'recording' || status === 'transcribing') ? 110 : 28;
+          win.setSize({ type: 'Logical', width: w, height: 28 });
+          snapToPosition(win, position, w);
         });
 
-        // Drag handling
+        // Drag via data-tauri-drag-region doesn't work for positioning logic,
+        // so we handle drag manually with mousedown/move/up
+        let winX = 0, winY = 0;
+
         overlay.addEventListener('mousedown', (e) => {
           isDragging = true;
           dragStartX = e.screenX;
           dragStartY = e.screenY;
+          // Get current position from snap calculation
+          const coords = POSITIONS[position];
+          const curW = overlay.getAttribute('data-status') !== 'idle' ? 110 : 28;
+          winX = Math.round(coords.x * (sw - curW));
+          winY = Math.round(coords.y * (sh - 28));
           overlay.style.cursor = 'grabbing';
         });
 
-        document.addEventListener('mousemove', async (e) => {
+        document.addEventListener('mousemove', (e) => {
           if (!isDragging) return;
-          const dx = e.screenX - dragStartX;
-          const dy = e.screenY - dragStartY;
-          if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
-            const pos = await win.outerPosition();
-            await win.setPosition({ type: 'Logical', x: pos.x + dx, y: pos.y + dy });
-            dragStartX = e.screenX;
-            dragStartY = e.screenY;
-          }
+          winX += e.screenX - dragStartX;
+          winY += e.screenY - dragStartY;
+          dragStartX = e.screenX;
+          dragStartY = e.screenY;
+          win.setPosition({ type: 'Logical', x: winX, y: winY });
         });
 
-        document.addEventListener('mouseup', async () => {
+        document.addEventListener('mouseup', () => {
           if (!isDragging) return;
           isDragging = false;
           overlay.style.cursor = 'grab';
 
-          const pos = await win.outerPosition();
-          const monitor = await win.currentMonitor();
-          if (!monitor) return;
-
-          const sw = monitor.size.width / monitor.scaleFactor;
-          const sh = monitor.size.height / monitor.scaleFactor;
-          const px = pos.x / sw;
-          const py = pos.y / sh;
+          const curW = overlay.getAttribute('data-status') !== 'idle' ? 110 : 28;
+          const px = winX / (sw - curW);
+          const py = winY / (sh - 28);
 
           let nearest = 'left-center';
           let minDist = Infinity;
@@ -205,27 +214,16 @@
 
           position = nearest;
           overlay.setAttribute('data-pos', position);
-          await snapToPosition(win, position);
-
-          try { await invoke('set_setting', { key: 'overlay_position', value: position }); } catch {}
+          snapToPosition(win, position, curW);
+          invoke('set_setting', { key: 'overlay_position', value: position }).catch(() => {});
         });
       }
 
-      async function snapToPosition(win, pos) {
-        const monitor = await win.currentMonitor();
-        if (!monitor) return;
-
-        const sw = monitor.size.width / monitor.scaleFactor;
-        const sh = monitor.size.height / monitor.scaleFactor;
-        const size = await win.outerSize();
-        const w = size.width / monitor.scaleFactor;
-        const h = size.height / monitor.scaleFactor;
-
+      function snapToPosition(win, pos, w) {
         const coords = POSITIONS[pos];
-        let x = coords.x * (sw - w);
-        let y = coords.y * (sh - h);
-
-        await win.setPosition({ type: 'Logical', x: Math.round(x), y: Math.round(y) });
+        const x = Math.round(coords.x * (sw - w));
+        const y = Math.round(coords.y * (sh - 28));
+        win.setPosition({ type: 'Logical', x, y });
       }
 
       init();
