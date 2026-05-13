@@ -45,7 +45,7 @@
 
       /* Recording */
       .overlay[data-status="recording"] {
-        width: 120px;
+        width: 82px;
         justify-content: flex-start;
         border-color: rgba(239, 68, 68, 0.5);
         box-shadow: 0 0 16px rgba(239, 68, 68, 0.2);
@@ -53,7 +53,7 @@
 
       /* Transcribing */
       .overlay[data-status="transcribing"] {
-        width: 88px;
+        width: 72px;
         justify-content: flex-start;
         border-color: rgba(123, 163, 201, 0.4);
         box-shadow: 0 0 16px rgba(123, 163, 201, 0.15);
@@ -202,7 +202,7 @@
         listen('recording-state', (event) => {
           const status = event.payload;
           overlay.setAttribute('data-status', status);
-          const w = status === 'recording' ? 120 : status === 'transcribing' ? 88 : 28;
+          const w = status === 'recording' ? 82 : status === 'transcribing' ? 72 : 28;
           win.setSize({ type: 'Logical', width: w, height: 28 });
           snapToPosition(win, position, w);
         });
@@ -254,7 +254,7 @@
 
       function getWidth() {
         const s = overlay.getAttribute('data-status');
-        return s === 'recording' ? 120 : s === 'transcribing' ? 88 : 28;
+        return s === 'recording' ? 82 : s === 'transcribing' ? 72 : 28;
       }
 
       function snapToPosition(win, pos, w) {

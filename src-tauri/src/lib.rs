@@ -211,10 +211,11 @@ fn paste_to_clipboard(text: &str) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn simulate_paste() {
     use std::process::Command;
+    std::thread::sleep(std::time::Duration::from_millis(150));
     let _ = Command::new("osascript")
         .arg("-e")
         .arg("tell application \"System Events\" to keystroke \"v\" using command down")
-        .output();
+        .spawn();
 }
 
 #[cfg(target_os = "windows")]
