@@ -203,7 +203,34 @@ fn paste_to_clipboard(text: &str) -> Result<(), String> {
     use arboard::Clipboard;
     let mut clipboard = Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
     clipboard.set_text(text).map_err(|e| format!("Clipboard set failed: {}", e))?;
+
+    simulate_paste();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn simulate_paste() {
+    use std::process::Command;
+    let _ = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to keystroke \"v\" using command down")
+        .output();
+}
+
+#[cfg(target_os = "windows")]
+fn simulate_paste() {
+    use std::process::Command;
+    let _ = Command::new("powershell")
+        .arg("-Command")
+        .arg("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')")
+        .output();
+}
+
+#[cfg(target_os = "linux")]
+fn simulate_paste() {
+    use std::process::Command;
+    let _ = Command::new("xdotool").arg("key").arg("ctrl+v").output()
+        .or_else(|_| Command::new("ydotool").arg("key").arg("29:1").arg("47:1").arg("47:0").arg("29:0").output());
 }
 
 // ── Shortcut parsing ──────────────────────────────────────

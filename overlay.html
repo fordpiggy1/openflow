@@ -6,170 +6,229 @@
     <title>OpenFlow Overlay</title>
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      html, body { background: transparent; overflow: hidden; user-select: none; }
+      html, body { background: transparent; overflow: hidden; user-select: none; -webkit-user-select: none; }
 
       .overlay {
-        width: 44px;
-        height: 44px;
-        border-radius: 12px;
-        background: rgba(26, 19, 50, 0.85);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
+        width: 28px;
+        height: 28px;
+        background: rgba(26, 19, 50, 0.88);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
         display: flex;
         align-items: center;
         justify-content: center;
         cursor: grab;
-        transition: width 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
-        border: 1.5px solid rgba(255,255,255,0.08);
-        position: relative;
+        transition: width 0.2s ease, height 0.2s ease, border-radius 0.2s ease,
+                    border-color 0.2s ease, box-shadow 0.2s ease;
+        border: 1px solid rgba(255,255,255,0.06);
+        position: absolute;
+        top: 0;
+        left: 0;
         overflow: hidden;
+        gap: 6px;
       }
 
       .overlay:active { cursor: grabbing; }
 
+      /* Position-based border-radius */
+      .overlay[data-pos="top-left"]     { border-radius: 0 0 10px 0; }
+      .overlay[data-pos="top-center"]   { border-radius: 0 0 10px 10px; }
+      .overlay[data-pos="top-right"]    { border-radius: 0 0 0 10px; }
+      .overlay[data-pos="left-center"]  { border-radius: 0 10px 10px 0; }
+      .overlay[data-pos="right-center"] { border-radius: 10px 0 0 10px; }
+      .overlay[data-pos="bottom-left"]  { border-radius: 0 10px 0 0; }
+      .overlay[data-pos="bottom-center"]{ border-radius: 10px 10px 0 0; }
+      .overlay[data-pos="bottom-right"] { border-radius: 10px 0 0 0; }
+
+      /* Recording state */
       .overlay[data-status="recording"] {
-        width: 140px;
-        border-color: rgba(239, 68, 68, 0.5);
-        box-shadow: 0 0 20px rgba(239, 68, 68, 0.2);
+        width: 110px;
+        border-color: rgba(239, 68, 68, 0.4);
+        box-shadow: 0 0 12px rgba(239, 68, 68, 0.15);
       }
 
       .overlay[data-status="transcribing"] {
-        width: 140px;
-        border-color: rgba(61, 90, 128, 0.5);
-        box-shadow: 0 0 20px rgba(61, 90, 128, 0.2);
+        width: 90px;
+        border-color: rgba(61, 90, 128, 0.4);
+        box-shadow: 0 0 12px rgba(61, 90, 128, 0.15);
       }
 
       .logo {
-        width: 24px;
-        height: 24px;
-        fill: #e8eaed;
+        width: 16px;
+        height: 16px;
+        fill: rgba(255,255,255,0.7);
         flex-shrink: 0;
       }
 
       .overlay[data-status="recording"] .logo,
       .overlay[data-status="transcribing"] .logo {
-        width: 18px;
-        height: 18px;
+        width: 14px;
+        height: 14px;
       }
 
+      /* Waveform */
       .waveform {
         display: none;
-        flex: 1;
-        height: 24px;
-        margin-left: 8px;
-        gap: 2px;
+        gap: 1.5px;
         align-items: center;
+        height: 16px;
       }
 
-      .overlay[data-status="recording"] .waveform {
-        display: flex;
-      }
+      .overlay[data-status="recording"] .waveform { display: flex; }
 
       .wave-bar {
-        width: 3px;
+        width: 2px;
         background: #ef4444;
-        border-radius: 2px;
-        animation: wave 0.6s ease-in-out infinite alternate;
+        border-radius: 1px;
+        animation: wave 0.5s ease-in-out infinite alternate;
       }
-
       .wave-bar:nth-child(1) { animation-delay: 0s; }
-      .wave-bar:nth-child(2) { animation-delay: 0.1s; }
-      .wave-bar:nth-child(3) { animation-delay: 0.2s; }
-      .wave-bar:nth-child(4) { animation-delay: 0.15s; }
-      .wave-bar:nth-child(5) { animation-delay: 0.05s; }
-      .wave-bar:nth-child(6) { animation-delay: 0.25s; }
-      .wave-bar:nth-child(7) { animation-delay: 0.12s; }
-      .wave-bar:nth-child(8) { animation-delay: 0.18s; }
+      .wave-bar:nth-child(2) { animation-delay: 0.08s; }
+      .wave-bar:nth-child(3) { animation-delay: 0.16s; }
+      .wave-bar:nth-child(4) { animation-delay: 0.12s; }
+      .wave-bar:nth-child(5) { animation-delay: 0.04s; }
+      .wave-bar:nth-child(6) { animation-delay: 0.2s; }
 
-      @keyframes wave {
-        from { height: 4px; }
-        to { height: 20px; }
+      @keyframes wave { from { height: 3px; } to { height: 14px; } }
+
+      /* Transcribing dots */
+      .dots { display: none; gap: 2px; align-items: center; }
+      .overlay[data-status="transcribing"] .dots { display: flex; }
+      .overlay[data-status="transcribing"] .waveform { display: none; }
+
+      .dots span {
+        width: 4px; height: 4px; background: #7BA3C9;
+        border-radius: 50%; animation: pulse 0.8s ease-in-out infinite;
       }
+      .dots span:nth-child(2) { animation-delay: 0.12s; }
+      .dots span:nth-child(3) { animation-delay: 0.24s; }
 
-      .status-text {
-        display: none;
-        font-family: -apple-system, system-ui, sans-serif;
-        font-size: 10px;
-        font-weight: 600;
-        color: rgba(255,255,255,0.6);
-        margin-left: 6px;
-        white-space: nowrap;
-        flex-shrink: 0;
-      }
-
-      .overlay[data-status="transcribing"] .status-text {
-        display: block;
-      }
-
-      .overlay[data-status="transcribing"] .waveform {
-        display: none;
-      }
-
-      .dot-pulse {
-        display: none;
-      }
-
-      .overlay[data-status="transcribing"] .dot-pulse {
-        display: flex;
-        gap: 3px;
-        margin-left: 8px;
-      }
-
-      .dot-pulse span {
-        width: 5px;
-        height: 5px;
-        background: #7BA3C9;
-        border-radius: 50%;
-        animation: pulse 1s ease-in-out infinite;
-      }
-
-      .dot-pulse span:nth-child(2) { animation-delay: 0.15s; }
-      .dot-pulse span:nth-child(3) { animation-delay: 0.3s; }
-
-      @keyframes pulse {
-        0%, 100% { opacity: 0.3; }
-        50% { opacity: 1; }
-      }
+      @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
     </style>
   </head>
   <body>
-    <div class="overlay" id="overlay" data-status="idle" data-tauri-drag-region>
+    <div class="overlay" id="overlay" data-status="idle" data-pos="left-center">
       <svg class="logo" viewBox="0 0 24 24">
         <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2H3v2a9 9 0 0 0 8 8.94V23h2v-2.06A9 9 0 0 0 21 12v-2h-2z"/>
       </svg>
       <div class="waveform">
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
+        <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
+        <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
       </div>
-      <div class="dot-pulse">
-        <span></span><span></span><span></span>
-      </div>
-      <span class="status-text">Transcribing</span>
+      <div class="dots"><span></span><span></span><span></span></div>
     </div>
 
     <script type="module">
-      const { listen } = await import('https://unpkg.com/@tauri-apps/api@2/event');
-      const { getCurrentWindow } = await import('https://unpkg.com/@tauri-apps/api@2/window');
-
       const overlay = document.getElementById('overlay');
-      const win = getCurrentWindow();
+      let position = 'left-center';
+      let isDragging = false;
+      let dragStartX, dragStartY;
 
-      listen('recording-state', (event) => {
-        const status = event.payload;
-        overlay.setAttribute('data-status', status);
+      const POSITIONS = {
+        'top-left':      { x: 0, y: 0 },
+        'top-center':    { x: 0.5, y: 0 },
+        'top-right':     { x: 1, y: 0 },
+        'left-center':   { x: 0, y: 0.5 },
+        'right-center':  { x: 1, y: 0.5 },
+        'bottom-left':   { x: 0, y: 1 },
+        'bottom-center': { x: 0.5, y: 1 },
+        'bottom-right':  { x: 1, y: 1 },
+      };
 
-        if (status === 'recording' || status === 'transcribing') {
-          win.setSize({ type: 'Logical', width: 148, height: 48 });
-        } else {
-          win.setSize({ type: 'Logical', width: 48, height: 48 });
-        }
-      });
+      async function init() {
+        const { listen } = await import('https://unpkg.com/@tauri-apps/api@2/event');
+        const { getCurrentWindow } = await import('https://unpkg.com/@tauri-apps/api@2/window');
+        const { invoke } = await import('https://unpkg.com/@tauri-apps/api@2/core');
+
+        const win = getCurrentWindow();
+
+        try {
+          const saved = await invoke('get_setting', { key: 'overlay_position' });
+          if (saved && POSITIONS[saved]) {
+            position = saved;
+          }
+        } catch {}
+
+        overlay.setAttribute('data-pos', position);
+        await snapToPosition(win, position);
+
+        listen('recording-state', async (event) => {
+          const status = event.payload;
+          overlay.setAttribute('data-status', status);
+
+          const isExpanded = status === 'recording' || status === 'transcribing';
+          const w = isExpanded ? 110 : 28;
+          await win.setSize({ type: 'Logical', width: w, height: 28 });
+          await snapToPosition(win, position);
+        });
+
+        // Drag handling
+        overlay.addEventListener('mousedown', (e) => {
+          isDragging = true;
+          dragStartX = e.screenX;
+          dragStartY = e.screenY;
+          overlay.style.cursor = 'grabbing';
+        });
+
+        document.addEventListener('mousemove', async (e) => {
+          if (!isDragging) return;
+          const dx = e.screenX - dragStartX;
+          const dy = e.screenY - dragStartY;
+          if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+            const pos = await win.outerPosition();
+            await win.setPosition({ type: 'Logical', x: pos.x + dx, y: pos.y + dy });
+            dragStartX = e.screenX;
+            dragStartY = e.screenY;
+          }
+        });
+
+        document.addEventListener('mouseup', async () => {
+          if (!isDragging) return;
+          isDragging = false;
+          overlay.style.cursor = 'grab';
+
+          const pos = await win.outerPosition();
+          const monitor = await win.currentMonitor();
+          if (!monitor) return;
+
+          const sw = monitor.size.width / monitor.scaleFactor;
+          const sh = monitor.size.height / monitor.scaleFactor;
+          const px = pos.x / sw;
+          const py = pos.y / sh;
+
+          let nearest = 'left-center';
+          let minDist = Infinity;
+          for (const [name, coords] of Object.entries(POSITIONS)) {
+            const dist = Math.hypot(px - coords.x, py - coords.y);
+            if (dist < minDist) { minDist = dist; nearest = name; }
+          }
+
+          position = nearest;
+          overlay.setAttribute('data-pos', position);
+          await snapToPosition(win, position);
+
+          try { await invoke('set_setting', { key: 'overlay_position', value: position }); } catch {}
+        });
+      }
+
+      async function snapToPosition(win, pos) {
+        const monitor = await win.currentMonitor();
+        if (!monitor) return;
+
+        const sw = monitor.size.width / monitor.scaleFactor;
+        const sh = monitor.size.height / monitor.scaleFactor;
+        const size = await win.outerSize();
+        const w = size.width / monitor.scaleFactor;
+        const h = size.height / monitor.scaleFactor;
+
+        const coords = POSITIONS[pos];
+        let x = coords.x * (sw - w);
+        let y = coords.y * (sh - h);
+
+        await win.setPosition({ type: 'Logical', x: Math.round(x), y: Math.round(y) });
+      }
+
+      init();
     </script>
   </body>
 </html>
