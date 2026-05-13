@@ -180,6 +180,7 @@ function App() {
   if (screen === "onboarding") {
     return (
       <main className="container">
+        <img src="/laisy-blue.png" alt="OpenFlow" style={{ width: 48, height: 48 }} />
         <h1>OpenFlow</h1>
         <p className="subtitle">Open-source voice transcription</p>
 
@@ -544,7 +545,7 @@ function App() {
         <button className="icon-btn" onClick={() => { loadHistory(); setScreen("history"); }}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         </button>
-        <h1>OpenFlow</h1>
+        <img src="/logo-mono-24.png" alt="OpenFlow" className="topbar-logo" />
         <button className="icon-btn" onClick={() => setScreen("settings")}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2m-9-11h2m18 0h2m-4.2-5.8l-1.4 1.4M5.6 18.4l-1.4 1.4m0-13.8l1.4 1.4m12.8 12.8l1.4 1.4"/></svg>
         </button>
