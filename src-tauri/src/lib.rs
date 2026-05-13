@@ -210,26 +210,89 @@ fn paste_to_clipboard(text: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn simulate_paste() {
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // Use CoreGraphics to simulate Cmd+V (doesn't require osascript)
-    use std::process::Command;
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+    }
 
-    // First check/request accessibility permission
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg(r#"
-            use framework "AppKit"
-            set opts to {(current application's NSDictionary's dictionaryWithObject:true forKey:"AXTrustedCheckOptionPrompt")}
-            set trusted to current application's AXIsProcessTrustedWithOptions(opts)
-        "#)
-        .output();
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFDictionaryCreate(
+            allocator: *const std::ffi::c_void,
+            keys: *const *const std::ffi::c_void,
+            values: *const *const std::ffi::c_void,
+            num_values: isize,
+            key_callbacks: *const std::ffi::c_void,
+            value_callbacks: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFRelease(cf: *const std::ffi::c_void);
+        static kCFBooleanTrue: *const std::ffi::c_void;
+        static kCFTypeDictionaryKeyCallBacks: std::ffi::c_void;
+        static kCFTypeDictionaryValueCallBacks: std::ffi::c_void;
+    }
 
-    // Then simulate the paste
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to keystroke \"v\" using command down")
-        .spawn();
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const std::ffi::c_void,
+            virtual_key: u16,
+            key_down: bool,
+        ) -> *const std::ffi::c_void;
+        fn CGEventSetFlags(event: *const std::ffi::c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *const std::ffi::c_void);
+    }
+
+    unsafe {
+        // Request accessibility permission with prompt
+        let key_str = b"AXTrustedCheckOptionPrompt\0".as_ptr() as *const std::ffi::c_void;
+
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFStringCreateWithCString(
+                alloc: *const std::ffi::c_void,
+                c_str: *const u8,
+                encoding: u32,
+            ) -> *const std::ffi::c_void;
+        }
+
+        let cf_key = CFStringCreateWithCString(std::ptr::null(), key_str as *const u8, 0x08000100);
+        let keys = [cf_key];
+        let values = [kCFBooleanTrue];
+        let opts = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks as *const _ as *const std::ffi::c_void,
+            &kCFTypeDictionaryValueCallBacks as *const _ as *const std::ffi::c_void,
+        );
+
+        let trusted = AXIsProcessTrustedWithOptions(opts);
+        CFRelease(opts);
+        CFRelease(cf_key);
+
+        if !trusted {
+            eprintln!("Accessibility permission not granted. Please enable in System Settings.");
+            return;
+        }
+
+        // Simulate Cmd+V using CoreGraphics
+        let v_keycode: u16 = 9; // kVK_ANSI_V
+        let cmd_flag: u64 = 0x100000; // kCGEventFlagMaskCommand
+
+        let key_down = CGEventCreateKeyboardEvent(std::ptr::null(), v_keycode, true);
+        CGEventSetFlags(key_down, cmd_flag);
+        CGEventPost(0, key_down); // kCGHIDEventTap = 0
+
+        let key_up = CGEventCreateKeyboardEvent(std::ptr::null(), v_keycode, false);
+        CGEventSetFlags(key_up, cmd_flag);
+        CGEventPost(0, key_up);
+
+        CFRelease(key_down);
+        CFRelease(key_up);
+    }
 }
 
 #[cfg(target_os = "windows")]

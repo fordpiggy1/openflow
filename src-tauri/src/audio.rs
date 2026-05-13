@@ -131,7 +131,7 @@ impl AudioRecorder {
                         }
 
                         let rms = rms_volume(&samples_data);
-                        if rms < 0.005 {
+                        if rms < 0.0005 {
                             let _ = reply.send(Err("No speech detected (too quiet).".to_string()));
                             continue;
                         }
