@@ -210,8 +210,22 @@ fn paste_to_clipboard(text: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn simulate_paste() {
-    use std::process::Command;
     std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Use CoreGraphics to simulate Cmd+V (doesn't require osascript)
+    use std::process::Command;
+
+    // First check/request accessibility permission
+    let _ = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"
+            use framework "AppKit"
+            set opts to {(current application's NSDictionary's dictionaryWithObject:true forKey:"AXTrustedCheckOptionPrompt")}
+            set trusted to current application's AXIsProcessTrustedWithOptions(opts)
+        "#)
+        .output();
+
+    // Then simulate the paste
     let _ = Command::new("osascript")
         .arg("-e")
         .arg("tell application \"System Events\" to keystroke \"v\" using command down")
