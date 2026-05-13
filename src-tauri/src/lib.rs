@@ -210,39 +210,12 @@ fn paste_to_clipboard(text: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn simulate_paste() {
+    use std::process::Command;
     std::thread::sleep(std::time::Duration::from_millis(200));
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGEventCreateKeyboardEvent(
-            source: *const std::ffi::c_void,
-            virtual_key: u16,
-            key_down: bool,
-        ) -> *const std::ffi::c_void;
-        fn CGEventSetFlags(event: *const std::ffi::c_void, flags: u64);
-        fn CGEventPost(tap: u32, event: *const std::ffi::c_void);
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFRelease(cf: *const std::ffi::c_void);
-    }
-
-    unsafe {
-        let v_keycode: u16 = 9;
-        let cmd_flag: u64 = 0x100000;
-
-        let key_down = CGEventCreateKeyboardEvent(std::ptr::null(), v_keycode, true);
-        CGEventSetFlags(key_down, cmd_flag);
-        CGEventPost(0, key_down);
-
-        let key_up = CGEventCreateKeyboardEvent(std::ptr::null(), v_keycode, false);
-        CGEventSetFlags(key_up, cmd_flag);
-        CGEventPost(0, key_up);
-
-        CFRelease(key_down);
-        CFRelease(key_up);
-    }
+    let _ = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to keystroke \"v\" using command down")
+        .spawn();
 }
 
 #[cfg(target_os = "windows")]

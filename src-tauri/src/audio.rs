@@ -137,7 +137,8 @@ impl AudioRecorder {
                             continue;
                         }
 
-                        let result = encode_wav(&mono_16k, 16000);
+                        let amplified = auto_gain(&mono_16k);
+                        let result = encode_wav(&amplified, 16000);
                         let _ = reply.send(result);
                     }
                 }
@@ -198,6 +199,15 @@ fn strip_silence(samples: &[f32], threshold: f32) -> Vec<f32> {
     }
 
     output
+}
+
+fn auto_gain(samples: &[f32]) -> Vec<f32> {
+    let peak = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak < 0.001 || peak > 0.5 {
+        return samples.to_vec();
+    }
+    let gain = (0.8 / peak).min(20.0);
+    samples.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
 }
 
 fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
