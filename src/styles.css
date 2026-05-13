@@ -490,3 +490,69 @@ code { font-family: var(--font-mono); font-size: 0.9em; background: var(--bg-sur
   transition: border-color 150ms ease-out;
 }
 .setting-value.clickable:hover { border-color: var(--accent); }
+
+/* Recents dropdown */
+.logo-wrapper { position: relative; }
+
+.recents-dropdown {
+  position: absolute;
+  top: 32px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 280px;
+  max-height: 400px;
+  overflow-y: auto;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+  z-index: 100;
+  animation: dropIn 0.15s ease-out;
+}
+
+@keyframes dropIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(-4px); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+.recents-header {
+  padding: 8px 12px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-softer);
+}
+
+.recents-empty {
+  padding: 16px 12px;
+  font-size: 12px;
+  color: var(--text-softer);
+  text-align: center;
+}
+
+.recents-item {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 100ms ease-out;
+}
+
+.recents-item:hover { background: var(--bg-hover); }
+
+.recents-footer {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  text-align: center;
+  border-top: 1px solid var(--border);
+  transition: background 100ms ease-out;
+}
+
+.recents-footer:hover { background: var(--bg-hover); }

@@ -65,6 +65,7 @@ function App() {
   const [recordHotkey, setRecordHotkey] = useState("Option+V");
   const [recopyHotkey, setRecopyHotkey] = useState("Ctrl+Shift+V");
   const [editingHotkey, setEditingHotkey] = useState<null | "record" | "recopy">(null);
+  const [showRecents, setShowRecents] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -545,7 +546,41 @@ function App() {
         <button className="icon-btn" onClick={() => { loadHistory(); setScreen("history"); }}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         </button>
-        <img src="/logo-128.png" alt="OpenFlow" className="topbar-logo" />
+        <div className="logo-wrapper">
+          <img
+            src="/logo-128.png"
+            alt="OpenFlow"
+            className="topbar-logo"
+            onClick={() => { if (history.length === 0) loadHistory(); setShowRecents(!showRecents); }}
+            style={{ cursor: "pointer" }}
+          />
+          {showRecents && (
+            <div className="recents-dropdown" onMouseLeave={() => setShowRecents(false)}>
+              <div className="recents-header">Recent</div>
+              {history.length === 0 && <div className="recents-empty">No transcriptions yet</div>}
+              {history.slice(0, 20).map((item, i) => (
+                <div
+                  key={item.id || i}
+                  className="recents-item"
+                  onClick={() => {
+                    const text = item.formatted_text || item.raw_text;
+                    navigator.clipboard.writeText(text);
+                    showNotification("Copied!");
+                    setShowRecents(false);
+                  }}
+                >
+                  {(item.formatted_text || item.raw_text).slice(0, 40)}
+                  {(item.formatted_text || item.raw_text).length > 40 ? "..." : ""}
+                </div>
+              ))}
+              {history.length > 0 && (
+                <div className="recents-footer" onClick={() => { setShowRecents(false); setScreen("history"); }}>
+                  All History
+                </div>
+              )}
+            </div>
+          )}
+        </div>
         <button className="icon-btn" onClick={() => setScreen("settings")}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2m-9-11h2m18 0h2m-4.2-5.8l-1.4 1.4M5.6 18.4l-1.4 1.4m0-13.8l1.4 1.4m12.8 12.8l1.4 1.4"/></svg>
         </button>
