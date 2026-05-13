@@ -11,7 +11,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-use transcribe::Provider;
+use transcribe::{ModelInfo, Provider};
 
 struct AppState {
     recorder: AudioRecorder,
@@ -53,6 +53,21 @@ fn search_history(state: State<AppState>, query: String) -> Result<Vec<Transcrip
     state.db.search_history(&query, 50)
 }
 
+// Model fetching
+#[tauri::command]
+async fn fetch_models(state: State<'_, AppState>, provider_name: Option<String>, api_key_override: Option<String>) -> Result<Vec<ModelInfo>, String> {
+    let provider_str = provider_name
+        .or_else(|| state.db.get_setting("provider"))
+        .unwrap_or_else(|| "groq".to_string());
+    let provider = Provider::from_str(&provider_str);
+
+    let api_key = api_key_override
+        .or_else(|| state.db.get_setting("api_key"))
+        .ok_or("No API key available")?;
+
+    transcribe::fetch_models(&api_key, &provider).await
+}
+
 // Recording commands
 #[tauri::command]
 fn start_recording(state: State<AppState>) -> Result<(), String> {
@@ -73,10 +88,13 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<Tra
         .map(|v| v != "false")
         .unwrap_or(true);
 
-    let raw_text = transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider).await?;
+    let stt_model = state.db.get_setting("stt_model");
+    let chat_model = state.db.get_setting("chat_model");
+
+    let raw_text = transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider, stt_model.as_deref()).await?;
 
     let formatted = if format_enabled {
-        match transcribe::format_text(&raw_text, &api_key, None, &provider, None).await {
+        match transcribe::format_text(&raw_text, &api_key, None, &provider, chat_model.as_deref()).await {
             Ok(text) => text,
             Err(_) => raw_text.clone(),
         }
@@ -203,8 +221,10 @@ fn handle_hotkey_release(app: &AppHandle) {
         let format_enabled = state.db.get_setting("format_enabled")
             .map(|v| v != "false")
             .unwrap_or(true);
+        let stt_model = state.db.get_setting("stt_model");
+        let chat_model = state.db.get_setting("chat_model");
 
-        let raw_text = match transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider).await {
+        let raw_text = match transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider, stt_model.as_deref()).await {
             Ok(t) => t,
             Err(e) => {
                 let _ = app_handle.emit("transcription-error", &e);
@@ -214,7 +234,7 @@ fn handle_hotkey_release(app: &AppHandle) {
         };
 
         let formatted = if format_enabled {
-            match transcribe::format_text(&raw_text, &api_key, None, &provider, None).await {
+            match transcribe::format_text(&raw_text, &api_key, None, &provider, chat_model.as_deref()).await {
                 Ok(text) => text,
                 Err(_) => raw_text.clone(),
             }
@@ -349,6 +369,7 @@ pub fn run() {
             set_setting,
             get_history,
             search_history,
+            fetch_models,
             start_recording,
             stop_recording_and_transcribe,
             copy_last_transcription,

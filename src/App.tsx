@@ -18,17 +18,23 @@ interface Transcription {
 }
 
 interface PluginInfo {
-  manifest: {
-    id: string;
-    name: string;
-    version: string;
-    description: string;
-    author: string | null;
-    hooks: string[];
-  };
+  manifest: { id: string; name: string; version: string; description: string; author: string | null; hooks: string[] };
   enabled: boolean;
   path: string;
 }
+
+interface ModelInfo {
+  id: string;
+  name: string;
+  model_type: string;
+}
+
+const PROVIDERS: Record<string, { label: string; hint: string; placeholder: string }> = {
+  groq: { label: "Groq (recommended)", hint: "console.groq.com/keys", placeholder: "gsk_..." },
+  openai: { label: "OpenAI", hint: "platform.openai.com/api-keys", placeholder: "sk-..." },
+  openrouter: { label: "OpenRouter", hint: "openrouter.ai/keys", placeholder: "sk-or-..." },
+  deepgram: { label: "Deepgram", hint: "console.deepgram.com", placeholder: "..." },
+};
 
 function App() {
   const [screen, setScreen] = useState<Screen>("onboarding");
@@ -44,6 +50,10 @@ function App() {
   const [formatEnabled, setFormatEnabled] = useState(true);
   const [notification, setNotification] = useState("");
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
+  const [sttModel, setSttModel] = useState("");
+  const [chatModel, setChatModel] = useState("");
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
 
   useEffect(() => {
     invoke<string | null>("get_api_key").then((key) => {
@@ -53,6 +63,8 @@ function App() {
     invoke<string | null>("get_setting", { key: "provider" }).then((v) => { if (v) setProvider(v); });
     invoke<string | null>("get_setting", { key: "theme" }).then((v) => { if (v) setTheme(v as "dark" | "light"); });
     invoke<string | null>("get_setting", { key: "format_enabled" }).then((v) => { if (v === "false") setFormatEnabled(false); });
+    invoke<string | null>("get_setting", { key: "stt_model" }).then((v) => { if (v) setSttModel(v); });
+    invoke<string | null>("get_setting", { key: "chat_model" }).then((v) => { if (v) setChatModel(v); });
     loadHistory();
   }, []);
 
@@ -74,6 +86,21 @@ function App() {
   const showNotification = (msg: string) => { setNotification(msg); setTimeout(() => setNotification(""), 2000); };
   const loadHistory = async () => { try { setHistory(await invoke<Transcription[]>("get_history", { limit: 50 })); } catch {} };
   const loadPlugins = async () => { try { setPlugins(await invoke<PluginInfo[]>("list_plugins")); } catch {} };
+  const saveSetting = async (key: string, value: string) => { await invoke("set_setting", { key, value }); };
+
+  const loadModels = async (providerName?: string, key?: string) => {
+    setModelsLoading(true);
+    try {
+      const models = await invoke<ModelInfo[]>("fetch_models", {
+        providerName: providerName || provider,
+        apiKeyOverride: key || undefined,
+      });
+      setAvailableModels(models);
+    } catch {
+      setAvailableModels([]);
+    }
+    setModelsLoading(false);
+  };
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) { loadHistory(); return; }
@@ -82,7 +109,22 @@ function App() {
 
   const handleSaveKey = async () => {
     if (!apiKey.trim()) return;
-    try { await invoke("set_api_key", { key: apiKey.trim() }); setScreen("main"); setError(""); } catch (e) { setError(String(e)); }
+    try {
+      await invoke("set_api_key", { key: apiKey.trim() });
+      await saveSetting("provider", provider);
+      if (sttModel) await saveSetting("stt_model", sttModel);
+      if (chatModel) await saveSetting("chat_model", chatModel);
+      setScreen("main");
+      setError("");
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleProviderChange = async (p: string) => {
+    setProvider(p);
+    setSttModel("");
+    setChatModel("");
+    setAvailableModels([]);
+    await saveSetting("provider", p);
   };
 
   const handleStartRecording = async () => {
@@ -100,7 +142,9 @@ function App() {
     } catch (e) { setError(String(e)); setStatus("idle"); }
   };
 
-  const saveSetting = async (key: string, value: string) => { await invoke("set_setting", { key, value }); };
+  const sttModels = availableModels.filter(m => m.model_type === "stt");
+  const chatModels = availableModels.filter(m => m.model_type === "chat");
+  const providerInfo = PROVIDERS[provider] || PROVIDERS.groq;
 
   // ONBOARDING
   if (screen === "onboarding") {
@@ -109,27 +153,48 @@ function App() {
         <h1>OpenFlow</h1>
         <p className="subtitle">Open-source voice transcription</p>
         <div className="onboarding">
-          <p>Enter your API key to get started.</p>
-          <div className="provider-select">
+          <div className="field">
             <label className="label">Provider</label>
-            <select value={provider} onChange={(e) => { setProvider(e.target.value); saveSetting("provider", e.target.value); }}>
-              <option value="groq">Groq (recommended)</option>
-              <option value="openai">OpenAI</option>
-              <option value="deepgram">Deepgram</option>
+            <select value={provider} onChange={(e) => handleProviderChange(e.target.value)}>
+              {Object.entries(PROVIDERS).map(([k, v]) => (
+                <option key={k} value={k}>{v.label}</option>
+              ))}
             </select>
           </div>
           <p className="hint">
-            {provider === "groq" && <>Get a free key at <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a></>}
-            {provider === "openai" && <>Get a key at <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com</a></>}
-            {provider === "deepgram" && <>Get a key at <a href="https://console.deepgram.com" target="_blank">console.deepgram.com</a></>}
+            Get a key at <a href={`https://${providerInfo.hint}`} target="_blank">{providerInfo.hint}</a>
           </p>
           <input
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            placeholder={provider === "groq" ? "gsk_..." : provider === "openai" ? "sk-..." : "..."}
+            placeholder={providerInfo.placeholder}
             onKeyDown={(e) => e.key === "Enter" && handleSaveKey()}
           />
+          {apiKey.length > 10 && availableModels.length === 0 && !modelsLoading && (
+            <button className="btn-secondary" onClick={() => loadModels(provider, apiKey)}>
+              Load available models
+            </button>
+          )}
+          {modelsLoading && <p className="hint">Loading models...</p>}
+          {sttModels.length > 0 && (
+            <div className="field">
+              <label className="label">Speech-to-text model</label>
+              <select value={sttModel} onChange={(e) => setSttModel(e.target.value)}>
+                <option value="">Default</option>
+                {sttModels.map(m => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
+              </select>
+            </div>
+          )}
+          {chatModels.length > 0 && (
+            <div className="field">
+              <label className="label">Formatting model</label>
+              <select value={chatModel} onChange={(e) => setChatModel(e.target.value)}>
+                <option value="">Default</option>
+                {chatModels.map(m => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
+              </select>
+            </div>
+          )}
           <button onClick={handleSaveKey} disabled={!apiKey.trim()}>Save & Continue</button>
           {error && <p className="error">{error}</p>}
         </div>
@@ -181,7 +246,7 @@ function App() {
             <div className="empty">
               <p>No plugins installed</p>
               <p className="hint" style={{ marginTop: 8 }}>
-                Plugins live in <code>~/.openflow/plugins/</code>. Each plugin is a folder with a <code>manifest.json</code>.
+                Plugins live in <code>~/.openflow/plugins/</code>
               </p>
             </div>
           )}
@@ -192,8 +257,8 @@ function App() {
                 <p className="hint" style={{ textAlign: "left", marginTop: 4 }}>{p.manifest.description}</p>
               </div>
               <button className="toggle-btn" onClick={async () => {
-                if (p.enabled) { await invoke("disable_plugin", { id: p.manifest.id }); }
-                else { await invoke("enable_plugin", { id: p.manifest.id }); }
+                if (p.enabled) await invoke("disable_plugin", { id: p.manifest.id });
+                else await invoke("enable_plugin", { id: p.manifest.id });
                 loadPlugins();
               }}>
                 {p.enabled ? "Enabled" : "Disabled"}
@@ -217,16 +282,40 @@ function App() {
         <div className="settings-list">
           <div className="setting-item">
             <label>Provider</label>
-            <select value={provider} onChange={(e) => { setProvider(e.target.value); saveSetting("provider", e.target.value); }}>
-              <option value="groq">Groq</option>
-              <option value="openai">OpenAI</option>
-              <option value="deepgram">Deepgram</option>
+            <select value={provider} onChange={(e) => handleProviderChange(e.target.value)}>
+              {Object.entries(PROVIDERS).map(([k, v]) => (
+                <option key={k} value={k}>{v.label}</option>
+              ))}
             </select>
           </div>
           <div className="setting-item">
             <label>API Key</label>
             <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} onBlur={() => apiKey && invoke("set_api_key", { key: apiKey })} />
           </div>
+          <div className="setting-item">
+            <label>Models</label>
+            <button className="btn-secondary" onClick={() => loadModels()}>
+              {modelsLoading ? "Loading..." : "Refresh models"}
+            </button>
+          </div>
+          {sttModels.length > 0 && (
+            <div className="setting-item">
+              <label>STT Model</label>
+              <select value={sttModel} onChange={(e) => { setSttModel(e.target.value); saveSetting("stt_model", e.target.value); }}>
+                <option value="">Default</option>
+                {sttModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
+              </select>
+            </div>
+          )}
+          {chatModels.length > 0 && (
+            <div className="setting-item">
+              <label>Chat Model</label>
+              <select value={chatModel} onChange={(e) => { setChatModel(e.target.value); saveSetting("chat_model", e.target.value); }}>
+                <option value="">Default</option>
+                {chatModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
+              </select>
+            </div>
+          )}
           <div className="setting-item">
             <label>Language</label>
             <select value={language} onChange={(e) => { setLanguage(e.target.value); saveSetting("language", e.target.value === "auto" ? "" : e.target.value); }}>
@@ -279,21 +368,15 @@ function App() {
   return (
     <main className="container">
       {notification && <div className="toast">{notification}</div>}
-
       <div className="top-row">
         <button className="icon-btn" onClick={() => { loadHistory(); setScreen("history"); }}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
-          </svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         </button>
         <h1>OpenFlow</h1>
         <button className="icon-btn" onClick={() => setScreen("settings")}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2m-9-11h2m18 0h2m-4.2-5.8l-1.4 1.4M5.6 18.4l-1.4 1.4m0-13.8l1.4 1.4m12.8 12.8l1.4 1.4"/>
-          </svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2m-9-11h2m18 0h2m-4.2-5.8l-1.4 1.4M5.6 18.4l-1.4 1.4m0-13.8l1.4 1.4m12.8 12.8l1.4 1.4"/></svg>
         </button>
       </div>
-
       <div className="status-ring" data-status={status}>
         <div className="status-inner">
           {status === "idle" && "Ready"}
@@ -301,24 +384,13 @@ function App() {
           {status === "transcribing" && "Transcribing..."}
         </div>
       </div>
-
-      <button
-        className="record-btn"
-        onMouseDown={handleStartRecording}
-        onMouseUp={handleStopRecording}
-        disabled={status === "transcribing"}
-      >
+      <button className="record-btn" onMouseDown={handleStartRecording} onMouseUp={handleStopRecording} disabled={status === "transcribing"}>
         {status === "idle" && "Hold to Record"}
         {status === "recording" && "Release to Transcribe"}
         {status === "transcribing" && "Processing..."}
       </button>
-
-      <p className="hint">
-        <strong>Ctrl+Shift+Space</strong> anywhere &middot; <strong>Ctrl+Shift+V</strong> re-copy
-      </p>
-
+      <p className="hint"><strong>Ctrl+Shift+Space</strong> anywhere &middot; <strong>Ctrl+Shift+V</strong> re-copy</p>
       {error && <p className="error">{error}</p>}
-
       {lastTranscription && (
         <div className="result">
           <p className="result-label">Copied to clipboard</p>
