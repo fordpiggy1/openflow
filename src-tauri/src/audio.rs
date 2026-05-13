@@ -131,14 +131,13 @@ impl AudioRecorder {
                         }
 
                         let mono_16k = downsample(&samples_data, native_sample_rate, 16000);
-                        let trimmed = strip_silence(&mono_16k, 0.005);
 
-                        if trimmed.len() < 800 {
+                        if mono_16k.len() < 800 {
                             let _ = reply.send(Err("Recording too short.".to_string()));
                             continue;
                         }
 
-                        let result = encode_wav(&trimmed, 16000);
+                        let result = encode_wav(&mono_16k, 16000);
                         let _ = reply.send(result);
                     }
                 }
