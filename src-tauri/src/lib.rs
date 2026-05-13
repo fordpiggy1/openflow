@@ -443,6 +443,7 @@ pub fn run() {
 
             let _tray = TrayIconBuilder::with_id("main_tray")
                 .menu(&menu)
+                .show_menu_on_left_click(true)
                 .tooltip("OpenFlow - Ready")
                 .icon({
                     let bytes = include_bytes!("../icons/icon.png");
