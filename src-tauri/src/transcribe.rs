@@ -12,6 +12,7 @@ pub enum Provider {
     OpenAI,
     OpenRouter,
     Deepgram,
+    Custom { base_url: String },
 }
 
 impl Provider {
@@ -20,6 +21,9 @@ impl Provider {
             "openai" => Self::OpenAI,
             "openrouter" => Self::OpenRouter,
             "deepgram" => Self::Deepgram,
+            s if s.starts_with("custom:") => Self::Custom {
+                base_url: s.strip_prefix("custom:").unwrap_or("").to_string(),
+            },
             _ => Self::Groq,
         }
     }
@@ -30,6 +34,7 @@ impl Provider {
             Self::OpenAI => "https://api.openai.com/v1",
             Self::OpenRouter => "https://openrouter.ai/api/v1",
             Self::Deepgram => "https://api.deepgram.com/v1",
+            Self::Custom { base_url } => base_url.as_str(),
         }
     }
 
@@ -58,8 +63,9 @@ impl Provider {
         match self {
             Self::Groq => "whisper-large-v3-turbo",
             Self::OpenAI => "whisper-1",
-            Self::OpenRouter => "openai/whisper-large-v3",
+            Self::OpenRouter => "openai/whisper-large-v3-turbo",
             Self::Deepgram => "nova-3",
+            Self::Custom { .. } => "whisper-large-v3",
         }
     }
 
@@ -69,6 +75,7 @@ impl Provider {
             Self::OpenAI => "gpt-4o-mini",
             Self::OpenRouter => "meta-llama/llama-3.3-70b-instruct",
             Self::Deepgram => "llama-3.3-70b-versatile",
+            Self::Custom { .. } => "default",
         }
     }
 
@@ -79,8 +86,8 @@ impl Provider {
         }
     }
 
-    pub fn supports_stt(&self) -> bool {
-        !matches!(self, Self::OpenRouter)
+    fn is_openrouter(&self) -> bool {
+        matches!(self, Self::OpenRouter)
     }
 }
 
@@ -142,8 +149,10 @@ async fn fetch_openai_compatible_models(api_key: &str, provider: &Provider) -> R
             .unwrap_or(false);
 
         let is_stt = id_lower.contains("whisper")
+            || id_lower.contains("chirp")
             || id_lower.contains("speech-to-text")
             || id_lower.contains("transcrib")
+            || id_lower.contains("asr")
             || modality.contains("audio")
             || has_audio_input;
 
@@ -182,8 +191,65 @@ pub async fn transcribe_audio(
 ) -> Result<String, String> {
     match provider {
         Provider::Deepgram => transcribe_deepgram(wav_bytes, api_key, language, model).await,
+        Provider::OpenRouter => transcribe_openrouter(wav_bytes, api_key, language, model).await,
         _ => transcribe_whisper(wav_bytes, api_key, language, provider, model).await,
     }
+}
+
+async fn transcribe_openrouter(
+    wav_bytes: Vec<u8>,
+    api_key: &str,
+    language: Option<&str>,
+    model: Option<&str>,
+) -> Result<String, String> {
+    use base64::Engine;
+    let client = reqwest::Client::new();
+    let stt_model = model.unwrap_or("openai/whisper-large-v3-turbo");
+
+    let b64_audio = base64::engine::general_purpose::STANDARD.encode(&wav_bytes);
+
+    let mut body = serde_json::json!({
+        "model": stt_model,
+        "input_audio": {
+            "data": b64_audio,
+            "format": "wav"
+        }
+    });
+
+    if let Some(lang) = language {
+        body["language"] = serde_json::Value::String(lang.to_string());
+    }
+
+    let response = client
+        .post("https://openrouter.ai/api/v1/audio/transcriptions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .header("HTTP-Referer", "https://openflow.dev")
+        .header("X-OpenRouter-Title", "OpenFlow")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    let status = response.status();
+    let resp_body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return match status.as_u16() {
+            401 | 403 => Err("Invalid API key. Check your OpenRouter key.".to_string()),
+            429 => Err("Rate limit hit. Wait a moment and try again.".to_string()),
+            _ => Err(format!("API error ({}): {}", status, resp_body)),
+        };
+    }
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp_body) {
+        if let Some(text) = json["text"].as_str() {
+            return Ok(text.to_string());
+        }
+    }
+
+    Err(format!("Unexpected response: {}", resp_body))
 }
 
 async fn transcribe_whisper(
@@ -218,7 +284,7 @@ async fn transcribe_whisper(
         .multipart(form)
         .timeout(std::time::Duration::from_secs(30));
 
-    if matches!(provider, Provider::OpenRouter) {
+    if provider.is_openrouter() {
         req = req.header("HTTP-Referer", "https://openflow.dev");
         req = req.header("X-Title", "OpenFlow");
     }
@@ -333,7 +399,7 @@ pub async fn format_text(
         .json(&body)
         .timeout(std::time::Duration::from_secs(15));
 
-    if matches!(provider, Provider::OpenRouter) {
+    if provider.is_openrouter() {
         req = req.header("HTTP-Referer", "https://openflow.dev");
         req = req.header("X-Title", "OpenFlow");
     }

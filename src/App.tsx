@@ -4,74 +4,93 @@ import { listen } from "@tauri-apps/api/event";
 
 type Screen = "onboarding" | "main" | "history" | "settings" | "plugins";
 type RecordingState = "idle" | "recording" | "transcribing";
+type OnboardingStep = "provider" | "apikey" | "test" | "done";
 
 interface Transcription {
-  id: string;
-  raw_text: string;
-  formatted_text: string | null;
-  provider: string;
-  duration_ms: number | null;
-  context_type: string | null;
-  window_title: string | null;
-  language: string | null;
-  created_at: string;
+  id: string; raw_text: string; formatted_text: string | null; provider: string;
+  duration_ms: number | null; context_type: string | null; window_title: string | null;
+  language: string | null; created_at: string;
 }
 
 interface PluginInfo {
   manifest: { id: string; name: string; version: string; description: string; author: string | null; hooks: string[] };
-  enabled: boolean;
-  path: string;
+  enabled: boolean; path: string;
 }
 
-interface ModelInfo {
-  id: string;
-  name: string;
-  model_type: string;
-}
+interface ModelInfo { id: string; name: string; model_type: string; }
 
-const PROVIDERS: Record<string, { label: string; hint: string; placeholder: string }> = {
-  groq: { label: "Groq (recommended)", hint: "console.groq.com/keys", placeholder: "gsk_..." },
-  openai: { label: "OpenAI", hint: "platform.openai.com/api-keys", placeholder: "sk-..." },
-  openrouter: { label: "OpenRouter", hint: "openrouter.ai/keys", placeholder: "sk-or-..." },
-  deepgram: { label: "Deepgram", hint: "console.deepgram.com", placeholder: "..." },
+const TRANSCRIPTION_PROVIDERS: Record<string, { label: string; hint: string; placeholder: string; description: string }> = {
+  groq: { label: "Groq", hint: "console.groq.com/keys", placeholder: "gsk_...", description: "Fastest. Free tier available." },
+  openai: { label: "OpenAI", hint: "platform.openai.com/api-keys", placeholder: "sk-...", description: "Most reliable. Pay-per-use." },
+  openrouter: { label: "OpenRouter", hint: "openrouter.ai/keys", placeholder: "sk-or-...", description: "300+ models including Whisper. Pay-per-use." },
+  deepgram: { label: "Deepgram", hint: "console.deepgram.com", placeholder: "...", description: "Nova models. Free tier available." },
+  custom: { label: "Custom", hint: "", placeholder: "API key", description: "Any OpenAI-compatible endpoint. Self-hosted, local, or third-party." },
+};
+
+const FORMATTING_PROVIDERS: Record<string, { label: string; hint: string; placeholder: string; description: string }> = {
+  ...TRANSCRIPTION_PROVIDERS,
 };
 
 function App() {
   const [screen, setScreen] = useState<Screen>("onboarding");
-  const [apiKey, setApiKey] = useState("");
+  const [onboardingStep, setOnboardingStep] = useState<OnboardingStep>("provider");
   const [status, setStatus] = useState<RecordingState>("idle");
   const [lastTranscription, setLastTranscription] = useState("");
   const [error, setError] = useState("");
+  const [notification, setNotification] = useState("");
   const [history, setHistory] = useState<Transcription[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
+  const [plugins, setPlugins] = useState<PluginInfo[]>([]);
+
+  // Settings state
+  const [transcriptionProvider, setTranscriptionProvider] = useState("groq");
+  const [transcriptionKey, setTranscriptionKey] = useState("");
+  const [transcriptionModel, setTranscriptionModel] = useState("");
+  const [formattingProvider, setFormattingProvider] = useState("groq");
+  const [formattingKey, setFormattingKey] = useState("");
+  const [formattingModel, setFormattingModel] = useState("");
+  const [sameProvider, setSameProvider] = useState(true);
   const [language, setLanguage] = useState("auto");
-  const [provider, setProvider] = useState("groq");
   const [theme, setTheme] = useState<"dark" | "light">("light");
   const [formatEnabled, setFormatEnabled] = useState(true);
-  const [notification, setNotification] = useState("");
-  const [plugins, setPlugins] = useState<PluginInfo[]>([]);
-  const [sttModel, setSttModel] = useState("");
-  const [chatModel, setChatModel] = useState("");
-  const [sttProvider, setSttProvider] = useState("openai");
-  const [sttApiKey, setSttApiKey] = useState("");
-  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [customTranscriptionUrl, setCustomTranscriptionUrl] = useState("");
+  const [customTranscriptionModel, setCustomTranscriptionModel] = useState("");
+  const [customFormattingUrl, setCustomFormattingUrl] = useState("");
+  const [customFormattingModel, setCustomFormattingModel] = useState("");
+  const [transcriptionModels, setTranscriptionModels] = useState<ModelInfo[]>([]);
+  const [formattingModels, setFormattingModels] = useState<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
 
-  const needsSttProvider = provider === "openrouter";
-
   useEffect(() => {
-    invoke<string | null>("get_api_key").then((key) => {
-      if (key) { setApiKey(key); setScreen("main"); }
-    });
-    invoke<string | null>("get_setting", { key: "language" }).then((v) => { if (v) setLanguage(v); });
-    invoke<string | null>("get_setting", { key: "provider" }).then((v) => { if (v) setProvider(v); });
-    invoke<string | null>("get_setting", { key: "theme" }).then((v) => { if (v) setTheme(v as "dark" | "light"); });
-    invoke<string | null>("get_setting", { key: "format_enabled" }).then((v) => { if (v === "false") setFormatEnabled(false); });
-    invoke<string | null>("get_setting", { key: "stt_model" }).then((v) => { if (v) setSttModel(v); });
-    invoke<string | null>("get_setting", { key: "chat_model" }).then((v) => { if (v) setChatModel(v); });
-    invoke<string | null>("get_setting", { key: "stt_provider" }).then((v) => { if (v) setSttProvider(v); });
-    invoke<string | null>("get_setting", { key: "stt_api_key" }).then((v) => { if (v) setSttApiKey(v); });
-    loadHistory();
+    (async () => {
+      const key = await invoke<string | null>("get_api_key");
+      if (key) {
+        setTranscriptionKey(key);
+        setFormattingKey(key);
+        setScreen("main");
+      }
+      const tp = await invoke<string | null>("get_setting", { key: "provider" });
+      if (tp) { setTranscriptionProvider(tp); setFormattingProvider(tp); }
+      const sp = await invoke<string | null>("get_setting", { key: "same_provider" });
+      if (sp === "false") {
+        setSameProvider(false);
+        const fp = await invoke<string | null>("get_setting", { key: "formatting_provider" });
+        if (fp) setFormattingProvider(fp);
+        const fk = await invoke<string | null>("get_setting", { key: "formatting_api_key" });
+        if (fk) setFormattingKey(fk);
+      }
+      const lang = await invoke<string | null>("get_setting", { key: "language" });
+      if (lang) setLanguage(lang);
+      const th = await invoke<string | null>("get_setting", { key: "theme" });
+      if (th) setTheme(th as "dark" | "light");
+      const fe = await invoke<string | null>("get_setting", { key: "format_enabled" });
+      if (fe === "false") setFormatEnabled(false);
+      const sm = await invoke<string | null>("get_setting", { key: "stt_model" });
+      if (sm) setTranscriptionModel(sm);
+      const cm = await invoke<string | null>("get_setting", { key: "chat_model" });
+      if (cm) setFormattingModel(cm);
+      loadHistory();
+    })();
   }, []);
 
   useEffect(() => { document.documentElement.setAttribute("data-theme", theme); }, [theme]);
@@ -92,50 +111,22 @@ function App() {
   const showNotification = (msg: string) => { setNotification(msg); setTimeout(() => setNotification(""), 2000); };
   const loadHistory = async () => { try { setHistory(await invoke<Transcription[]>("get_history", { limit: 50 })); } catch {} };
   const loadPlugins = async () => { try { setPlugins(await invoke<PluginInfo[]>("list_plugins")); } catch {} };
-  const saveSetting = async (key: string, value: string) => { await invoke("set_setting", { key, value }); };
 
-  const loadModels = async (providerName?: string, key?: string) => {
+  const save = async (key: string, value: string) => { await invoke("set_setting", { key, value }); };
+
+  const loadModelsFor = async (providerName: string, apiKey: string, target: "transcription" | "formatting") => {
     setModelsLoading(true);
     try {
-      const models = await invoke<ModelInfo[]>("fetch_models", {
-        providerName: providerName || provider,
-        apiKeyOverride: key || undefined,
-      });
-      setAvailableModels(models);
-    } catch {
-      setAvailableModels([]);
-    }
+      const models = await invoke<ModelInfo[]>("fetch_models", { providerName, apiKeyOverride: apiKey });
+      if (target === "transcription") setTranscriptionModels(models.filter(m => m.model_type === "stt"));
+      else setFormattingModels(models.filter(m => m.model_type === "chat"));
+    } catch { }
     setModelsLoading(false);
   };
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) { loadHistory(); return; }
     try { setHistory(await invoke<Transcription[]>("search_history", { query: searchQuery })); } catch {}
-  };
-
-  const handleSaveKey = async () => {
-    if (!apiKey.trim()) return;
-    if (needsSttProvider && !sttApiKey.trim()) { setError("OpenRouter needs a separate STT provider key for transcription."); return; }
-    try {
-      await invoke("set_api_key", { key: apiKey.trim() });
-      await saveSetting("provider", provider);
-      if (sttModel) await saveSetting("stt_model", sttModel);
-      if (chatModel) await saveSetting("chat_model", chatModel);
-      if (needsSttProvider) {
-        await saveSetting("stt_provider", sttProvider);
-        await saveSetting("stt_api_key", sttApiKey.trim());
-      }
-      setScreen("main");
-      setError("");
-    } catch (e) { setError(String(e)); }
-  };
-
-  const handleProviderChange = async (p: string) => {
-    setProvider(p);
-    setSttModel("");
-    setChatModel("");
-    setAvailableModels([]);
-    await saveSetting("provider", p);
   };
 
   const handleStartRecording = async () => {
@@ -153,88 +144,227 @@ function App() {
     } catch (e) { setError(String(e)); setStatus("idle"); }
   };
 
-  const sttModels = availableModels.filter(m => m.model_type === "stt");
-  const chatModels = availableModels.filter(m => m.model_type === "chat");
-  const providerInfo = PROVIDERS[provider] || PROVIDERS.groq;
+  const getProviderValue = (name: string, customUrl: string) =>
+    name === "custom" ? `custom:${customUrl.replace(/\/+$/, "")}` : name;
 
-  // ONBOARDING
+  const finishOnboarding = async () => {
+    await invoke("set_api_key", { key: transcriptionKey.trim() });
+    await save("provider", getProviderValue(transcriptionProvider, customTranscriptionUrl));
+    await save("same_provider", String(sameProvider));
+    if (transcriptionModel) await save("stt_model", transcriptionModel);
+    if (customTranscriptionModel) await save("stt_model", customTranscriptionModel);
+    if (!sameProvider) {
+      await save("formatting_provider", getProviderValue(formattingProvider, customFormattingUrl));
+      await save("formatting_api_key", formattingKey.trim());
+      if (formattingModel) await save("chat_model", formattingModel);
+      if (customFormattingModel) await save("chat_model", customFormattingModel);
+    }
+    setScreen("main");
+  };
+
+  const tProv = TRANSCRIPTION_PROVIDERS[transcriptionProvider as keyof typeof TRANSCRIPTION_PROVIDERS];
+  const fProv = FORMATTING_PROVIDERS[formattingProvider as keyof typeof FORMATTING_PROVIDERS];
+
+  // ─── ONBOARDING ─────────────────────────────────────────
   if (screen === "onboarding") {
     return (
       <main className="container">
         <h1>OpenFlow</h1>
         <p className="subtitle">Open-source voice transcription</p>
-        <div className="onboarding">
-          <div className="field">
-            <label className="label">Provider</label>
-            <select value={provider} onChange={(e) => handleProviderChange(e.target.value)}>
-              {Object.entries(PROVIDERS).map(([k, v]) => (
-                <option key={k} value={k}>{v.label}</option>
-              ))}
-            </select>
+
+        <div className="wizard">
+          <div className="wizard-steps">
+            <span className={onboardingStep === "provider" ? "step active" : "step"}>1</span>
+            <span className="step-line" />
+            <span className={onboardingStep === "apikey" ? "step active" : "step"}>2</span>
+            <span className="step-line" />
+            <span className={onboardingStep === "test" ? "step active" : "step"}>3</span>
           </div>
-          <p className="hint">
-            Get a key at <a href={`https://${providerInfo.hint}`} target="_blank">{providerInfo.hint}</a>
-          </p>
-          <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder={providerInfo.placeholder}
-            onKeyDown={(e) => e.key === "Enter" && handleSaveKey()}
-          />
-          {needsSttProvider && (
-            <>
-              <div className="stt-notice">
-                <p className="hint">OpenRouter handles formatting only. You need a separate provider for speech-to-text:</p>
+
+          {onboardingStep === "provider" && (
+            <div className="wizard-content">
+              <h2>Choose your transcription provider</h2>
+              <p className="hint">This is the service that converts your voice to text.</p>
+              <div className="provider-cards">
+                {Object.entries(TRANSCRIPTION_PROVIDERS).map(([k, v]) => (
+                  <button
+                    key={k}
+                    className={`provider-card ${transcriptionProvider === k ? "selected" : ""}`}
+                    onClick={() => setTranscriptionProvider(k)}
+                  >
+                    <strong>{v.label}</strong>
+                    <span>{v.description}</span>
+                  </button>
+                ))}
               </div>
+
+              <div className="toggle-row">
+                <label>Use same provider for text formatting?</label>
+                <button className="toggle-btn" onClick={() => setSameProvider(!sameProvider)}>
+                  {sameProvider ? "Yes" : "No"}
+                </button>
+              </div>
+
+              {!sameProvider && (
+                <>
+                  <h2 style={{ marginTop: 16 }}>Formatting provider</h2>
+                  <p className="hint">The LLM that cleans up punctuation and formatting.</p>
+                  <div className="provider-cards">
+                    {Object.entries(FORMATTING_PROVIDERS).map(([k, v]) => (
+                      <button
+                        key={k}
+                        className={`provider-card ${formattingProvider === k ? "selected" : ""}`}
+                        onClick={() => setFormattingProvider(k)}
+                      >
+                        <strong>{v.label}</strong>
+                        <span>{v.description}</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              <button className="btn-primary" onClick={() => setOnboardingStep("apikey")}>
+                Continue
+              </button>
+            </div>
+          )}
+
+          {onboardingStep === "apikey" && (
+            <div className="wizard-content">
+              <h2>Enter your API {sameProvider ? "key" : "keys"}</h2>
+
+              {transcriptionProvider === "custom" && (
+                <div className="field">
+                  <label className="label">Transcription endpoint URL</label>
+                  <p className="hint">OpenAI-compatible base URL (e.g. http://localhost:8080/v1)</p>
+                  <input
+                    value={customTranscriptionUrl}
+                    onChange={(e) => setCustomTranscriptionUrl(e.target.value)}
+                    placeholder="https://your-server.com/v1"
+                  />
+                  <label className="label" style={{ marginTop: 8 }}>Model name</label>
+                  <input
+                    value={customTranscriptionModel}
+                    onChange={(e) => setCustomTranscriptionModel(e.target.value)}
+                    placeholder="whisper-large-v3"
+                  />
+                </div>
+              )}
+
               <div className="field">
-                <label className="label">STT Provider</label>
-                <select value={sttProvider} onChange={(e) => { setSttProvider(e.target.value); saveSetting("stt_provider", e.target.value); }}>
-                  <option value="openai">OpenAI</option>
-                  <option value="groq">Groq</option>
-                  <option value="deepgram">Deepgram</option>
-                </select>
+                <label className="label">
+                  {sameProvider ? "API Key" : `${tProv?.label || "Transcription"} key (transcription)`}
+                </label>
+                {tProv?.hint && (
+                  <p className="hint">
+                    Get one at <a href={`https://${tProv.hint}`} target="_blank">{tProv.hint}</a>
+                  </p>
+                )}
+                <input
+                  type="password"
+                  value={transcriptionKey}
+                  onChange={(e) => { setTranscriptionKey(e.target.value); if (sameProvider) setFormattingKey(e.target.value); }}
+                  placeholder={tProv?.placeholder}
+                />
               </div>
-              <input
-                type="password"
-                value={sttApiKey}
-                onChange={(e) => setSttApiKey(e.target.value)}
-                placeholder={sttProvider === "groq" ? "Groq key (gsk_...)" : sttProvider === "openai" ? "OpenAI key (sk-...)" : "Deepgram key"}
-              />
-            </>
-          )}
-          {apiKey.length > 10 && availableModels.length === 0 && !modelsLoading && (
-            <button className="btn-secondary" onClick={() => loadModels(provider, apiKey)}>
-              Load available models
-            </button>
-          )}
-          {modelsLoading && <p className="hint">Loading models...</p>}
-          {sttModels.length > 0 && (
-            <div className="field">
-              <label className="label">Speech-to-text model</label>
-              <select value={sttModel} onChange={(e) => setSttModel(e.target.value)}>
-                <option value="">Default</option>
-                {sttModels.map(m => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
-              </select>
+
+              {!sameProvider && (
+                <div className="field" style={{ marginTop: 16 }}>
+                  {formattingProvider === "custom" && (
+                    <>
+                      <label className="label">Formatting endpoint URL</label>
+                      <p className="hint">OpenAI-compatible chat completions base URL</p>
+                      <input
+                        value={customFormattingUrl}
+                        onChange={(e) => setCustomFormattingUrl(e.target.value)}
+                        placeholder="https://your-server.com/v1"
+                      />
+                      <label className="label" style={{ marginTop: 8 }}>Model name</label>
+                      <input
+                        value={customFormattingModel}
+                        onChange={(e) => setCustomFormattingModel(e.target.value)}
+                        placeholder="llama-3.3-70b"
+                      />
+                    </>
+                  )}
+                  <label className="label" style={{ marginTop: formattingProvider === "custom" ? 8 : 0 }}>{fProv?.label || "Formatting"} key (formatting)</label>
+                  {fProv?.hint && (
+                    <p className="hint">
+                      Get one at <a href={`https://${fProv.hint}`} target="_blank">{fProv.hint}</a>
+                    </p>
+                  )}
+                  <input
+                    type="password"
+                    value={formattingKey}
+                    onChange={(e) => setFormattingKey(e.target.value)}
+                    placeholder={fProv?.placeholder}
+                  />
+                </div>
+              )}
+
+              {error && <p className="error">{error}</p>}
+
+              <div className="wizard-nav">
+                <button className="btn-secondary" onClick={() => setOnboardingStep("provider")}>Back</button>
+                <button
+                  className="btn-primary"
+                  disabled={!transcriptionKey.trim() || (!sameProvider && !formattingKey.trim())}
+                  onClick={() => { setError(""); setOnboardingStep("test"); }}
+                >
+                  Continue
+                </button>
+              </div>
             </div>
           )}
-          {chatModels.length > 0 && (
-            <div className="field">
-              <label className="label">Formatting model</label>
-              <select value={chatModel} onChange={(e) => setChatModel(e.target.value)}>
-                <option value="">Default</option>
-                {chatModels.map(m => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
-              </select>
+
+          {onboardingStep === "test" && (
+            <div className="wizard-content">
+              <h2>Optional: Choose models</h2>
+              <p className="hint">Load available models from your provider, or use defaults.</p>
+
+              <div className="field">
+                <label className="label">Transcription model</label>
+                <div className="model-row">
+                  <select value={transcriptionModel} onChange={(e) => setTranscriptionModel(e.target.value)}>
+                    <option value="">Default ({TRANSCRIPTION_PROVIDERS[transcriptionProvider as keyof typeof TRANSCRIPTION_PROVIDERS]?.label})</option>
+                    {transcriptionModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
+                  </select>
+                  <button className="btn-secondary" onClick={() => loadModelsFor(transcriptionProvider, transcriptionKey, "transcription")}>
+                    {modelsLoading ? "..." : "Load"}
+                  </button>
+                </div>
+              </div>
+
+              {(formatEnabled && !sameProvider) && (
+                <div className="field">
+                  <label className="label">Formatting model</label>
+                  <div className="model-row">
+                    <select value={formattingModel} onChange={(e) => setFormattingModel(e.target.value)}>
+                      <option value="">Default ({FORMATTING_PROVIDERS[formattingProvider as keyof typeof FORMATTING_PROVIDERS]?.label})</option>
+                      {formattingModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
+                    </select>
+                    <button className="btn-secondary" onClick={() => loadModelsFor(formattingProvider, formattingKey, "formatting")}>
+                      {modelsLoading ? "..." : "Load"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="wizard-nav">
+                <button className="btn-secondary" onClick={() => setOnboardingStep("apikey")}>Back</button>
+                <button className="btn-primary" onClick={finishOnboarding}>
+                  Start using OpenFlow
+                </button>
+              </div>
             </div>
           )}
-          <button onClick={handleSaveKey} disabled={!apiKey.trim()}>Save & Continue</button>
-          {error && <p className="error">{error}</p>}
         </div>
       </main>
     );
   }
 
-  // HISTORY
+  // ─── HISTORY ────────────────────────────────────────────
   if (screen === "history") {
     return (
       <main className="container history-screen">
@@ -255,7 +385,6 @@ function App() {
                 <span>{new Date(item.created_at).toLocaleString()}</span>
                 {item.duration_ms && <span>{(item.duration_ms / 1000).toFixed(1)}s</span>}
                 <span>{item.provider}</span>
-                {item.language && <span>{item.language}</span>}
               </div>
             </div>
           ))}
@@ -264,7 +393,7 @@ function App() {
     );
   }
 
-  // PLUGINS
+  // ─── PLUGINS ────────────────────────────────────────────
   if (screen === "plugins") {
     return (
       <main className="container settings-screen">
@@ -274,27 +403,11 @@ function App() {
           <div />
         </div>
         <div className="settings-list">
-          {plugins.length === 0 && (
-            <div className="empty">
-              <p>No plugins installed</p>
-              <p className="hint" style={{ marginTop: 8 }}>
-                Plugins live in <code>~/.openflow/plugins/</code>
-              </p>
-            </div>
-          )}
+          {plugins.length === 0 && <div className="empty"><p>No plugins installed</p><p className="hint" style={{ marginTop: 8 }}>Plugins live in <code>~/.openflow/plugins/</code></p></div>}
           {plugins.map((p) => (
             <div key={p.manifest.id} className="setting-item">
-              <div>
-                <label>{p.manifest.name} <span className="setting-value">{p.manifest.version}</span></label>
-                <p className="hint" style={{ textAlign: "left", marginTop: 4 }}>{p.manifest.description}</p>
-              </div>
-              <button className="toggle-btn" onClick={async () => {
-                if (p.enabled) await invoke("disable_plugin", { id: p.manifest.id });
-                else await invoke("enable_plugin", { id: p.manifest.id });
-                loadPlugins();
-              }}>
-                {p.enabled ? "Enabled" : "Disabled"}
-              </button>
+              <div><label>{p.manifest.name} <span className="setting-value">{p.manifest.version}</span></label><p className="hint" style={{ textAlign: "left", marginTop: 4 }}>{p.manifest.description}</p></div>
+              <button className="toggle-btn" onClick={async () => { if (p.enabled) await invoke("disable_plugin", { id: p.manifest.id }); else await invoke("enable_plugin", { id: p.manifest.id }); loadPlugins(); }}>{p.enabled ? "Enabled" : "Disabled"}</button>
             </div>
           ))}
         </div>
@@ -302,7 +415,7 @@ function App() {
     );
   }
 
-  // SETTINGS
+  // ─── SETTINGS ───────────────────────────────────────────
   if (screen === "settings") {
     return (
       <main className="container settings-screen">
@@ -313,106 +426,63 @@ function App() {
         </div>
         <div className="settings-list">
           <div className="setting-item">
-            <label>Provider</label>
-            <select value={provider} onChange={(e) => handleProviderChange(e.target.value)}>
-              {Object.entries(PROVIDERS).map(([k, v]) => (
-                <option key={k} value={k}>{v.label}</option>
-              ))}
+            <label>Transcription provider</label>
+            <select value={transcriptionProvider} onChange={(e) => { setTranscriptionProvider(e.target.value); save("provider", e.target.value); if (sameProvider) setFormattingProvider(e.target.value); }}>
+              {Object.entries(TRANSCRIPTION_PROVIDERS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
             </select>
           </div>
           <div className="setting-item">
-            <label>API Key</label>
-            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} onBlur={() => apiKey && invoke("set_api_key", { key: apiKey })} />
+            <label>Transcription key</label>
+            <input type="password" value={transcriptionKey} onChange={(e) => setTranscriptionKey(e.target.value)} onBlur={() => transcriptionKey && invoke("set_api_key", { key: transcriptionKey })} />
           </div>
-          {needsSttProvider && (
+          <div className="setting-item">
+            <label>Same provider for formatting?</label>
+            <button className="toggle-btn" onClick={() => { const v = !sameProvider; setSameProvider(v); save("same_provider", String(v)); if (v) { setFormattingProvider(transcriptionProvider); setFormattingKey(transcriptionKey); } }}>
+              {sameProvider ? "Yes" : "No"}
+            </button>
+          </div>
+          {!sameProvider && (
             <>
               <div className="setting-item">
-                <label>STT Provider</label>
-                <select value={sttProvider} onChange={(e) => { setSttProvider(e.target.value); saveSetting("stt_provider", e.target.value); }}>
-                  <option value="openai">OpenAI</option>
-                  <option value="groq">Groq</option>
-                  <option value="deepgram">Deepgram</option>
+                <label>Formatting provider</label>
+                <select value={formattingProvider} onChange={(e) => { setFormattingProvider(e.target.value); save("formatting_provider", e.target.value); }}>
+                  {Object.entries(FORMATTING_PROVIDERS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
                 </select>
               </div>
               <div className="setting-item">
-                <label>STT API Key</label>
-                <input type="password" value={sttApiKey} onChange={(e) => setSttApiKey(e.target.value)} onBlur={() => sttApiKey && saveSetting("stt_api_key", sttApiKey)} />
+                <label>Formatting key</label>
+                <input type="password" value={formattingKey} onChange={(e) => setFormattingKey(e.target.value)} onBlur={() => formattingKey && save("formatting_api_key", formattingKey)} />
               </div>
             </>
           )}
           <div className="setting-item">
-            <label>Models</label>
-            <button className="btn-secondary" onClick={() => loadModels()}>
-              {modelsLoading ? "Loading..." : "Refresh models"}
-            </button>
-          </div>
-          {sttModels.length > 0 && (
-            <div className="setting-item">
-              <label>STT Model</label>
-              <select value={sttModel} onChange={(e) => { setSttModel(e.target.value); saveSetting("stt_model", e.target.value); }}>
-                <option value="">Default</option>
-                {sttModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
-              </select>
-            </div>
-          )}
-          {chatModels.length > 0 && (
-            <div className="setting-item">
-              <label>Chat Model</label>
-              <select value={chatModel} onChange={(e) => { setChatModel(e.target.value); saveSetting("chat_model", e.target.value); }}>
-                <option value="">Default</option>
-                {chatModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
-              </select>
-            </div>
-          )}
-          <div className="setting-item">
             <label>Language</label>
-            <select value={language} onChange={(e) => { setLanguage(e.target.value); saveSetting("language", e.target.value === "auto" ? "" : e.target.value); }}>
+            <select value={language} onChange={(e) => { setLanguage(e.target.value); save("language", e.target.value === "auto" ? "" : e.target.value); }}>
               <option value="auto">Auto-detect</option>
-              <option value="en">English</option>
-              <option value="es">Spanish</option>
-              <option value="fr">French</option>
-              <option value="de">German</option>
-              <option value="it">Italian</option>
-              <option value="pt">Portuguese</option>
-              <option value="nl">Dutch</option>
-              <option value="ja">Japanese</option>
-              <option value="ko">Korean</option>
-              <option value="zh">Chinese</option>
-              <option value="ar">Arabic</option>
-              <option value="hi">Hindi</option>
+              <option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option>
+              <option value="de">German</option><option value="it">Italian</option><option value="pt">Portuguese</option>
+              <option value="nl">Dutch</option><option value="ja">Japanese</option><option value="ko">Korean</option>
+              <option value="zh">Chinese</option><option value="ar">Arabic</option><option value="hi">Hindi</option>
               <option value="ru">Russian</option>
             </select>
           </div>
           <div className="setting-item">
             <label>LLM Formatting</label>
-            <button className="toggle-btn" onClick={() => { const v = !formatEnabled; setFormatEnabled(v); saveSetting("format_enabled", String(v)); }}>
-              {formatEnabled ? "On" : "Off"}
-            </button>
+            <button className="toggle-btn" onClick={() => { const v = !formatEnabled; setFormatEnabled(v); save("format_enabled", String(v)); }}>{formatEnabled ? "On" : "Off"}</button>
           </div>
           <div className="setting-item">
             <label>Theme</label>
-            <button className="toggle-btn" onClick={() => { const t = theme === "dark" ? "light" : "dark"; setTheme(t); saveSetting("theme", t); }}>
-              {theme === "dark" ? "Dark" : "Light"}
-            </button>
+            <button className="toggle-btn" onClick={() => { const t = theme === "dark" ? "light" : "dark"; setTheme(t); save("theme", t); }}>{theme === "dark" ? "Dark" : "Light"}</button>
           </div>
-          <div className="setting-item">
-            <label>Record Hotkey</label>
-            <span className="setting-value">Ctrl+Shift+Space</span>
-          </div>
-          <div className="setting-item">
-            <label>Re-copy Hotkey</label>
-            <span className="setting-value">Ctrl+Shift+V</span>
-          </div>
-          <div className="setting-item">
-            <label>Plugins</label>
-            <button className="nav-btn" onClick={() => { loadPlugins(); setScreen("plugins"); }}>Manage</button>
-          </div>
+          <div className="setting-item"><label>Record</label><span className="setting-value">Ctrl+Shift+Space</span></div>
+          <div className="setting-item"><label>Re-copy</label><span className="setting-value">Ctrl+Shift+V</span></div>
+          <div className="setting-item"><label>Plugins</label><button className="nav-btn" onClick={() => { loadPlugins(); setScreen("plugins"); }}>Manage</button></div>
         </div>
       </main>
     );
   }
 
-  // MAIN
+  // ─── MAIN ───────────────────────────────────────────────
   return (
     <main className="container">
       {notification && <div className="toast">{notification}</div>}
