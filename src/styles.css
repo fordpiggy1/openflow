@@ -468,3 +468,22 @@ code { font-family: var(--font-mono); font-size: 0.9em; background: var(--bg-sur
 .model-row { display: flex; gap: 8px; }
 .model-row select { flex: 1; }
 .model-row .btn-secondary { white-space: nowrap; }
+
+.hotkey-input {
+  max-width: 160px;
+  padding: 4px 8px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+.setting-value.clickable {
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: border-color 150ms ease-out;
+}
+.setting-value.clickable:hover { border-color: var(--accent); }

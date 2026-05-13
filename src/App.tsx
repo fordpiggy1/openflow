@@ -57,9 +57,14 @@ function App() {
   const [customTranscriptionModel, setCustomTranscriptionModel] = useState("");
   const [customFormattingUrl, setCustomFormattingUrl] = useState("");
   const [customFormattingModel, setCustomFormattingModel] = useState("");
+  const [microphone, setMicrophone] = useState("");
+  const [microphones, setMicrophones] = useState<{ id: string; name: string; is_default: boolean }[]>([]);
   const [transcriptionModels, setTranscriptionModels] = useState<ModelInfo[]>([]);
   const [formattingModels, setFormattingModels] = useState<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [recordHotkey, setRecordHotkey] = useState("Option+V");
+  const [recopyHotkey, setRecopyHotkey] = useState("Ctrl+Shift+V");
+  const [editingHotkey, setEditingHotkey] = useState<null | "record" | "recopy">(null);
 
   useEffect(() => {
     (async () => {
@@ -89,7 +94,11 @@ function App() {
       if (sm) setTranscriptionModel(sm);
       const cm = await invoke<string | null>("get_setting", { key: "chat_model" });
       if (cm) setFormattingModel(cm);
+      invoke<string | null>("get_setting", { key: "microphone" }).then((v) => { if (v) setMicrophone(v); });
+      invoke<string | null>("get_setting", { key: "hotkey_record" }).then((v) => { if (v) setRecordHotkey(v); });
+      invoke<string | null>("get_setting", { key: "hotkey_recopy" }).then((v) => { if (v) setRecopyHotkey(v); });
       loadHistory();
+      loadMicrophones();
     })();
   }, []);
 
@@ -105,12 +114,14 @@ function App() {
     });
     const u3 = listen<string>("transcription-error", (e) => setError(e.payload));
     const u4 = listen<string>("recopy-success", (e) => showNotification(e.payload));
-    return () => { u1.then(f => f()); u2.then(f => f()); u3.then(f => f()); u4.then(f => f()); };
+    const u5 = listen<string>("navigate", (e) => { if (e.payload === "history") { loadHistory(); setScreen("history"); } });
+    return () => { u1.then(f => f()); u2.then(f => f()); u3.then(f => f()); u4.then(f => f()); u5.then(f => f()); };
   }, []);
 
   const showNotification = (msg: string) => { setNotification(msg); setTimeout(() => setNotification(""), 2000); };
   const loadHistory = async () => { try { setHistory(await invoke<Transcription[]>("get_history", { limit: 50 })); } catch {} };
   const loadPlugins = async () => { try { setPlugins(await invoke<PluginInfo[]>("list_plugins")); } catch {} };
+  const loadMicrophones = async () => { try { setMicrophones(await invoke<{ id: string; name: string; is_default: boolean }[]>("list_audio_devices")); } catch {} };
 
   const save = async (key: string, value: string) => { await invoke("set_setting", { key, value }); };
 
@@ -456,6 +467,13 @@ function App() {
             </>
           )}
           <div className="setting-item">
+            <label>Microphone</label>
+            <select value={microphone} onChange={(e) => { setMicrophone(e.target.value); save("microphone", e.target.value); }}>
+              <option value="">System default</option>
+              {microphones.map(m => <option key={m.id} value={m.id}>{m.name}{m.is_default ? " (default)" : ""}</option>)}
+            </select>
+          </div>
+          <div className="setting-item">
             <label>Language</label>
             <select value={language} onChange={(e) => { setLanguage(e.target.value); save("language", e.target.value === "auto" ? "" : e.target.value); }}>
               <option value="auto">Auto-detect</option>
@@ -474,8 +492,44 @@ function App() {
             <label>Theme</label>
             <button className="toggle-btn" onClick={() => { const t = theme === "dark" ? "light" : "dark"; setTheme(t); save("theme", t); }}>{theme === "dark" ? "Dark" : "Light"}</button>
           </div>
-          <div className="setting-item"><label>Record</label><span className="setting-value">Ctrl+Shift+Space</span></div>
-          <div className="setting-item"><label>Re-copy</label><span className="setting-value">Ctrl+Shift+V</span></div>
+          <div className="setting-item">
+            <label>Record hotkey</label>
+            {editingHotkey === "record" ? (
+              <input
+                className="hotkey-input"
+                autoFocus
+                value={recordHotkey}
+                onChange={(e) => setRecordHotkey(e.target.value)}
+                onBlur={async () => {
+                  try { await invoke("rebind_hotkey", { action: "record", shortcutStr: recordHotkey }); } catch (e) { setError(String(e)); }
+                  setEditingHotkey(null);
+                }}
+                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                placeholder="e.g. Option+V"
+              />
+            ) : (
+              <button className="setting-value clickable" onClick={() => setEditingHotkey("record")}>{recordHotkey}</button>
+            )}
+          </div>
+          <div className="setting-item">
+            <label>Re-copy hotkey</label>
+            {editingHotkey === "recopy" ? (
+              <input
+                className="hotkey-input"
+                autoFocus
+                value={recopyHotkey}
+                onChange={(e) => setRecopyHotkey(e.target.value)}
+                onBlur={async () => {
+                  try { await invoke("rebind_hotkey", { action: "recopy", shortcutStr: recopyHotkey }); } catch (e) { setError(String(e)); }
+                  setEditingHotkey(null);
+                }}
+                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                placeholder="e.g. Ctrl+Shift+V"
+              />
+            ) : (
+              <button className="setting-value clickable" onClick={() => setEditingHotkey("recopy")}>{recopyHotkey}</button>
+            )}
+          </div>
           <div className="setting-item"><label>Plugins</label><button className="nav-btn" onClick={() => { loadPlugins(); setScreen("plugins"); }}>Manage</button></div>
         </div>
       </main>
@@ -507,7 +561,7 @@ function App() {
         {status === "recording" && "Release to Transcribe"}
         {status === "transcribing" && "Processing..."}
       </button>
-      <p className="hint"><strong>Ctrl+Shift+Space</strong> anywhere &middot; <strong>Ctrl+Shift+V</strong> re-copy</p>
+      <p className="hint"><strong>{recordHotkey}</strong> anywhere &middot; <strong>{recopyHotkey}</strong> re-copy</p>
       {error && <p className="error">{error}</p>}
       {lastTranscription && (
         <div className="result">

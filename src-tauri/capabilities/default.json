@@ -1,9 +1,11 @@
 {
   "identifier": "default",
   "description": "Default capabilities for OpenFlow",
-  "windows": ["main"],
+  "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
+    "core:window:default",
+    "core:event:default",
     "shell:allow-open",
     "global-shortcut:default"
   ]

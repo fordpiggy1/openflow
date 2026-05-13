@@ -1,10 +1,19 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use serde::Serialize;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 enum RecordCommand {
-    Start,
+    Start(Option<String>),
     Stop(mpsc::Sender<Result<Vec<u8>, String>>),
+    ListDevices(mpsc::Sender<Vec<AudioDevice>>),
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
 }
 
 pub struct AudioRecorder {
@@ -22,9 +31,36 @@ impl AudioRecorder {
 
             for cmd in cmd_rx {
                 match cmd {
-                    RecordCommand::Start => {
+                    RecordCommand::ListDevices(reply) => {
                         let host = cpal::default_host();
-                        let device = match host.default_input_device() {
+                        let default_name = host.default_input_device()
+                            .and_then(|d| d.name().ok())
+                            .unwrap_or_default();
+
+                        let mut devices = Vec::new();
+                        if let Ok(input_devices) = host.input_devices() {
+                            for device in input_devices {
+                                let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+                                devices.push(AudioDevice {
+                                    id: name.clone(),
+                                    name: name.clone(),
+                                    is_default: name == default_name,
+                                });
+                            }
+                        }
+                        let _ = reply.send(devices);
+                    }
+                    RecordCommand::Start(device_name) => {
+                        let host = cpal::default_host();
+                        let device = if let Some(ref name) = device_name {
+                            host.input_devices().ok()
+                                .and_then(|mut devs| devs.find(|d| d.name().ok().as_ref() == Some(name)))
+                                .or_else(|| host.default_input_device())
+                        } else {
+                            host.default_input_device()
+                        };
+
+                        let device = match device {
                             Some(d) => d,
                             None => {
                                 eprintln!("No input device found");
@@ -118,19 +154,24 @@ impl AudioRecorder {
         Self { cmd_tx }
     }
 
-    pub fn start(&self) -> Result<(), String> {
-        self.cmd_tx
-            .send(RecordCommand::Start)
+    pub fn list_devices(&self) -> Result<Vec<AudioDevice>, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.cmd_tx.send(RecordCommand::ListDevices(reply_tx))
+            .map_err(|_| "Audio thread not running".to_string())?;
+        reply_rx.recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| "Device list timeout".to_string())
+    }
+
+    pub fn start(&self, device_name: Option<String>) -> Result<(), String> {
+        self.cmd_tx.send(RecordCommand::Start(device_name))
             .map_err(|_| "Audio thread not running".to_string())
     }
 
     pub fn stop(&self) -> Result<Vec<u8>, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.cmd_tx
-            .send(RecordCommand::Stop(reply_tx))
+        self.cmd_tx.send(RecordCommand::Stop(reply_tx))
             .map_err(|_| "Audio thread not running".to_string())?;
-        reply_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+        reply_rx.recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| "Audio thread timeout".to_string())?
     }
 }
@@ -142,8 +183,8 @@ fn rms_volume(samples: &[f32]) -> f32 {
 }
 
 fn strip_silence(samples: &[f32], threshold: f32) -> Vec<f32> {
-    let window = 1600; // 100ms at 16kHz
-    let grace = 4800;  // 300ms grace period to keep natural pauses
+    let window = 1600;
+    let grace = 4800;
     let mut output = Vec::with_capacity(samples.len());
     let mut silence_run = 0usize;
 
@@ -167,29 +208,22 @@ fn strip_silence(samples: &[f32], threshold: f32) -> Vec<f32> {
 }
 
 fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
-        return samples.to_vec();
-    }
+    if from_rate == to_rate { return samples.to_vec(); }
     let ratio = from_rate as f64 / to_rate as f64;
     let output_len = (samples.len() as f64 / ratio) as usize;
     let mut output = Vec::with_capacity(output_len);
     for i in 0..output_len {
         let src_idx = (i as f64 * ratio) as usize;
-        if src_idx < samples.len() {
-            output.push(samples[src_idx]);
-        }
+        if src_idx < samples.len() { output.push(samples[src_idx]); }
     }
     output
 }
 
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
     let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
+        channels: 1, sample_rate, bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-
     let mut wav_buffer = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut wav_buffer);
