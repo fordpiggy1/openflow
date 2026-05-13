@@ -135,13 +135,24 @@ async fn fetch_openai_compatible_models(api_key: &str, provider: &Provider) -> R
 
         let id_lower = id.to_lowercase();
 
+        let modality = m["architecture"]["modality"].as_str().unwrap_or("");
+        let input_modalities = m["architecture"]["input_modalities"].as_array();
+        let has_audio_input = input_modalities
+            .map(|arr| arr.iter().any(|v| v.as_str() == Some("audio")))
+            .unwrap_or(false);
+
         let is_stt = id_lower.contains("whisper")
-            || (id_lower.contains("distil") && id_lower.contains("whisper"));
+            || id_lower.contains("speech-to-text")
+            || id_lower.contains("transcrib")
+            || modality.contains("audio")
+            || has_audio_input;
+
         let is_skip = id_lower.contains("tts")
+            || id_lower.contains("text-to-speech")
             || id_lower.contains("dall")
             || id_lower.contains("embed")
             || id_lower.contains("moderation")
-            || id_lower.contains("image");
+            || id_lower.contains("image-gen");
 
         if is_skip { continue; }
 
