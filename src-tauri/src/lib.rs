@@ -444,7 +444,11 @@ pub fn run() {
             let _tray = TrayIconBuilder::with_id("main_tray")
                 .menu(&menu)
                 .tooltip("OpenFlow - Ready")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon({
+                    let bytes = include_bytes!("../icons/icon.png");
+                    tauri::image::Image::from_bytes(bytes).unwrap_or_else(|_| app.default_window_icon().unwrap().clone())
+                })
+                .icon_as_template(true)
                 .on_menu_event(|app, event| {
                     let id = event.id().as_ref();
                     match id {
