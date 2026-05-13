@@ -245,36 +245,35 @@ fn simulate_paste() {
     }
 
     unsafe {
-        // Request accessibility permission with prompt
-        let key_str = b"AXTrustedCheckOptionPrompt\0".as_ptr() as *const std::ffi::c_void;
-
-        #[link(name = "CoreFoundation", kind = "framework")]
-        extern "C" {
-            fn CFStringCreateWithCString(
-                alloc: *const std::ffi::c_void,
-                c_str: *const u8,
-                encoding: u32,
-            ) -> *const std::ffi::c_void;
-        }
-
-        let cf_key = CFStringCreateWithCString(std::ptr::null(), key_str as *const u8, 0x08000100);
-        let keys = [cf_key];
-        let values = [kCFBooleanTrue];
-        let opts = CFDictionaryCreate(
-            std::ptr::null(),
-            keys.as_ptr(),
-            values.as_ptr(),
-            1,
-            &kCFTypeDictionaryKeyCallBacks as *const _ as *const std::ffi::c_void,
-            &kCFTypeDictionaryValueCallBacks as *const _ as *const std::ffi::c_void,
-        );
-
-        let trusted = AXIsProcessTrustedWithOptions(opts);
-        CFRelease(opts);
-        CFRelease(cf_key);
+        // Check without prompt first
+        let trusted = AXIsProcessTrustedWithOptions(std::ptr::null());
 
         if !trusted {
-            eprintln!("Accessibility permission not granted. Please enable in System Settings.");
+            // Only prompt once
+            #[link(name = "CoreFoundation", kind = "framework")]
+            extern "C" {
+                fn CFStringCreateWithCString(
+                    alloc: *const std::ffi::c_void,
+                    c_str: *const u8,
+                    encoding: u32,
+                ) -> *const std::ffi::c_void;
+            }
+
+            let key_str = b"AXTrustedCheckOptionPrompt\0";
+            let cf_key = CFStringCreateWithCString(std::ptr::null(), key_str.as_ptr(), 0x08000100);
+            let keys = [cf_key];
+            let values = [kCFBooleanTrue];
+            let opts = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const std::ffi::c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const std::ffi::c_void,
+            );
+            AXIsProcessTrustedWithOptions(opts);
+            CFRelease(opts);
+            CFRelease(cf_key);
             return;
         }
 
