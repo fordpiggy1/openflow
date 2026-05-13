@@ -52,8 +52,12 @@ function App() {
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
   const [sttModel, setSttModel] = useState("");
   const [chatModel, setChatModel] = useState("");
+  const [sttProvider, setSttProvider] = useState("openai");
+  const [sttApiKey, setSttApiKey] = useState("");
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
+
+  const needsSttProvider = provider === "openrouter";
 
   useEffect(() => {
     invoke<string | null>("get_api_key").then((key) => {
@@ -65,6 +69,8 @@ function App() {
     invoke<string | null>("get_setting", { key: "format_enabled" }).then((v) => { if (v === "false") setFormatEnabled(false); });
     invoke<string | null>("get_setting", { key: "stt_model" }).then((v) => { if (v) setSttModel(v); });
     invoke<string | null>("get_setting", { key: "chat_model" }).then((v) => { if (v) setChatModel(v); });
+    invoke<string | null>("get_setting", { key: "stt_provider" }).then((v) => { if (v) setSttProvider(v); });
+    invoke<string | null>("get_setting", { key: "stt_api_key" }).then((v) => { if (v) setSttApiKey(v); });
     loadHistory();
   }, []);
 
@@ -109,11 +115,16 @@ function App() {
 
   const handleSaveKey = async () => {
     if (!apiKey.trim()) return;
+    if (needsSttProvider && !sttApiKey.trim()) { setError("OpenRouter needs a separate STT provider key for transcription."); return; }
     try {
       await invoke("set_api_key", { key: apiKey.trim() });
       await saveSetting("provider", provider);
       if (sttModel) await saveSetting("stt_model", sttModel);
       if (chatModel) await saveSetting("chat_model", chatModel);
+      if (needsSttProvider) {
+        await saveSetting("stt_provider", sttProvider);
+        await saveSetting("stt_api_key", sttApiKey.trim());
+      }
       setScreen("main");
       setError("");
     } catch (e) { setError(String(e)); }
@@ -171,6 +182,27 @@ function App() {
             placeholder={providerInfo.placeholder}
             onKeyDown={(e) => e.key === "Enter" && handleSaveKey()}
           />
+          {needsSttProvider && (
+            <>
+              <div className="stt-notice">
+                <p className="hint">OpenRouter handles formatting only. You need a separate provider for speech-to-text:</p>
+              </div>
+              <div className="field">
+                <label className="label">STT Provider</label>
+                <select value={sttProvider} onChange={(e) => { setSttProvider(e.target.value); saveSetting("stt_provider", e.target.value); }}>
+                  <option value="openai">OpenAI</option>
+                  <option value="groq">Groq</option>
+                  <option value="deepgram">Deepgram</option>
+                </select>
+              </div>
+              <input
+                type="password"
+                value={sttApiKey}
+                onChange={(e) => setSttApiKey(e.target.value)}
+                placeholder={sttProvider === "groq" ? "Groq key (gsk_...)" : sttProvider === "openai" ? "OpenAI key (sk-...)" : "Deepgram key"}
+              />
+            </>
+          )}
           {apiKey.length > 10 && availableModels.length === 0 && !modelsLoading && (
             <button className="btn-secondary" onClick={() => loadModels(provider, apiKey)}>
               Load available models
@@ -292,6 +324,22 @@ function App() {
             <label>API Key</label>
             <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} onBlur={() => apiKey && invoke("set_api_key", { key: apiKey })} />
           </div>
+          {needsSttProvider && (
+            <>
+              <div className="setting-item">
+                <label>STT Provider</label>
+                <select value={sttProvider} onChange={(e) => { setSttProvider(e.target.value); saveSetting("stt_provider", e.target.value); }}>
+                  <option value="openai">OpenAI</option>
+                  <option value="groq">Groq</option>
+                  <option value="deepgram">Deepgram</option>
+                </select>
+              </div>
+              <div className="setting-item">
+                <label>STT API Key</label>
+                <input type="password" value={sttApiKey} onChange={(e) => setSttApiKey(e.target.value)} onBlur={() => sttApiKey && saveSetting("stt_api_key", sttApiKey)} />
+              </div>
+            </>
+          )}
           <div className="setting-item">
             <label>Models</label>
             <button className="btn-secondary" onClick={() => loadModels()}>

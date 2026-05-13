@@ -94,9 +94,21 @@ impl AudioRecorder {
                             continue;
                         }
 
-                        let mono_16k = downsample(&samples_data, native_sample_rate, 16000);
+                        let rms = rms_volume(&samples_data);
+                        if rms < 0.005 {
+                            let _ = reply.send(Err("No speech detected (too quiet).".to_string()));
+                            continue;
+                        }
 
-                        let result = encode_wav(&mono_16k, 16000);
+                        let mono_16k = downsample(&samples_data, native_sample_rate, 16000);
+                        let trimmed = strip_silence(&mono_16k, 0.01);
+
+                        if trimmed.len() < 1600 {
+                            let _ = reply.send(Err("Recording too short.".to_string()));
+                            continue;
+                        }
+
+                        let result = encode_wav(&trimmed, 16000);
                         let _ = reply.send(result);
                     }
                 }
@@ -121,6 +133,37 @@ impl AudioRecorder {
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| "Audio thread timeout".to_string())?
     }
+}
+
+fn rms_volume(samples: &[f32]) -> f32 {
+    if samples.is_empty() { return 0.0; }
+    let sum: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum / samples.len() as f64).sqrt() as f32
+}
+
+fn strip_silence(samples: &[f32], threshold: f32) -> Vec<f32> {
+    let window = 1600; // 100ms at 16kHz
+    let grace = 4800;  // 300ms grace period to keep natural pauses
+    let mut output = Vec::with_capacity(samples.len());
+    let mut silence_run = 0usize;
+
+    for chunk_start in (0..samples.len()).step_by(window) {
+        let chunk_end = (chunk_start + window).min(samples.len());
+        let chunk = &samples[chunk_start..chunk_end];
+        let chunk_rms = rms_volume(chunk);
+
+        if chunk_rms > threshold {
+            output.extend_from_slice(chunk);
+            silence_run = 0;
+        } else {
+            silence_run += chunk.len();
+            if silence_run <= grace {
+                output.extend_from_slice(chunk);
+            }
+        }
+    }
+
+    output
 }
 
 fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {

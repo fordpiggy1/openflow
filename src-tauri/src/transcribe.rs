@@ -78,6 +78,10 @@ impl Provider {
             _ => ("Authorization".to_string(), format!("Bearer {}", api_key)),
         }
     }
+
+    pub fn supports_stt(&self) -> bool {
+        !matches!(self, Self::OpenRouter)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -130,13 +134,18 @@ async fn fetch_openai_compatible_models(api_key: &str, provider: &Provider) -> R
         if id.is_empty() { continue; }
 
         let id_lower = id.to_lowercase();
-        let model_type = if id_lower.contains("whisper") || id_lower.contains("nova") {
-            "stt"
-        } else if id_lower.contains("tts") || id_lower.contains("dall") || id_lower.contains("embed") {
-            continue;
-        } else {
-            "chat"
-        };
+
+        let is_stt = id_lower.contains("whisper")
+            || (id_lower.contains("distil") && id_lower.contains("whisper"));
+        let is_skip = id_lower.contains("tts")
+            || id_lower.contains("dall")
+            || id_lower.contains("embed")
+            || id_lower.contains("moderation")
+            || id_lower.contains("image");
+
+        if is_skip { continue; }
+
+        let model_type = if is_stt { "stt" } else { "chat" };
 
         let name = m["name"].as_str()
             .unwrap_or(&id)

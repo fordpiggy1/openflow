@@ -436,3 +436,5 @@ h2 {
 }
 .btn-secondary:hover { border-color: var(--accent); }
 code { font-family: var(--font-mono); font-size: 0.9em; background: var(--bg-surface-alt); padding: 2px 4px; border-radius: 3px; }
+.stt-notice { padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-surface-alt); width: 100%; }
+.stt-notice .hint { text-align: left; max-width: none; }

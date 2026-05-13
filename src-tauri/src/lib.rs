@@ -80,7 +80,7 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<Tra
     let wav_bytes = state.recorder.stop()?;
 
     let api_key = state.db.get_setting("api_key")
-        .ok_or("No API key set. Add your Groq API key in settings.")?;
+        .ok_or("No API key set. Add your API key in settings.")?;
     let language = state.db.get_setting("language");
     let provider_str = state.db.get_setting("provider").unwrap_or_else(|| "groq".to_string());
     let provider = Provider::from_str(&provider_str);
@@ -91,7 +91,16 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<Tra
     let stt_model = state.db.get_setting("stt_model");
     let chat_model = state.db.get_setting("chat_model");
 
-    let raw_text = transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider, stt_model.as_deref()).await?;
+    let (stt_provider, stt_key) = if provider.supports_stt() {
+        (provider.clone(), api_key.clone())
+    } else {
+        let stt_prov_str = state.db.get_setting("stt_provider").unwrap_or_else(|| "openai".to_string());
+        let stt_api_key = state.db.get_setting("stt_api_key")
+            .ok_or("No STT API key set. OpenRouter needs a separate STT provider (Groq or OpenAI) for transcription.")?;
+        (Provider::from_str(&stt_prov_str), stt_api_key)
+    };
+
+    let raw_text = transcribe::transcribe_audio(wav_bytes, &stt_key, language.as_deref(), &stt_provider, stt_model.as_deref()).await?;
 
     let formatted = if format_enabled {
         match transcribe::format_text(&raw_text, &api_key, None, &provider, chat_model.as_deref()).await {
@@ -224,7 +233,21 @@ fn handle_hotkey_release(app: &AppHandle) {
         let stt_model = state.db.get_setting("stt_model");
         let chat_model = state.db.get_setting("chat_model");
 
-        let raw_text = match transcribe::transcribe_audio(wav_bytes, &api_key, language.as_deref(), &provider, stt_model.as_deref()).await {
+        let (stt_provider, stt_key) = if provider.supports_stt() {
+            (provider.clone(), api_key.clone())
+        } else {
+            let stt_prov_str = state.db.get_setting("stt_provider").unwrap_or_else(|| "openai".to_string());
+            match state.db.get_setting("stt_api_key") {
+                Some(k) => (Provider::from_str(&stt_prov_str), k),
+                None => {
+                    let _ = app_handle.emit("transcription-error", "OpenRouter needs a separate STT provider. Set one in settings.");
+                    let _ = app_handle.emit("recording-state", "idle");
+                    return;
+                }
+            }
+        };
+
+        let raw_text = match transcribe::transcribe_audio(wav_bytes, &stt_key, language.as_deref(), &stt_provider, stt_model.as_deref()).await {
             Ok(t) => t,
             Err(e) => {
                 let _ = app_handle.emit("transcription-error", &e);
