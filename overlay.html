@@ -153,6 +153,10 @@
     </div>
 
     <script type="module">
+      import { listen } from '@tauri-apps/api/event';
+      import { getCurrentWindow } from '@tauri-apps/api/window';
+      import { invoke } from '@tauri-apps/api/core';
+
       const overlay = document.getElementById('overlay');
       let position = 'left-center';
       let isDragging = false;
@@ -173,19 +177,6 @@
       };
 
       async function init() {
-        const tauriEvent = await import('/node_modules/@tauri-apps/api/event.js').catch(() =>
-          import('https://unpkg.com/@tauri-apps/api@2/event')
-        );
-        const tauriWindow = await import('/node_modules/@tauri-apps/api/window.js').catch(() =>
-          import('https://unpkg.com/@tauri-apps/api@2/window')
-        );
-        const tauriCore = await import('/node_modules/@tauri-apps/api/core.js').catch(() =>
-          import('https://unpkg.com/@tauri-apps/api@2/core')
-        );
-
-        const { listen } = tauriEvent;
-        const { getCurrentWindow } = tauriWindow;
-        const { invoke } = tauriCore;
         const win = getCurrentWindow();
 
         // Visible on all Spaces

@@ -455,6 +455,7 @@ pub fn run() {
                     match id {
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.unminimize();
                                 let _ = w.show();
                                 let _ = w.set_focus();
                             }
@@ -483,6 +484,11 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Make overlay background transparent
+            if let Some(overlay) = app.get_webview_window("overlay") {
+                let _ = overlay.set_background_color(Some(tauri::utils::config::Color(0, 0, 0, 0)));
+            }
 
             #[cfg(debug_assertions)]
             {
