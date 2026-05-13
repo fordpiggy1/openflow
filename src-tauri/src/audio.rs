@@ -130,16 +130,10 @@ impl AudioRecorder {
                             continue;
                         }
 
-                        let rms = rms_volume(&samples_data);
-                        if rms < 0.0005 {
-                            let _ = reply.send(Err("No speech detected (too quiet).".to_string()));
-                            continue;
-                        }
-
                         let mono_16k = downsample(&samples_data, native_sample_rate, 16000);
-                        let trimmed = strip_silence(&mono_16k, 0.01);
+                        let trimmed = strip_silence(&mono_16k, 0.005);
 
-                        if trimmed.len() < 1600 {
+                        if trimmed.len() < 800 {
                             let _ = reply.send(Err("Recording too short.".to_string()));
                             continue;
                         }
