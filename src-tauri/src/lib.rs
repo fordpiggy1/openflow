@@ -212,27 +212,6 @@ fn paste_to_clipboard(text: &str) -> Result<(), String> {
 fn simulate_paste() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    #[link(name = "ApplicationServices", kind = "framework")]
-    extern "C" {
-        fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFDictionaryCreate(
-            allocator: *const std::ffi::c_void,
-            keys: *const *const std::ffi::c_void,
-            values: *const *const std::ffi::c_void,
-            num_values: isize,
-            key_callbacks: *const std::ffi::c_void,
-            value_callbacks: *const std::ffi::c_void,
-        ) -> *const std::ffi::c_void;
-        fn CFRelease(cf: *const std::ffi::c_void);
-        static kCFBooleanTrue: *const std::ffi::c_void;
-        static kCFTypeDictionaryKeyCallBacks: std::ffi::c_void;
-        static kCFTypeDictionaryValueCallBacks: std::ffi::c_void;
-    }
-
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGEventCreateKeyboardEvent(
@@ -244,46 +223,18 @@ fn simulate_paste() {
         fn CGEventPost(tap: u32, event: *const std::ffi::c_void);
     }
 
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
     unsafe {
-        // Check without prompt first
-        let trusted = AXIsProcessTrustedWithOptions(std::ptr::null());
-
-        if !trusted {
-            // Only prompt once
-            #[link(name = "CoreFoundation", kind = "framework")]
-            extern "C" {
-                fn CFStringCreateWithCString(
-                    alloc: *const std::ffi::c_void,
-                    c_str: *const u8,
-                    encoding: u32,
-                ) -> *const std::ffi::c_void;
-            }
-
-            let key_str = b"AXTrustedCheckOptionPrompt\0";
-            let cf_key = CFStringCreateWithCString(std::ptr::null(), key_str.as_ptr(), 0x08000100);
-            let keys = [cf_key];
-            let values = [kCFBooleanTrue];
-            let opts = CFDictionaryCreate(
-                std::ptr::null(),
-                keys.as_ptr(),
-                values.as_ptr(),
-                1,
-                &kCFTypeDictionaryKeyCallBacks as *const _ as *const std::ffi::c_void,
-                &kCFTypeDictionaryValueCallBacks as *const _ as *const std::ffi::c_void,
-            );
-            AXIsProcessTrustedWithOptions(opts);
-            CFRelease(opts);
-            CFRelease(cf_key);
-            return;
-        }
-
-        // Simulate Cmd+V using CoreGraphics
-        let v_keycode: u16 = 9; // kVK_ANSI_V
-        let cmd_flag: u64 = 0x100000; // kCGEventFlagMaskCommand
+        let v_keycode: u16 = 9;
+        let cmd_flag: u64 = 0x100000;
 
         let key_down = CGEventCreateKeyboardEvent(std::ptr::null(), v_keycode, true);
         CGEventSetFlags(key_down, cmd_flag);
-        CGEventPost(0, key_down); // kCGHIDEventTap = 0
+        CGEventPost(0, key_down);
 
         let key_up = CGEventCreateKeyboardEvent(std::ptr::null(), v_keycode, false);
         CGEventSetFlags(key_up, cmd_flag);
