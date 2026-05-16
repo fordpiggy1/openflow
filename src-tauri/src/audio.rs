@@ -122,7 +122,10 @@ impl AudioRecorder {
                         }
                     }
                     RecordCommand::Stop(reply) => {
-                        _active_stream = None;
+                        if let Some(ref stream) = _active_stream {
+                            let _ = stream.pause();
+                        }
+                        drop(_active_stream.take());
 
                         let samples_data = samples.lock().unwrap();
                         if samples_data.is_empty() {
