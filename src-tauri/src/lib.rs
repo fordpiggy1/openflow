@@ -290,19 +290,9 @@ fn get_shortcut_from_settings(db: &Database, action: &str, default: &str) -> Sho
 // ── Hotkey handlers ───────────────────────────────────────
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.unminimize();
         let _ = w.show();
+        let _ = w.unminimize();
         let _ = w.set_focus();
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-        let bundle_id = "io.laisy.openflow";
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(format!("tell application id \"{}\" to activate", bundle_id))
-            .spawn();
     }
 }
 
@@ -513,6 +503,14 @@ pub fn run() {
             }
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             set_api_key, get_api_key, get_setting, set_setting,
