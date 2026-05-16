@@ -289,30 +289,20 @@ fn get_shortcut_from_settings(db: &Database, action: &str, default: &str) -> Sho
 
 // ── Hotkey handlers ───────────────────────────────────────
 fn show_main_window(app: &AppHandle) {
-    #[cfg(target_os = "macos")]
-    {
-        #[link(name = "AppKit", kind = "framework")]
-        extern "C" {
-            fn NSApp() -> *mut std::ffi::c_void;
-        }
-
-        #[link(name = "objc", kind = "dylib")]
-        extern "C" {
-            fn objc_msgSend(receiver: *mut std::ffi::c_void, sel: *const std::ffi::c_void, ...) -> *mut std::ffi::c_void;
-            fn sel_registerName(name: *const u8) -> *const std::ffi::c_void;
-        }
-
-        unsafe {
-            let nsapp = NSApp();
-            let activate_sel = sel_registerName(b"activateIgnoringOtherApps:\0".as_ptr());
-            objc_msgSend(nsapp, activate_sel, true as i32);
-        }
-    }
-
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let bundle_id = "io.laisy.openflow";
+        let _ = Command::new("osascript")
+            .arg("-e")
+            .arg(format!("tell application id \"{}\" to activate", bundle_id))
+            .spawn();
     }
 }
 
