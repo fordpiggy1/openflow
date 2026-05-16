@@ -53,7 +53,8 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "infoPlist": "Info.plist"
     }
   }
 }
