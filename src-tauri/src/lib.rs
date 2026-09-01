@@ -157,15 +157,44 @@ fn speech_settings(
         .secrets
         .get("tts_api_key")?
         .or_else(|| state.secrets.get("api_key").ok().flatten())
-        .ok_or("No API key set. Add your OpenRouter key in Settings.")?;
+        .unwrap_or_default();
+    // A self-hosted endpoint on the LAN normally has no auth. Every hosted
+    // provider still needs a key, and saying so early beats a 401 later.
+    if api_key.trim().is_empty() && !provider.is_custom() {
+        return Err("No API key set. Add your key in Settings.".to_string());
+    }
+    // Gemini's model and voice names are meaningless to a self-hosted server,
+    // so custom endpoints fall back to the generic OpenAI names instead.
     let model = model
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| state.db.get_setting("tts_model"))
-        .unwrap_or_else(|| transcribe::GEMINI_TTS_MODEL.to_string());
+        .or_else(|| {
+            state
+                .db
+                .get_setting("tts_model")
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            if provider.is_custom() {
+                "tts-1".to_string()
+            } else {
+                transcribe::GEMINI_TTS_MODEL.to_string()
+            }
+        });
     let voice = voice
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| state.db.get_setting("tts_voice"))
-        .unwrap_or_else(|| "Kore".to_string());
+        .or_else(|| {
+            state
+                .db
+                .get_setting("tts_voice")
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            if provider.is_custom() {
+                "alloy".to_string()
+            } else {
+                "Kore".to_string()
+            }
+        });
     let format = response_format
         .filter(|value| !value.trim().is_empty())
         .or_else(|| state.db.get_setting("tts_response_format"))

@@ -274,6 +274,8 @@ function App() {
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [ttsModel, setTtsModel] = useState(TTS_DEFAULT_MODEL);
   const [ttsVoice, setTtsVoice] = useState("Kore");
+  const [ttsProvider, setTtsProvider] = useState("openrouter");
+  const [customTtsUrl, setCustomTtsUrl] = useState("");
   const [ttsPreviewText, setTtsPreviewText] = useState("OpenFlow is ready. Your ideas can move at the speed of your voice.");
   const [ttsStatus, setTtsStatus] = useState<"idle" | "streaming" | "ready" | "error">("idle");
   const [ttsError, setTtsError] = useState("");
@@ -353,7 +355,7 @@ function App() {
           invoke<string | null>("get_api_key"),
           invoke<string | null>("get_setting", { key: "formatting_api_key" }),
         ]);
-        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice, storedSaveHistory, storedRetentionDays] = await Promise.all([
+        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice, storedTtsProvider, storedSaveHistory, storedRetentionDays] = await Promise.all([
           invoke<string | null>("get_setting", { key: "provider" }),
           invoke<string | null>("get_setting", { key: "formatting_provider" }),
           invoke<string | null>("get_setting", { key: "same_provider" }),
@@ -368,6 +370,7 @@ function App() {
           invoke<string | null>("get_setting", { key: "tts_enabled" }),
           invoke<string | null>("get_setting", { key: "tts_model" }),
           invoke<string | null>("get_setting", { key: "tts_voice" }),
+          invoke<string | null>("get_setting", { key: "tts_provider" }),
           invoke<string | null>("get_setting", { key: "save_history" }),
           invoke<string | null>("get_setting", { key: "history_retention_days" }),
         ]);
@@ -409,6 +412,9 @@ function App() {
         setTtsEnabled(storedTtsEnabled !== "false");
         if (storedTtsModel) setTtsModel(storedTtsModel);
         if (storedTtsVoice) setTtsVoice(storedTtsVoice);
+        const parsedTts = parseStoredProvider(storedTtsProvider);
+        setTtsProvider(parsedTts.name);
+        setCustomTtsUrl(parsedTts.customUrl);
         if (storedSaveHistory === "false") setSaveHistory(false);
         if (storedRetentionDays) setRetentionDays(storedRetentionDays);
       } catch (reason) {
@@ -609,7 +615,7 @@ function App() {
       ["theme", theme],
       ["microphone", microphone],
       ["tts_enabled", String(ttsEnabled)],
-      ["tts_provider", "openrouter"],
+      ["tts_provider", providerValue(ttsProvider, customTtsUrl)],
       ["tts_model", ttsModel.trim() || TTS_DEFAULT_MODEL],
       ["tts_voice", ttsVoice.trim() || "Kore"],
       ["tts_response_format", "mp3"],
@@ -1085,15 +1091,19 @@ function App() {
           </section>
 
           <section className="settings-section voice-section">
-            <div className="section-heading"><div><div className="heading-with-badge"><h2>Gemini voice</h2><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div><p>Preview Gemini 3.1 Flash TTS through OpenRouter.</p></div><span className="section-number">03</span></div>
-            {transcriptionProvider !== "openrouter" ? (
+            <div className="section-heading"><div><div className="heading-with-badge"><h2>Voice output</h2><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div><p>Preview Gemini 3.1 Flash TTS through OpenRouter.</p></div><span className="section-number">03</span></div>
+            {ttsProvider !== "custom" && transcriptionProvider !== "openrouter" ? (
               <div className="capability-empty"><Icon name="volume" size={22} /><div><strong>OpenRouter connection required</strong><p>Choose OpenRouter above to stream Gemini voice previews with the same protected key.</p></div></div>
             ) : (
               <>
                 <div className="settings-grid">
                   <div className="inline-setting span-two"><div><strong>Voice features</strong><small>Enable speech generation in OpenFlow.</small></div><Toggle checked={ttsEnabled} label="Enable voice features" onChange={(checked) => { setTtsEnabled(checked); markDirty(); }} /></div>
-                  <div className="field-group"><label htmlFor="settings-tts-model">Voice model</label><input id="settings-tts-model" list="settings-tts-models" value={ttsModel} disabled={!ttsEnabled} onChange={(event) => { setTtsModel(event.target.value); markDirty(); setTtsStatus("idle"); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
-                  <div className="field-group"><label htmlFor="settings-tts-voice">Voice</label><input id="settings-tts-voice" list="tts-voices" value={ttsVoice} disabled={!ttsEnabled} onChange={(event) => { setTtsVoice(event.target.value); markDirty(); setTtsStatus("idle"); }} /><datalist id="tts-voices">{TTS_VOICES.map((voice) => <option key={voice} value={voice} />)}</datalist></div>
+                  <div className="field-group"><label htmlFor="settings-tts-provider">Speech endpoint</label><select id="settings-tts-provider" value={ttsProvider} disabled={!ttsEnabled} onChange={(event) => { const next = event.target.value; setTtsProvider(next); markDirty(); setTtsStatus("idle"); if (next === "custom") { setTtsModel(""); setTtsVoice(""); } }}><option value="openrouter">OpenRouter (Gemini)</option><option value="openai">OpenAI</option><option value="custom">Self-hosted / LAN</option></select><small>Point this at a machine on your network to keep audio off the internet.</small></div>
+                  {ttsProvider === "custom" && (
+                    <div className="field-group span-two"><label htmlFor="settings-tts-url">Speech endpoint URL</label><input id="settings-tts-url" value={customTtsUrl} disabled={!ttsEnabled} onChange={(event) => { setCustomTtsUrl(event.target.value); markDirty(); setTtsStatus("idle"); }} placeholder="http://192.168.1.10:8880/v1" autoCapitalize="none" autoCorrect="off" spellCheck={false} /><small>OpenAI-compatible base URL. OpenFlow calls <code>/audio/speech</code> under it. Plain http and an empty API key are both fine on a LAN.</small></div>
+                  )}
+                  <div className="field-group"><label htmlFor="settings-tts-model">Voice model</label><input id="settings-tts-model" list="settings-tts-models" value={ttsModel} disabled={!ttsEnabled} placeholder={ttsProvider === "custom" ? "kokoro" : TTS_DEFAULT_MODEL} onChange={(event) => { setTtsModel(event.target.value); markDirty(); setTtsStatus("idle"); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
+                  <div className="field-group"><label htmlFor="settings-tts-voice">Voice</label><input id="settings-tts-voice" list="tts-voices" value={ttsVoice} disabled={!ttsEnabled} placeholder={ttsProvider === "custom" ? "af_bella" : "Kore"} onChange={(event) => { setTtsVoice(event.target.value); markDirty(); setTtsStatus("idle"); }} /><datalist id="tts-voices">{TTS_VOICES.map((voice) => <option key={voice} value={voice} />)}</datalist></div>
                 </div>
                 <div className="voice-preview">
                   <label htmlFor="tts-preview">Preview text</label>

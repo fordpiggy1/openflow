@@ -39,6 +39,37 @@ Model availability and billing are controlled by the provider. OpenFlow does not
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.
 
+## Self-hosting on your LAN
+
+Both speech-to-text and speech synthesis can point at a machine on your own
+network, so audio never leaves it and there is no per-request cost.
+
+Pick **Custom** as the transcription provider, or **Self-hosted / LAN** as the
+speech endpoint, and give the OpenAI-compatible base URL:
+
+```
+http://192.168.1.10:8880/v1
+```
+
+OpenFlow appends the standard paths under it (`/audio/transcriptions`,
+`/chat/completions`, `/audio/speech`). Plain `http` is accepted, and an empty
+API key is fine -- when there is no key, no `Authorization` header is sent at
+all, which is what unauthenticated local servers expect.
+
+Servers that work as-is:
+
+| Role | Server | Notes |
+|------|--------|-------|
+| Speech synthesis | [`kokoro-fastapi`](https://github.com/remsky/Kokoro-FastAPI) | Serves `/v1/audio/speech`, supports streaming. Model `kokoro`, voices like `af_bella`. |
+| Speech synthesis | [`openedai-speech`](https://github.com/matatonic/openedai-speech) | Wraps Piper or XTTS behind the OpenAI API. Lighter on CPU-only boxes. |
+| Transcription | [`faster-whisper-server`](https://github.com/fedirz/faster-whisper-server) | Serves `/v1/audio/transcriptions`. |
+| Transcription | `whisper.cpp` server | Built-in OpenAI-compatible mode. |
+
+On macOS the first connection to a LAN address triggers the system's local
+network permission prompt. Approve it, or the requests fail in a way that looks
+exactly like the server being down. (Settings -> Privacy & Security -> Local
+Network if it was denied once.)
+
 ## Audio pipeline
 
 Capture runs at the device's native rate and format, then downsamples to the
