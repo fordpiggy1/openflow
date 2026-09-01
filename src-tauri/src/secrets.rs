@@ -8,6 +8,7 @@ use std::path::{Component, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE: &str = "io.laisy.openflow";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;

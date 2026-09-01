@@ -17,7 +17,7 @@ The project is currently an early source build. There are no official pre-built 
 
 ### Streaming scope
 
-Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview uses a streaming HTTP response and delivers ordered chunks to the UI, but playback starts after the preview has finished downloading.
+Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download.
 
 ## Providers
 

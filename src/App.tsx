@@ -64,6 +64,15 @@ interface TtsStreamResult {
   bytes: number;
 }
 
+interface TtsStreamPlayback {
+  mediaSource: MediaSource;
+  sourceBuffer: SourceBuffer | null;
+  pending: Map<number, Uint8Array>;
+  nextSequence: number;
+  finished: boolean;
+  started: boolean;
+}
+
 interface ProviderDefinition {
   label: string;
   description: string;
@@ -165,6 +174,31 @@ function decodeBase64Chunks(chunks: string[]) {
   });
 }
 
+function pumpTtsPlayback(
+  playback: TtsStreamPlayback,
+  audio: HTMLAudioElement | null,
+  onPlaybackError: () => void,
+) {
+  const sourceBuffer = playback.sourceBuffer;
+  if (!sourceBuffer || sourceBuffer.updating || playback.mediaSource.readyState !== "open") return;
+
+  if (!playback.started && sourceBuffer.buffered.length > 0) {
+    playback.started = true;
+    void audio?.play().catch(onPlaybackError);
+  }
+
+  const next = playback.pending.get(playback.nextSequence);
+  if (next) {
+    playback.pending.delete(playback.nextSequence);
+    playback.nextSequence += 1;
+    const bytes = next.buffer.slice(next.byteOffset, next.byteOffset + next.byteLength) as ArrayBuffer;
+    sourceBuffer.appendBuffer(bytes);
+    return;
+  }
+
+  if (playback.finished) playback.mediaSource.endOfStream();
+}
+
 function Icon({ name, size = 18 }: { name: "arrow" | "check" | "clock" | "gear" | "mic" | "play" | "refresh" | "spark" | "stop" | "volume"; size?: number }) {
   const paths: Record<typeof name, ReactNode> = {
     arrow: <><path d="m15 18-6-6 6-6"/><path d="M9 12h10"/></>,
@@ -243,6 +277,7 @@ function App() {
   const [ttsAudioUrl, setTtsAudioUrl] = useState("");
   const ttsRequestRef = useRef<string | null>(null);
   const ttsChunksRef = useRef<Map<string, Map<number, string>>>(new Map());
+  const ttsPlaybackRef = useRef<Map<string, TtsStreamPlayback>>(new Map());
   const ttsMimeRef = useRef("audio/mpeg");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const cancelHotkeyEditRef = useRef(false);
@@ -392,6 +427,14 @@ function App() {
         const chunks = ttsChunksRef.current.get(request_id) || new Map<number, string>();
         chunks.set(sequence, data_base64);
         ttsChunksRef.current.set(request_id, chunks);
+        const playback = ttsPlaybackRef.current.get(request_id);
+        if (playback) {
+          const [bytes] = decodeBase64Chunks([data_base64]);
+          playback.pending.set(sequence, bytes);
+          pumpTtsPlayback(playback, audioRef.current, () => {
+            setTtsError("Live playback was blocked. Use the audio controls to continue.");
+          });
+        }
       }),
       listen<TtsFinished>("tts-finished", (event) => {
         const requestId = event.payload?.request_id || ttsRequestRef.current;
@@ -400,6 +443,18 @@ function App() {
         if (!chunks?.size) {
           setTtsStatus("error");
           setTtsError("Voice preview failed. The provider returned no audio.");
+          ttsChunksRef.current.delete(requestId);
+          ttsPlaybackRef.current.delete(requestId);
+          ttsRequestRef.current = null;
+          return;
+        }
+        const playback = ttsPlaybackRef.current.get(requestId);
+        if (playback) {
+          playback.finished = true;
+          pumpTtsPlayback(playback, audioRef.current, () => {
+            setTtsError("Live playback was blocked. Use the audio controls to continue.");
+          });
+          setTtsStatus("ready");
           ttsChunksRef.current.delete(requestId);
           ttsRequestRef.current = null;
           return;
@@ -419,6 +474,15 @@ function App() {
   }, [loadHistory, showNotification]);
 
   useEffect(() => () => { if (ttsAudioUrl) URL.revokeObjectURL(ttsAudioUrl); }, [ttsAudioUrl]);
+
+  useEffect(() => () => {
+    for (const playback of ttsPlaybackRef.current.values()) {
+      if (playback.mediaSource.readyState === "open") {
+        try { playback.mediaSource.endOfStream(); } catch { /* The stream may already be closing. */ }
+      }
+    }
+    ttsPlaybackRef.current.clear();
+  }, []);
 
   const markDirty = () => {
     setSettingsDirty(true);
@@ -605,7 +669,10 @@ function App() {
     if (!ttsPreviewText.trim()) { setTtsError("Enter a short preview sentence first."); return; }
     if (transcriptionProvider !== "openrouter") { setTtsError("Gemini voice previews require OpenRouter as your transcription provider."); return; }
     if (ttsStatus === "ready" && ttsAudioUrl) {
-      try { await audioRef.current?.play(); } catch { setTtsError("Playback was blocked. Use the audio controls below to play the preview."); }
+      try {
+        if (audioRef.current) audioRef.current.currentTime = 0;
+        await audioRef.current?.play();
+      } catch { setTtsError("Playback was blocked. Use the audio controls below to play the preview."); }
       return;
     }
     setTtsError("");
@@ -614,6 +681,40 @@ function App() {
     ttsRequestRef.current = requestId;
     ttsChunksRef.current.set(requestId, new Map());
     ttsMimeRef.current = "audio/mpeg";
+    if ("MediaSource" in window && MediaSource.isTypeSupported("audio/mpeg")) {
+      const mediaSource = new MediaSource();
+      const playback: TtsStreamPlayback = {
+        mediaSource,
+        sourceBuffer: null,
+        pending: new Map(),
+        nextSequence: 0,
+        finished: false,
+        started: false,
+      };
+      ttsPlaybackRef.current.set(requestId, playback);
+      const streamUrl = URL.createObjectURL(mediaSource);
+      setTtsAudioUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return streamUrl;
+      });
+      mediaSource.addEventListener("sourceopen", () => {
+        if (ttsPlaybackRef.current.get(requestId) !== playback) return;
+        try {
+          playback.sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+          playback.sourceBuffer.mode = "sequence";
+          playback.sourceBuffer.addEventListener("updateend", () => {
+            pumpTtsPlayback(playback, audioRef.current, () => {
+              setTtsError("Live playback was blocked. Use the audio controls to continue.");
+            });
+          });
+          pumpTtsPlayback(playback, audioRef.current, () => {
+            setTtsError("Live playback was blocked. Use the audio controls to continue.");
+          });
+        } catch {
+          ttsPlaybackRef.current.delete(requestId);
+        }
+      }, { once: true });
+    }
     try {
       const result = await invoke<TtsStreamResult>("stream_speech", {
         text: ttsPreviewText.trim(),
@@ -640,6 +741,7 @@ function App() {
           ? "Voice preview failed. The provider returned no audio."
           : "Voice preview failed. Audio could not be delivered to the player.");
         ttsChunksRef.current.delete(requestId);
+        ttsPlaybackRef.current.delete(requestId);
         ttsRequestRef.current = null;
       }
     } catch (reason) {
@@ -647,6 +749,7 @@ function App() {
         setTtsStatus("error");
         setTtsError(`Voice preview failed. ${friendlyError(reason)}`);
         ttsChunksRef.current.delete(requestId);
+        ttsPlaybackRef.current.delete(requestId);
         ttsRequestRef.current = null;
       }
     }
@@ -656,7 +759,15 @@ function App() {
     const requestId = ttsRequestRef.current;
     try { await invoke("cancel_speech", { requestId }); } catch { /* Cancellation is best-effort. */ }
     if (requestId) ttsChunksRef.current.delete(requestId);
+    if (requestId) {
+      const playback = ttsPlaybackRef.current.get(requestId);
+      if (playback?.mediaSource.readyState === "open") {
+        try { playback.mediaSource.endOfStream(); } catch { /* Cancellation races with provider completion. */ }
+      }
+      ttsPlaybackRef.current.delete(requestId);
+    }
     ttsRequestRef.current = null;
+    setTtsAudioUrl("");
     setTtsStatus("idle");
     setTtsError("");
   };
