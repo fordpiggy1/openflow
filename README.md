@@ -35,9 +35,50 @@ Model availability and billing are controlled by the provider. OpenFlow does not
 
 - API credentials are stored using macOS Keychain, Windows DPAPI, or Linux Secret Service. Linux requires an unlocked keyring and the `secret-tool` command.
 - Recordings are held in memory for transcription and sent to the provider selected in Settings. Cleanup sends transcript text to the selected cleanup provider. Gemini voice previews send their text to OpenRouter.
-- Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory.
+- Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory. You control it from Settings: delete individual entries, clear everything, turn saving off entirely, or set an auto-delete window (1/7/30/90 days) that is applied at launch and after each transcription.
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.
+
+## Self-hosting on your LAN
+
+Both speech-to-text and speech synthesis can point at a machine on your own
+network, so audio never leaves it and there is no per-request cost.
+
+Pick **Custom** as the transcription provider, or **Self-hosted / LAN** as the
+speech endpoint, and give the OpenAI-compatible base URL:
+
+```
+http://192.168.1.10:8880/v1
+```
+
+OpenFlow appends the standard paths under it (`/audio/transcriptions`,
+`/chat/completions`, `/audio/speech`). Plain `http` is accepted, and an empty
+API key is fine -- when there is no key, no `Authorization` header is sent at
+all, which is what unauthenticated local servers expect.
+
+Servers that work as-is:
+
+| Role | Server | Notes |
+|------|--------|-------|
+| Speech synthesis | [`kokoro-fastapi`](https://github.com/remsky/Kokoro-FastAPI) | Serves `/v1/audio/speech`, supports streaming. Model `kokoro`, voices like `af_bella`. |
+| Speech synthesis | [`openedai-speech`](https://github.com/matatonic/openedai-speech) | Wraps Piper or XTTS behind the OpenAI API. Lighter on CPU-only boxes. |
+| Transcription | [`faster-whisper-server`](https://github.com/fedirz/faster-whisper-server) | Serves `/v1/audio/transcriptions`. |
+| Transcription | `whisper.cpp` server | Built-in OpenAI-compatible mode. |
+
+On macOS the first connection to a LAN address triggers the system's local
+network permission prompt. Approve it, or the requests fail in a way that looks
+exactly like the server being down. (Settings -> Privacy & Security -> Local
+Network if it was denied once.)
+
+## Audio pipeline
+
+Capture runs at the device's native rate and format, then downsamples to the
+16 kHz mono WAV the speech models expect. The resampler low-passes before
+decimating: skipping that step folds everything above the new 8 kHz Nyquist
+back into the speech band (a 15 kHz whine lands on 1 kHz, on top of the voice),
+and interpolation alone does not prevent it. Gain is then set from the 95th
+percentile of sample magnitude rather than the absolute peak, so a single cough
+or desk bump does not cancel the boost for an otherwise quiet recording.
 
 ## Build from source
 

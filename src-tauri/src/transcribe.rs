@@ -74,11 +74,23 @@ impl Provider {
         }
     }
 
-    fn authorization(&self, api_key: &str) -> String {
-        match self {
+    /// `None` when there is no key to send.
+    ///
+    /// Self-hosted OpenAI-compatible servers on a LAN (Kokoro, llama.cpp,
+    /// vLLM, ...) usually run with no auth at all, and several of them reject a
+    /// request carrying `Bearer ` with an empty value. Omit the header instead.
+    fn authorization(&self, api_key: &str) -> Option<String> {
+        if api_key.trim().is_empty() {
+            return None;
+        }
+        Some(match self {
             Self::Deepgram => format!("Token {}", api_key),
             _ => format!("Bearer {}", api_key),
-        }
+        })
+    }
+
+    pub fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
     }
 
     pub fn is_openrouter(&self) -> bool {
@@ -111,9 +123,7 @@ pub async fn fetch_models(api_key: &str, provider: &Provider) -> Result<Vec<Mode
     }
     let client = client()?;
     let response = with_openrouter_headers(
-        client
-            .get(provider.endpoint("models")?)
-            .bearer_auth(api_key),
+        with_auth(client.get(provider.endpoint("models")?), provider, api_key),
         provider,
     )
     .timeout(Duration::from_secs(15))
@@ -281,9 +291,11 @@ async fn transcribe_whisper(
         form = form.text("language", language.to_string());
     }
     let response = with_openrouter_headers(
-        client()?
-            .post(provider.endpoint("audio/transcriptions")?)
-            .header("Authorization", provider.authorization(api_key)),
+        with_auth(
+            client()?.post(provider.endpoint("audio/transcriptions")?),
+            provider,
+            api_key,
+        ),
         provider,
     )
     .multipart(form)
@@ -379,9 +391,7 @@ pub async fn format_text(
     });
     let endpoint = provider.endpoint("chat/completions")?;
     let response = with_openrouter_headers(
-        client()?
-            .post(endpoint)
-            .header("Authorization", provider.authorization(api_key)),
+        with_auth(client()?.post(endpoint), provider, api_key),
         provider,
     )
     .json(&body)
@@ -441,9 +451,11 @@ pub async fn request_speech(
     }
     let body = serde_json::json!({ "model": model, "input": text, "voice": voice, "response_format": response_format });
     let response = with_openrouter_headers(
-        client()?
-            .post(provider.endpoint("audio/speech")?)
-            .header("Authorization", provider.authorization(api_key)),
+        with_auth(
+            client()?.post(provider.endpoint("audio/speech")?),
+            provider,
+            api_key,
+        ),
         provider,
     )
     .json(&body)
@@ -500,6 +512,18 @@ fn client() -> Result<reqwest::Client, String> {
         .user_agent("OpenFlow/0.1")
         .build()
         .map_err(|error| format!("Could not initialize network client: {}", error))
+}
+
+/// Attaches the Authorization header only when there is a key to attach.
+fn with_auth(
+    builder: reqwest::RequestBuilder,
+    provider: &Provider,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    match provider.authorization(api_key) {
+        Some(value) => builder.header("Authorization", value),
+        None => builder,
+    }
 }
 
 fn with_openrouter_headers(
@@ -584,6 +608,40 @@ fn validate_custom_url(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_api_key_sends_no_authorization_header() {
+        // Self-hosted servers on a LAN are usually unauthenticated, and some
+        // reject a request carrying `Bearer ` with an empty value.
+        let custom = Provider::from_str("custom:http://192.168.1.10:8880/v1");
+        assert_eq!(custom.authorization(""), None);
+        assert_eq!(custom.authorization("   "), None);
+        assert_eq!(
+            custom.authorization("sk-local"),
+            Some("Bearer sk-local".to_string())
+        );
+        assert_eq!(
+            Provider::from_str("deepgram").authorization("abc"),
+            Some("Token abc".to_string())
+        );
+    }
+
+    #[test]
+    fn custom_provider_accepts_plain_http_lan_addresses() {
+        // No TLS on a home network, so http:// has to survive validation.
+        let provider = Provider::from_str("custom:http://192.168.100.121:8880/v1");
+        assert!(provider.is_custom());
+        assert_eq!(
+            provider.endpoint("audio/speech").unwrap(),
+            "http://192.168.100.121:8880/v1/audio/speech"
+        );
+    }
+
+    #[test]
+    fn custom_provider_with_no_url_reports_a_usable_error() {
+        let broken = Provider::from_str("custom:not a url");
+        assert!(broken.endpoint("audio/speech").is_err());
+    }
 
     #[test]
     fn custom_provider_rejects_non_http_urls() {

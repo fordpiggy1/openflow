@@ -267,10 +267,15 @@ function App() {
   const [showFormattingKey, setShowFormattingKey] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsDirty, setSettingsDirty] = useState(false);
+  const [saveHistory, setSaveHistory] = useState(true);
+  const [retentionDays, setRetentionDays] = useState("");
+  const [confirmingClear, setConfirmingClear] = useState(false);
 
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [ttsModel, setTtsModel] = useState(TTS_DEFAULT_MODEL);
   const [ttsVoice, setTtsVoice] = useState("Kore");
+  const [ttsProvider, setTtsProvider] = useState("openrouter");
+  const [customTtsUrl, setCustomTtsUrl] = useState("");
   const [ttsPreviewText, setTtsPreviewText] = useState("OpenFlow is ready. Your ideas can move at the speed of your voice.");
   const [ttsStatus, setTtsStatus] = useState<"idle" | "streaming" | "ready" | "error">("idle");
   const [ttsError, setTtsError] = useState("");
@@ -281,6 +286,31 @@ function App() {
   const ttsMimeRef = useRef("audio/mpeg");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const cancelHotkeyEditRef = useRef(false);
+
+  // Copy without the paste keystroke. paste_text is the other verb, used by the
+  // tray and the re-copy hotkey where focus is in the user's editor.
+  const copyToClipboard = async (text: string) => {
+    try { await invoke("copy_text", { text }); showNotification("Copied to clipboard"); }
+    catch (err) { setError(String(err)); }
+  };
+
+  const handleDeleteTranscription = async (id: string) => {
+    try {
+      await invoke("delete_transcription", { id });
+      setHistory((prev) => prev.filter((entry) => entry.id !== id));
+      showNotification("Deleted");
+    } catch (err) { setError(String(err)); }
+  };
+
+  const handleClearHistory = async () => {
+    if (!confirmingClear) { setConfirmingClear(true); return; }
+    try {
+      const removed = await invoke<number>("clear_history");
+      setHistory([]);
+      showNotification(`Deleted ${removed} transcription${removed === 1 ? "" : "s"}`);
+    } catch (err) { setError(String(err)); }
+    setConfirmingClear(false);
+  };
 
   const showNotification = useCallback((message: string) => {
     setNotification(message);
@@ -325,7 +355,7 @@ function App() {
           invoke<string | null>("get_api_key"),
           invoke<string | null>("get_setting", { key: "formatting_api_key" }),
         ]);
-        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice] = await Promise.all([
+        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice, storedTtsProvider, storedSaveHistory, storedRetentionDays] = await Promise.all([
           invoke<string | null>("get_setting", { key: "provider" }),
           invoke<string | null>("get_setting", { key: "formatting_provider" }),
           invoke<string | null>("get_setting", { key: "same_provider" }),
@@ -340,6 +370,9 @@ function App() {
           invoke<string | null>("get_setting", { key: "tts_enabled" }),
           invoke<string | null>("get_setting", { key: "tts_model" }),
           invoke<string | null>("get_setting", { key: "tts_voice" }),
+          invoke<string | null>("get_setting", { key: "tts_provider" }),
+          invoke<string | null>("get_setting", { key: "save_history" }),
+          invoke<string | null>("get_setting", { key: "history_retention_days" }),
         ]);
         const [keyResult, formattingKeyResult] = await secretReads;
         if (!mounted) return;
@@ -379,6 +412,11 @@ function App() {
         setTtsEnabled(storedTtsEnabled !== "false");
         if (storedTtsModel) setTtsModel(storedTtsModel);
         if (storedTtsVoice) setTtsVoice(storedTtsVoice);
+        const parsedTts = parseStoredProvider(storedTtsProvider);
+        setTtsProvider(parsedTts.name);
+        setCustomTtsUrl(parsedTts.customUrl);
+        if (storedSaveHistory === "false") setSaveHistory(false);
+        if (storedRetentionDays) setRetentionDays(storedRetentionDays);
       } catch (reason) {
         if (mounted) setError(`OpenFlow settings could not be loaded. ${friendlyError(reason)}`);
       } finally {
@@ -577,10 +615,12 @@ function App() {
       ["theme", theme],
       ["microphone", microphone],
       ["tts_enabled", String(ttsEnabled)],
-      ["tts_provider", "openrouter"],
+      ["tts_provider", providerValue(ttsProvider, customTtsUrl)],
       ["tts_model", ttsModel.trim() || TTS_DEFAULT_MODEL],
       ["tts_voice", ttsVoice.trim() || "Kore"],
       ["tts_response_format", "mp3"],
+      ["save_history", String(saveHistory)],
+      ["history_retention_days", retentionDays],
     ];
     if (!sameProvider) {
       settings.push(
@@ -988,10 +1028,13 @@ function App() {
           <div className="history-list">
             {history.length === 0 && <div className="empty-state"><Icon name="clock" size={26} /><h2>Nothing here yet</h2><p>Your first transcription will appear here, ready to copy again.</p><button className="button secondary" onClick={() => setScreen("main")}>Record something</button></div>}
             {history.map((item) => (
-              <button key={item.id} className="history-item" onClick={async () => { await navigator.clipboard.writeText(item.formatted_text || item.raw_text); showNotification("Copied to clipboard"); }}>
-                <span className="history-text">{item.formatted_text || item.raw_text}</span>
-                <span className="history-meta"><time dateTime={item.created_at}>{new Date(item.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}</time>{item.duration_ms ? <span>{(item.duration_ms / 1000).toFixed(1)} sec</span> : null}<span>{item.provider.replace("custom:", "")}</span></span>
-              </button>
+              <div key={item.id} className="history-item-row">
+                <button className="history-item" onClick={async () => { await copyToClipboard(item.formatted_text || item.raw_text); }}>
+                  <span className="history-text">{item.formatted_text || item.raw_text}</span>
+                  <span className="history-meta"><time dateTime={item.created_at}>{new Date(item.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}</time>{item.duration_ms ? <span>{(item.duration_ms / 1000).toFixed(1)} sec</span> : null}<span>{item.provider.replace("custom:", "")}</span></span>
+                </button>
+                <button className="history-delete" aria-label="Delete this transcription" title="Delete" onClick={() => void handleDeleteTranscription(item.id)}>×</button>
+              </div>
             ))}
           </div>
         </div>
@@ -1048,15 +1091,19 @@ function App() {
           </section>
 
           <section className="settings-section voice-section">
-            <div className="section-heading"><div><div className="heading-with-badge"><h2>Gemini voice</h2><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div><p>Preview Gemini 3.1 Flash TTS through OpenRouter.</p></div><span className="section-number">03</span></div>
-            {transcriptionProvider !== "openrouter" ? (
+            <div className="section-heading"><div><div className="heading-with-badge"><h2>Voice output</h2><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div><p>Preview Gemini 3.1 Flash TTS through OpenRouter.</p></div><span className="section-number">03</span></div>
+            {ttsProvider !== "custom" && transcriptionProvider !== "openrouter" ? (
               <div className="capability-empty"><Icon name="volume" size={22} /><div><strong>OpenRouter connection required</strong><p>Choose OpenRouter above to stream Gemini voice previews with the same protected key.</p></div></div>
             ) : (
               <>
                 <div className="settings-grid">
                   <div className="inline-setting span-two"><div><strong>Voice features</strong><small>Enable speech generation in OpenFlow.</small></div><Toggle checked={ttsEnabled} label="Enable voice features" onChange={(checked) => { setTtsEnabled(checked); markDirty(); }} /></div>
-                  <div className="field-group"><label htmlFor="settings-tts-model">Voice model</label><input id="settings-tts-model" list="settings-tts-models" value={ttsModel} disabled={!ttsEnabled} onChange={(event) => { setTtsModel(event.target.value); markDirty(); setTtsStatus("idle"); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
-                  <div className="field-group"><label htmlFor="settings-tts-voice">Voice</label><input id="settings-tts-voice" list="tts-voices" value={ttsVoice} disabled={!ttsEnabled} onChange={(event) => { setTtsVoice(event.target.value); markDirty(); setTtsStatus("idle"); }} /><datalist id="tts-voices">{TTS_VOICES.map((voice) => <option key={voice} value={voice} />)}</datalist></div>
+                  <div className="field-group"><label htmlFor="settings-tts-provider">Speech endpoint</label><select id="settings-tts-provider" value={ttsProvider} disabled={!ttsEnabled} onChange={(event) => { const next = event.target.value; setTtsProvider(next); markDirty(); setTtsStatus("idle"); if (next === "custom") { setTtsModel(""); setTtsVoice(""); } }}><option value="openrouter">OpenRouter (Gemini)</option><option value="openai">OpenAI</option><option value="custom">Self-hosted / LAN</option></select><small>Point this at a machine on your network to keep audio off the internet.</small></div>
+                  {ttsProvider === "custom" && (
+                    <div className="field-group span-two"><label htmlFor="settings-tts-url">Speech endpoint URL</label><input id="settings-tts-url" value={customTtsUrl} disabled={!ttsEnabled} onChange={(event) => { setCustomTtsUrl(event.target.value); markDirty(); setTtsStatus("idle"); }} placeholder="http://192.168.1.10:8880/v1" autoCapitalize="none" autoCorrect="off" spellCheck={false} /><small>OpenAI-compatible base URL. OpenFlow calls <code>/audio/speech</code> under it. Plain http and an empty API key are both fine on a LAN.</small></div>
+                  )}
+                  <div className="field-group"><label htmlFor="settings-tts-model">Voice model</label><input id="settings-tts-model" list="settings-tts-models" value={ttsModel} disabled={!ttsEnabled} placeholder={ttsProvider === "custom" ? "kokoro" : TTS_DEFAULT_MODEL} onChange={(event) => { setTtsModel(event.target.value); markDirty(); setTtsStatus("idle"); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
+                  <div className="field-group"><label htmlFor="settings-tts-voice">Voice</label><input id="settings-tts-voice" list="tts-voices" value={ttsVoice} disabled={!ttsEnabled} placeholder={ttsProvider === "custom" ? "af_bella" : "Kore"} onChange={(event) => { setTtsVoice(event.target.value); markDirty(); setTtsStatus("idle"); }} /><datalist id="tts-voices">{TTS_VOICES.map((voice) => <option key={voice} value={voice} />)}</datalist></div>
                 </div>
                 <div className="voice-preview">
                   <label htmlFor="tts-preview">Preview text</label>
@@ -1077,6 +1124,9 @@ function App() {
               <div className="settings-row"><div><label htmlFor="record-hotkey">Record shortcut</label><small>Hold to record, release to transcribe.</small></div>{editingHotkey === "record" ? <input id="record-hotkey" className="hotkey-input" aria-label="Record shortcut" autoFocus value={hotkeyDraft} onChange={(event) => setHotkeyDraft(event.target.value)} onBlur={() => { if (cancelHotkeyEditRef.current) { cancelHotkeyEditRef.current = false; return; } void updateHotkey("record", hotkeyDraft); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { event.preventDefault(); cancelHotkeyEditRef.current = true; setEditingHotkey(null); } }} /> : <button id="record-hotkey" className="key-button" aria-label={`Change record shortcut, currently ${recordHotkey}`} onClick={() => { cancelHotkeyEditRef.current = false; setHotkeyDraft(recordHotkey); setEditingHotkey("record"); }}>{recordHotkey}</button>}</div>
               <div className="settings-row"><div><label htmlFor="recopy-hotkey">Re-copy shortcut</label><small>Paste your most recent result again.</small></div>{editingHotkey === "recopy" ? <input id="recopy-hotkey" className="hotkey-input" aria-label="Re-copy shortcut" autoFocus value={hotkeyDraft} onChange={(event) => setHotkeyDraft(event.target.value)} onBlur={() => { if (cancelHotkeyEditRef.current) { cancelHotkeyEditRef.current = false; return; } void updateHotkey("recopy", hotkeyDraft); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { event.preventDefault(); cancelHotkeyEditRef.current = true; setEditingHotkey(null); } }} /> : <button id="recopy-hotkey" className="key-button" aria-label={`Change re-copy shortcut, currently ${recopyHotkey}`} onClick={() => { cancelHotkeyEditRef.current = false; setHotkeyDraft(recopyHotkey); setEditingHotkey("recopy"); }}>{recopyHotkey}</button>}</div>
               <div className="settings-row"><div><label>Appearance</label><small>Use the theme that feels easiest on your eyes.</small></div><div className="segmented"><button className={theme === "light" ? "active" : ""} onClick={() => { setTheme("light"); markDirty(); }}>Light</button><button className={theme === "dark" ? "active" : ""} onClick={() => { setTheme("dark"); markDirty(); }}>Dark</button></div></div>
+              <div className="settings-row"><div><label>Save transcription history</label><small>Dictation captures whatever you say out loud. Turn this off to keep nothing.</small></div><button className="button secondary compact-button" onClick={() => { setSaveHistory((on) => !on); setSettingsDirty(true); }} aria-pressed={saveHistory}>{saveHistory ? "On" : "Off"}</button></div>
+              <div className="settings-row"><div><label>Auto-delete after</label><small>Older entries are removed on launch and after each transcription.</small></div><select value={retentionDays} onChange={(event) => { setRetentionDays(event.target.value); setSettingsDirty(true); }}><option value="">Never</option><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></div>
+              <div className="settings-row"><div><label>Clear all history</label><small>Deletes every stored transcription immediately.</small></div><button className="button secondary compact-button danger" onClick={() => void handleClearHistory()} onBlur={() => setConfirmingClear(false)}>{confirmingClear ? "Click again to confirm" : "Clear"}</button></div>
               <div className="settings-row"><div><label>Plugins</label><small>Extend what happens after transcription.</small></div><button className="button secondary compact-button" onClick={() => { void loadPlugins(); setScreen("plugins"); }}>Manage</button></div>
             </div>
           </section>
@@ -1092,7 +1142,7 @@ function App() {
         <button className="icon-button" onClick={() => { void loadHistory(); setScreen("history"); }} aria-label="Open transcription history"><Icon name="clock" /></button>
         <button className="brand-button" onClick={() => { if (!history.length) void loadHistory(); setShowRecents((shown) => !shown); }} aria-expanded={showRecents} aria-haspopup="dialog"><img src="/logo-128.png" alt=""/><span>OpenFlow</span></button>
         <button className="icon-button" onClick={() => { setError(""); setSettingsDirty(false); setScreen("settings"); }} aria-label="Open settings"><Icon name="gear" /></button>
-        {showRecents && <div className="recents-popover" role="dialog" aria-label="Recent transcriptions"><div className="popover-heading"><span>Recent</span><button onClick={() => setShowRecents(false)} aria-label="Close recent transcriptions">×</button></div>{history.length === 0 ? <p className="popover-empty">Your recent words will appear here.</p> : history.slice(0, 6).map((item) => <button key={item.id} onClick={async () => { await navigator.clipboard.writeText(item.formatted_text || item.raw_text); showNotification("Copied to clipboard"); setShowRecents(false); }}>{item.formatted_text || item.raw_text}</button>)}{history.length > 0 && <button className="popover-footer" onClick={() => { setShowRecents(false); setScreen("history"); }}>View all history</button>}</div>}
+        {showRecents && <div className="recents-popover" role="dialog" aria-label="Recent transcriptions"><div className="popover-heading"><span>Recent</span><button onClick={() => setShowRecents(false)} aria-label="Close recent transcriptions">×</button></div>{history.length === 0 ? <p className="popover-empty">Your recent words will appear here.</p> : history.slice(0, 6).map((item) => <button key={item.id} onClick={async () => { await copyToClipboard(item.formatted_text || item.raw_text); setShowRecents(false); }}>{item.formatted_text || item.raw_text}</button>)}{history.length > 0 && <button className="popover-footer" onClick={() => { setShowRecents(false); setScreen("history"); }}>View all history</button>}</div>}
       </header>
 
       <section className="recording-workspace" aria-labelledby="recording-title">
@@ -1117,7 +1167,7 @@ function App() {
 
       <section className="workspace-feedback" aria-live="polite">
         {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}
-        {lastTranscription ? <button className="last-result" onClick={async () => { await navigator.clipboard.writeText(lastTranscription); showNotification("Copied to clipboard"); }}><span className="result-status"><Icon name="check" size={15} /> Copied to clipboard</span><span className="result-copy">{lastTranscription}</span><span className="copy-affordance">Copy again</span></button> : <div className="first-sample"><span className="sample-line"/><p>Your first transcription will settle here.</p><span className="sample-line"/></div>}
+        {lastTranscription ? <button className="last-result" onClick={async () => { await copyToClipboard(lastTranscription); }}><span className="result-status"><Icon name="check" size={15} /> Copied to clipboard</span><span className="result-copy">{lastTranscription}</span><span className="copy-affordance">Copy again</span></button> : <div className="first-sample"><span className="sample-line"/><p>Your first transcription will settle here.</p><span className="sample-line"/></div>}
       </section>
     </main>
   );
