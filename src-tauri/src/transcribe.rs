@@ -1,5 +1,10 @@
-use reqwest::multipart;
+use base64::Engine;
+use reqwest::{multipart, Response};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+pub const GEMINI_TTS_MODEL: &str = "google/gemini-3.1-flash-tts-preview";
 
 #[derive(Deserialize)]
 struct WhisperResponse {
@@ -16,13 +21,13 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+    pub fn from_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Self::OpenAI,
             "openrouter" => Self::OpenRouter,
             "deepgram" => Self::Deepgram,
-            s if s.starts_with("custom:") => Self::Custom {
-                base_url: s.strip_prefix("custom:").unwrap_or("").to_string(),
+            custom if custom.starts_with("custom:") => Self::Custom {
+                base_url: validate_custom_url(custom.trim_start_matches("custom:")),
             },
             _ => Self::Groq,
         }
@@ -32,38 +37,28 @@ impl Provider {
         match self {
             Self::Groq => "https://api.groq.com/openai/v1",
             Self::OpenAI => "https://api.openai.com/v1",
-            Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::OpenRouter => OPENROUTER_URL,
             Self::Deepgram => "https://api.deepgram.com/v1",
             Self::Custom { base_url } => base_url.as_str(),
         }
     }
 
-    fn transcription_url(&self) -> String {
-        match self {
-            Self::Deepgram => format!("{}/listen", self.base_url()),
-            _ => format!("{}/audio/transcriptions", self.base_url()),
+    fn endpoint(&self, suffix: &str) -> Result<String, String> {
+        if self.base_url().is_empty() {
+            return Err("Custom provider URL is invalid".to_string());
         }
-    }
-
-    fn chat_url(&self) -> String {
-        match self {
-            Self::Deepgram => "https://api.groq.com/openai/v1/chat/completions".to_string(),
-            _ => format!("{}/chat/completions", self.base_url()),
-        }
-    }
-
-    fn models_url(&self) -> String {
-        match self {
-            Self::Deepgram => String::new(),
-            _ => format!("{}/models", self.base_url()),
-        }
+        Ok(format!(
+            "{}/{}",
+            self.base_url().trim_end_matches('/'),
+            suffix.trim_start_matches('/')
+        ))
     }
 
     pub fn default_stt_model(&self) -> &str {
         match self {
             Self::Groq => "whisper-large-v3-turbo",
             Self::OpenAI => "whisper-1",
-            Self::OpenRouter => "openai/whisper-large-v3-turbo",
+            Self::OpenRouter => "openai/whisper-1",
             Self::Deepgram => "nova-3",
             Self::Custom { .. } => "whisper-large-v3",
         }
@@ -73,20 +68,20 @@ impl Provider {
         match self {
             Self::Groq => "llama-3.3-70b-versatile",
             Self::OpenAI => "gpt-4o-mini",
-            Self::OpenRouter => "meta-llama/llama-3.3-70b-instruct",
+            Self::OpenRouter => "google/gemini-3-flash-preview",
             Self::Deepgram => "llama-3.3-70b-versatile",
             Self::Custom { .. } => "default",
         }
     }
 
-    fn auth_header(&self, api_key: &str) -> (String, String) {
+    fn authorization(&self, api_key: &str) -> String {
         match self {
-            Self::Deepgram => ("Authorization".to_string(), format!("Token {}", api_key)),
-            _ => ("Authorization".to_string(), format!("Bearer {}", api_key)),
+            Self::Deepgram => format!("Token {}", api_key),
+            _ => format!("Bearer {}", api_key),
         }
     }
 
-    fn is_openrouter(&self) -> bool {
+    pub fn is_openrouter(&self) -> bool {
         matches!(self, Self::OpenRouter)
     }
 }
@@ -99,87 +94,124 @@ pub struct ModelInfo {
 }
 
 pub async fn fetch_models(api_key: &str, provider: &Provider) -> Result<Vec<ModelInfo>, String> {
-    match provider {
-        Provider::Deepgram => Ok(vec![
-            ModelInfo { id: "nova-3".into(), name: "Nova 3".into(), model_type: "stt".into() },
-            ModelInfo { id: "nova-2".into(), name: "Nova 2".into(), model_type: "stt".into() },
-        ]),
-        _ => fetch_openai_compatible_models(api_key, provider).await,
+    ensure_api_key(api_key)?;
+    if matches!(provider, Provider::Deepgram) {
+        return Ok(vec![
+            ModelInfo {
+                id: "nova-3".into(),
+                name: "Nova 3".into(),
+                model_type: "stt".into(),
+            },
+            ModelInfo {
+                id: "nova-2".into(),
+                name: "Nova 2".into(),
+                model_type: "stt".into(),
+            },
+        ]);
     }
-}
-
-async fn fetch_openai_compatible_models(api_key: &str, provider: &Provider) -> Result<Vec<ModelInfo>, String> {
-    let client = reqwest::Client::new();
-    let url = provider.models_url();
-    if url.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let (header_name, header_val) = provider.auth_header(api_key);
-
-    let response = client
-        .get(&url)
-        .header(&header_name, &header_val)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
+    let client = client()?;
+    let response = with_openrouter_headers(
+        client
+            .get(provider.endpoint("models")?)
+            .bearer_auth(api_key),
+        provider,
+    )
+    .timeout(Duration::from_secs(15))
+    .send()
+    .await
+    .map_err(|error| request_error("fetch models", error))?;
+    let status = response.status();
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to fetch models: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Models API returned {}", response.status()));
+        .map_err(|error| format!("Could not read models response: {}", error))?;
+    if !status.is_success() {
+        return Err(api_error("Models", status, &body));
     }
-
-    let body: serde_json::Value = response.json().await
-        .map_err(|e| format!("Failed to parse models: {}", e))?;
-
-    let data = body["data"].as_array()
-        .ok_or("No models data in response")?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Could not parse models: {}", error))?;
+    let data = json
+        .get("data")
+        .and_then(|value| value.as_array())
+        .ok_or("Models response did not contain data")?;
 
     let mut models = Vec::new();
-    for m in data {
-        let id = m["id"].as_str().unwrap_or_default().to_string();
-        if id.is_empty() { continue; }
-
-        let id_lower = id.to_lowercase();
-
-        let modality = m["architecture"]["modality"].as_str().unwrap_or("");
-        let input_modalities = m["architecture"]["input_modalities"].as_array();
-        let has_audio_input = input_modalities
-            .map(|arr| arr.iter().any(|v| v.as_str() == Some("audio")))
-            .unwrap_or(false);
-
-        let is_stt = id_lower.contains("whisper")
-            || id_lower.contains("chirp")
-            || id_lower.contains("speech-to-text")
-            || id_lower.contains("transcrib")
-            || id_lower.contains("asr")
-            || modality.contains("audio")
-            || has_audio_input;
-
-        let is_skip = id_lower.contains("tts")
-            || id_lower.contains("text-to-speech")
-            || id_lower.contains("dall")
-            || id_lower.contains("embed")
-            || id_lower.contains("moderation")
-            || id_lower.contains("image-gen");
-
-        if is_skip { continue; }
-
-        let model_type = if is_stt { "stt" } else { "chat" };
-
-        let name = m["name"].as_str()
-            .unwrap_or(&id)
-            .to_string();
-
+    for item in data {
+        let Some(id) = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Some(model_type) = classify_model(item, id) else {
+            continue;
+        };
+        let name = item
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or(id);
         models.push(ModelInfo {
-            id: id.clone(),
-            name,
+            id: id.to_string(),
+            name: name.to_string(),
             model_type: model_type.to_string(),
         });
     }
-
-    models.sort_by(|a, b| a.id.cmp(&b.id));
+    if provider.is_openrouter() && !models.iter().any(|model| model.id == GEMINI_TTS_MODEL) {
+        models.push(ModelInfo {
+            id: GEMINI_TTS_MODEL.into(),
+            name: "Gemini 3.1 Flash TTS Preview".into(),
+            model_type: "tts".into(),
+        });
+    }
+    models.sort_by(|a, b| a.model_type.cmp(&b.model_type).then(a.name.cmp(&b.name)));
+    models.dedup_by(|a, b| a.id == b.id);
     Ok(models)
+}
+
+fn classify_model(item: &serde_json::Value, id: &str) -> Option<&'static str> {
+    let lower = id.to_ascii_lowercase();
+    let outputs = modalities(item, "output_modalities");
+    let has_output = |expected: &str| outputs.iter().any(|modality| modality == expected);
+    let id_tokens = lower.split(['/', '-', '_', '.', ':']);
+    let is_stt_name = lower.contains("whisper")
+        || lower.contains("chirp")
+        || lower.contains("transcrib")
+        || lower.contains("speech-to-text")
+        || id_tokens.clone().any(|token| token == "stt");
+    let is_tts_name = lower.contains("text-to-speech")
+        || lower.contains("speech-generation")
+        || id_tokens.clone().any(|token| token == "tts");
+
+    if has_output("transcription") || is_stt_name {
+        return Some("stt");
+    }
+    if has_output("speech") || is_tts_name {
+        return Some("tts");
+    }
+    if lower.contains("embed")
+        || lower.contains("moderation")
+        || lower.contains("rerank")
+        || lower.contains("image-gen")
+        || lower.contains("dall-")
+        || lower.contains("realtime")
+    {
+        return None;
+    }
+    // Model APIs are inconsistent about architecture metadata. Unknown text and
+    // multimodal models remain valid formatting candidates unless their id
+    // clearly identifies a specialized non-chat model above.
+    Some("chat")
+}
+
+fn modalities(item: &serde_json::Value, key: &str) -> Vec<String> {
+    item.get("architecture")
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_ascii_lowercase))
+        .collect()
 }
 
 pub async fn transcribe_audio(
@@ -189,6 +221,10 @@ pub async fn transcribe_audio(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<String, String> {
+    ensure_api_key(api_key)?;
+    if wav_bytes.len() > 50 * 1024 * 1024 {
+        return Err("Recording is too large to transcribe".to_string());
+    }
     match provider {
         Provider::Deepgram => transcribe_deepgram(wav_bytes, api_key, language, model).await,
         Provider::OpenRouter => transcribe_openrouter(wav_bytes, api_key, language, model).await,
@@ -202,54 +238,25 @@ async fn transcribe_openrouter(
     language: Option<&str>,
     model: Option<&str>,
 ) -> Result<String, String> {
-    use base64::Engine;
-    let client = reqwest::Client::new();
-    let stt_model = model.unwrap_or("openai/whisper-large-v3-turbo");
-
-    let b64_audio = base64::engine::general_purpose::STANDARD.encode(&wav_bytes);
-
     let mut body = serde_json::json!({
-        "model": stt_model,
-        "input_audio": {
-            "data": b64_audio,
-            "format": "wav"
-        }
+        "model": model.unwrap_or("openai/whisper-1"),
+        "input_audio": { "data": base64::engine::general_purpose::STANDARD.encode(wav_bytes), "format": "wav" }
     });
-
-    if let Some(lang) = language {
-        body["language"] = serde_json::Value::String(lang.to_string());
+    if let Some(language) = normalize_language(language) {
+        body["language"] = language.into();
     }
-
-    let response = client
-        .post("https://openrouter.ai/api/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("HTTP-Referer", "https://openflow.dev")
-        .header("X-OpenRouter-Title", "OpenFlow")
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    let status = response.status();
-    let resp_body = response.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        return match status.as_u16() {
-            401 | 403 => Err("Invalid API key. Check your OpenRouter key.".to_string()),
-            429 => Err("Rate limit hit. Wait a moment and try again.".to_string()),
-            _ => Err(format!("API error ({}): {}", status, resp_body)),
-        };
-    }
-
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp_body) {
-        if let Some(text) = json["text"].as_str() {
-            return Ok(text.to_string());
-        }
-    }
-
-    Err(format!("Unexpected response: {}", resp_body))
+    let response = with_openrouter_headers(
+        client()?
+            .post(format!("{OPENROUTER_URL}/audio/transcriptions"))
+            .bearer_auth(api_key),
+        &Provider::OpenRouter,
+    )
+    .json(&body)
+    .timeout(Duration::from_secs(90))
+    .send()
+    .await
+    .map_err(|error| request_error("transcribe audio", error))?;
+    parse_transcription_response(response, "OpenRouter").await
 }
 
 async fn transcribe_whisper(
@@ -259,53 +266,51 @@ async fn transcribe_whisper(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let stt_model = model.unwrap_or(provider.default_stt_model());
-
-    let file_part = multipart::Part::bytes(wav_bytes)
+    let file = multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
         .mime_str("audio/wav")
-        .map_err(|e| format!("Multipart error: {}", e))?;
-
+        .map_err(|error| format!("Could not prepare recording: {}", error))?;
     let mut form = multipart::Form::new()
-        .part("file", file_part)
-        .text("model", stt_model.to_string())
+        .part("file", file)
+        .text(
+            "model",
+            model.unwrap_or(provider.default_stt_model()).to_string(),
+        )
         .text("response_format", "json");
-
-    if let Some(lang) = language {
-        form = form.text("language", lang.to_string());
+    if let Some(language) = normalize_language(language) {
+        form = form.text("language", language.to_string());
     }
+    let response = with_openrouter_headers(
+        client()?
+            .post(provider.endpoint("audio/transcriptions")?)
+            .header("Authorization", provider.authorization(api_key)),
+        provider,
+    )
+    .multipart(form)
+    .timeout(Duration::from_secs(90))
+    .send()
+    .await
+    .map_err(|error| request_error("transcribe audio", error))?;
+    parse_transcription_response(response, "Transcription").await
+}
 
-    let (header_name, header_val) = provider.auth_header(api_key);
-
-    let mut req = client
-        .post(&provider.transcription_url())
-        .header(&header_name, &header_val)
-        .multipart(form)
-        .timeout(std::time::Duration::from_secs(30));
-
-    if provider.is_openrouter() {
-        req = req.header("HTTP-Referer", "https://openflow.dev");
-        req = req.header("X-Title", "OpenFlow");
-    }
-
-    let response = req.send().await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
+async fn parse_transcription_response(response: Response, label: &str) -> Result<String, String> {
     let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read transcription response: {}", error))?;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return match status.as_u16() {
-            401 | 403 => Err("Invalid API key. Check your API key in settings.".to_string()),
-            429 => Err("Rate limit hit. Wait a moment and try again.".to_string()),
-            _ => Err(format!("API error ({}): {}", status, body)),
-        };
+        return Err(api_error(label, status, &body));
     }
-
-    let result: WhisperResponse = response.json().await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    Ok(result.text)
+    let result: WhisperResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("Could not parse transcription: {}", error))?;
+    let text = result.text.trim().to_string();
+    if text.is_empty() {
+        Err("The transcription service returned no speech".to_string())
+    } else {
+        Ok(text)
+    }
 }
 
 async fn transcribe_deepgram(
@@ -314,56 +319,43 @@ async fn transcribe_deepgram(
     language: Option<&str>,
     model: Option<&str>,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let dg_model = model.unwrap_or("nova-3");
-
-    let mut url = format!("https://api.deepgram.com/v1/listen?model={}&smart_format=true", dg_model);
-    if let Some(lang) = language {
-        url.push_str(&format!("&language={}", lang));
+    let mut url = reqwest::Url::parse("https://api.deepgram.com/v1/listen")
+        .map_err(|error| format!("Invalid Deepgram URL: {}", error))?;
+    url.query_pairs_mut()
+        .append_pair("model", model.unwrap_or("nova-3"))
+        .append_pair("smart_format", "true");
+    if let Some(language) = normalize_language(language) {
+        url.query_pairs_mut().append_pair("language", language);
     }
-
-    let response = client
-        .post(&url)
+    let response = client()?
+        .post(url)
         .header("Authorization", format!("Token {}", api_key))
         .header("Content-Type", "audio/wav")
         .body(wav_bytes)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(90))
         .send()
         .await
-        .map_err(|e| format!("Deepgram request failed: {}", e))?;
-
+        .map_err(|error| request_error("transcribe audio", error))?;
     let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read Deepgram response: {}", error))?;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return match status.as_u16() {
-            401 | 403 => Err("Invalid Deepgram API key.".to_string()),
-            429 => Err("Deepgram rate limit hit.".to_string()),
-            _ => Err(format!("Deepgram error ({}): {}", status, body)),
-        };
+        return Err(api_error("Deepgram", status, &body));
     }
-
-    let result: serde_json::Value = response.json().await
-        .map_err(|e| format!("Parse error: {}", e))?;
-
-    result["results"]["channels"][0]["alternatives"][0]["transcript"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or("No transcript in Deepgram response".to_string())
+    let result: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Could not parse Deepgram response: {}", error))?;
+    result
+        .pointer("/results/channels/0/alternatives/0/transcript")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .ok_or("Deepgram returned no speech".to_string())
 }
 
-const FORMAT_SYSTEM_PROMPT: &str = "\
-Format this dictation into clean text. Rules:
-1. Add punctuation, capitalization, and paragraph breaks.
-2. Interpret voice commands naturally:
-   - \"new paragraph\" or \"next paragraph\" = start a new paragraph
-   - \"new line\" or \"next line\" = line break
-   - \"period\" / \"full stop\" / \"comma\" / \"question mark\" / \"exclamation mark\" = insert that punctuation
-   - \"scratch that\" or \"delete that\" = remove the previous sentence
-   - \"undo\" or \"go back\" = remove the last few words
-   - \"all caps\" + word = CAPITALIZE that word
-3. Remove filler words (um, uh, like, you know) unless they seem intentional.
-4. Do not add content that was not spoken.
-5. Output ONLY the formatted text, nothing else.";
+const FORMAT_SYSTEM_PROMPT: &str = "Format this dictation into clean text. Add punctuation, capitalization, and paragraph breaks. Interpret spoken editing commands such as new paragraph, comma, scratch that, undo, and all caps. Remove accidental filler words. Never add content that was not spoken. Output only the formatted text.";
 
 pub async fn format_text(
     raw_text: &str,
@@ -372,50 +364,276 @@ pub async fn format_text(
     provider: &Provider,
     chat_model: Option<&str>,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let model = chat_model.unwrap_or(provider.default_chat_model());
-
-    let user_content = match context {
-        Some(ctx) => format!("Context: {}\n\nDictation: {}", ctx, raw_text),
-        None => raw_text.to_string(),
-    };
-
+    ensure_api_key(api_key)?;
+    if matches!(provider, Provider::Deepgram) {
+        return Err("Deepgram provides transcription but not chat formatting. Choose a separate formatting provider or disable formatting.".to_string());
+    }
+    let user_content = context
+        .filter(|ctx| !ctx.trim().is_empty())
+        .map(|ctx| format!("Context: {}\n\nDictation: {}", ctx, raw_text))
+        .unwrap_or_else(|| raw_text.to_string());
     let body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": FORMAT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 2048
+        "model": chat_model.unwrap_or(provider.default_chat_model()),
+        "messages": [{"role":"system","content":FORMAT_SYSTEM_PROMPT},{"role":"user","content":user_content}],
+        "temperature": 0.3, "max_tokens": 2048
     });
+    let endpoint = provider.endpoint("chat/completions")?;
+    let response = with_openrouter_headers(
+        client()?
+            .post(endpoint)
+            .header("Authorization", provider.authorization(api_key)),
+        provider,
+    )
+    .json(&body)
+    .timeout(Duration::from_secs(45))
+    .send()
+    .await
+    .map_err(|error| request_error("format text", error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read formatting response: {}", error))?;
+    if !status.is_success() {
+        return Err(api_error("Formatting", status, &body));
+    }
+    let result: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Could not parse formatting response: {}", error))?;
+    result
+        .pointer("/choices/0/message/content")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .ok_or("Formatting service returned no text".to_string())
+}
 
-    let (header_name, header_val) = provider.auth_header(api_key);
+pub async fn request_speech(
+    text: &str,
+    api_key: &str,
+    provider: &Provider,
+    model: &str,
+    voice: &str,
+    response_format: &str,
+) -> Result<Response, String> {
+    ensure_api_key(api_key)?;
+    if text.trim().is_empty() {
+        return Err("Text to speak cannot be empty".to_string());
+    }
+    if text.chars().count() > 32_000 {
+        return Err("Text to speak is too long (maximum 32,000 characters)".to_string());
+    }
+    if !matches!(response_format, "mp3" | "pcm" | "wav") {
+        return Err("Speech format must be mp3, pcm, or wav".to_string());
+    }
+    if voice.is_empty()
+        || voice.len() > 80
+        || !voice
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err("Speech voice is invalid".to_string());
+    }
+    if matches!(provider, Provider::Deepgram | Provider::Groq) {
+        return Err(
+            "This provider does not expose an OpenAI-compatible speech endpoint".to_string(),
+        );
+    }
+    let body = serde_json::json!({ "model": model, "input": text, "voice": voice, "response_format": response_format });
+    let response = with_openrouter_headers(
+        client()?
+            .post(provider.endpoint("audio/speech")?)
+            .header("Authorization", provider.authorization(api_key)),
+        provider,
+    )
+    .json(&body)
+    .timeout(Duration::from_secs(120))
+    .send()
+    .await
+    .map_err(|error| request_error("generate speech", error))?;
+    if response.status().is_success() {
+        validate_speech_response(&response)?;
+        return Ok(response);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(api_error("Speech", status, &body))
+}
 
-    let mut req = client
-        .post(&provider.chat_url())
-        .header(&header_name, &header_val)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(15));
+fn validate_speech_response(response: &Response) -> Result<(), String> {
+    if response.content_length() == Some(0) {
+        return Err("Speech provider returned an empty audio response".to_string());
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .ok_or_else(|| "Speech provider did not identify its response as audio".to_string())?;
+    if !content_type.starts_with("audio/") && content_type != "application/octet-stream" {
+        return Err(format!(
+            "Speech provider returned {} instead of audio",
+            content_type
+        ));
+    }
+    Ok(())
+}
 
+pub fn speech_mime(format: &str) -> &'static str {
+    match format {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        _ => "audio/pcm",
+    }
+}
+
+fn client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent("OpenFlow/0.1")
+        .build()
+        .map_err(|error| format!("Could not initialize network client: {}", error))
+}
+
+fn with_openrouter_headers(
+    builder: reqwest::RequestBuilder,
+    provider: &Provider,
+) -> reqwest::RequestBuilder {
     if provider.is_openrouter() {
-        req = req.header("HTTP-Referer", "https://openflow.dev");
-        req = req.header("X-Title", "OpenFlow");
+        builder
+            .header("HTTP-Referer", "https://github.com/laisyio/openflow")
+            .header("X-Title", "OpenFlow")
+    } else {
+        builder
+    }
+}
+
+fn normalize_language(language: Option<&str>) -> Option<&str> {
+    language
+        .map(str::trim)
+        .filter(|language| !language.is_empty() && *language != "auto")
+}
+
+fn ensure_api_key(api_key: &str) -> Result<(), String> {
+    if api_key.trim().is_empty() {
+        Err("No API key set. Add one in Settings.".to_string())
+    } else if api_key.len() > 16_384 {
+        Err("API key is unexpectedly large".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn api_error(label: &str, status: reqwest::StatusCode, body: &str) -> String {
+    match status.as_u16() {
+        401 | 403 => format!(
+            "{} rejected the API key. Check the key and provider.",
+            label
+        ),
+        402 => format!("{} account has insufficient credits.", label),
+        408 => format!("{} request timed out.", label),
+        413 => format!("{} rejected the recording because it is too large.", label),
+        429 => format!("{} rate limit reached. Wait briefly and try again.", label),
+        _ => {
+            let detail = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|json| {
+                    json.pointer("/error/message")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| body.chars().take(300).collect());
+            if detail.trim().is_empty() {
+                format!("{} API returned {}", label, status)
+            } else {
+                format!("{} API returned {}: {}", label, status, detail.trim())
+            }
+        }
+    }
+}
+
+fn request_error(action: &str, error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!("Timed out while trying to {}", action)
+    } else if error.is_connect() {
+        format!("Could not connect to the provider to {}", action)
+    } else {
+        format!("Could not {}: {}", action, error)
+    }
+}
+
+fn validate_custom_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value.trim()) else {
+        return String::new();
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return String::new();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_provider_rejects_non_http_urls() {
+        assert!(
+            matches!(Provider::from_str("custom:file:///tmp/api"), Provider::Custom { base_url } if base_url.is_empty())
+        );
+        assert!(
+            matches!(Provider::from_str("custom:https://localhost:8080/v1/"), Provider::Custom { base_url } if base_url == "https://localhost:8080/v1")
+        );
     }
 
-    let response = req.send().await
-        .map_err(|e| format!("Format request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err("LLM formatting failed".to_string());
+    #[test]
+    fn auto_language_is_omitted() {
+        assert_eq!(normalize_language(Some("auto")), None);
+        assert_eq!(normalize_language(Some("en")), Some("en"));
     }
 
-    let result: serde_json::Value = response.json().await
-        .map_err(|e| format!("Parse error: {}", e))?;
+    #[test]
+    fn classifies_models_when_modality_metadata_is_missing() {
+        let no_architecture = serde_json::json!({});
+        assert_eq!(
+            classify_model(&no_architecture, "google/gemini-3.1-flash-tts-preview"),
+            Some("tts")
+        );
+        assert_eq!(
+            classify_model(&no_architecture, "openai/whisper-1"),
+            Some("stt")
+        );
+        assert_eq!(
+            classify_model(&no_architecture, "google/gemini-3.1-flash-lite-preview"),
+            Some("chat")
+        );
+        assert_eq!(
+            classify_model(&no_architecture, "openai/text-embedding-3-small"),
+            None
+        );
+    }
 
-    result["choices"][0]["message"]["content"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or("No content in response".to_string())
+    #[test]
+    fn explicit_output_modalities_override_generic_model_names() {
+        let speech = serde_json::json!({
+            "architecture": { "output_modalities": ["speech"] }
+        });
+        let transcription = serde_json::json!({
+            "architecture": { "output_modalities": ["transcription"] }
+        });
+        assert_eq!(classify_model(&speech, "vendor/generic-audio"), Some("tts"));
+        assert_eq!(
+            classify_model(&transcription, "vendor/generic-audio"),
+            Some("stt")
+        );
+    }
 }
