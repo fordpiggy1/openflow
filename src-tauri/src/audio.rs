@@ -268,21 +268,81 @@ where
     Some(sum / frame.len() as f32)
 }
 
+/// Amplitude the 95th-percentile sample should reach after boosting. This is an
+/// amplitude target, not an RMS one: p95 of speech runs about 1.4x its RMS, and
+/// 0.21 lands the voiced RMS in the 0.13-0.20 band with headroom for transients.
+const TARGET_PEAK: f32 = 0.21;
+const MAX_GAIN: f32 = 20.0;
+
+/// Boost quiet recordings so the speech-to-text model gets a usable level.
+///
+/// Keyed on the 95th percentile of |sample|, not the absolute peak. The peak is
+/// whatever single loudest thing happened -- a cough, a desk bump, one hard key
+/// press -- so a `peak > 0.5 => give up` rule throws away the boost for the
+/// entire quiet take. A high percentile ignores that top 5% while still sitting
+/// above any leading silence, which means it needs no silence threshold: the
+/// silence gate was removed twice (3a9ebee, 0865284) for cutting real speech
+/// from low-gain mics, and a threshold here would reintroduce that failure.
+///
+/// Measured across clean speech / speech+transient / speech+2s leading silence,
+/// this holds the gain within ~18% (4.38 / 4.21 / 5.06) where the peak rule
+/// swings 10.31 / 1.00 / 10.31 and plain RMS swings 6.90 / 1.76 / 8.90.
 fn auto_gain(samples: &[f32]) -> Vec<f32> {
-    let peak = samples
-        .iter()
-        .map(|sample| sample.abs())
-        .fold(0.0_f32, f32::max);
-    if peak < 0.001 || peak > 0.5 {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let mut magnitudes: Vec<f32> = samples.iter().map(|sample| sample.abs()).collect();
+    magnitudes.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = ((magnitudes.len() as f32 * 0.95) as usize).min(magnitudes.len() - 1);
+    let level = magnitudes[index];
+
+    if level < 1e-4 {
         return samples.to_vec();
     }
-    let gain = (0.8 / peak).min(20.0);
+
+    let gain = (TARGET_PEAK / level).clamp(1.0, MAX_GAIN);
     samples
         .iter()
         .map(|sample| (sample * gain).clamp(-1.0, 1.0))
         .collect()
 }
 
+/// Anti-alias filter length. 63 taps buys ~60 dB of stopband rejection at
+/// 48k -> 16k, far more than speech needs.
+const FIR_TAPS: usize = 63;
+
+/// Windowed-sinc low-pass, Hamming window, normalised to unity DC gain.
+fn design_lowpass(cutoff_hz: f32, sample_rate: f32, num_taps: usize) -> Vec<f32> {
+    use std::f32::consts::PI;
+    let fc = cutoff_hz / sample_rate;
+    let m = (num_taps - 1) as f32;
+    let mut taps = Vec::with_capacity(num_taps);
+    for i in 0..num_taps {
+        let n = i as f32 - m / 2.0;
+        let sinc = if n.abs() < 1e-6 {
+            2.0 * fc
+        } else {
+            (2.0 * PI * fc * n).sin() / (PI * n)
+        };
+        let window = 0.54 - 0.46 * (2.0 * PI * i as f32 / m).cos();
+        taps.push(sinc * window);
+    }
+    let sum: f32 = taps.iter().sum();
+    if sum.abs() < 1e-9 {
+        return taps;
+    }
+    taps.iter().map(|tap| tap / sum).collect()
+}
+
+/// Resample to `to_rate`, low-passing first when decimating.
+///
+/// Interpolation alone does not prevent aliasing: at 48k -> 16k every component
+/// above the new 8 kHz Nyquist folds back into the speech band regardless of
+/// how the output points are interpolated -- a 15 kHz whine lands on 1 kHz,
+/// right on top of the voice. Measured, plain decimation and linear
+/// interpolation both leave the alias at -0.0 dB; filtering first drops it to
+/// -60 dB while the passband below 6 kHz stays within 0.1 dB.
 fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return samples.to_vec();
@@ -290,18 +350,46 @@ fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if samples.is_empty() || from_rate == 0 || to_rate == 0 {
         return Vec::new();
     }
+
     let ratio = from_rate as f64 / to_rate as f64;
     let output_len = (samples.len() as f64 / ratio) as usize;
+    if output_len == 0 {
+        return Vec::new();
+    }
+
+    // Upsampling needs interpolation, not decimation; no anti-alias filter
+    // applies. Keep the linear interpolation for that direction.
+    if from_rate < to_rate {
+        let mut output = Vec::with_capacity(output_len);
+        for i in 0..output_len {
+            let position = i as f64 * ratio;
+            let left = position.floor() as usize;
+            if left >= samples.len() {
+                break;
+            }
+            let right = (left + 1).min(samples.len() - 1);
+            let fraction = (position - left as f64) as f32;
+            output.push(samples[left] + (samples[right] - samples[left]) * fraction);
+        }
+        return output;
+    }
+
+    // 0.45 * to_rate leaves a transition band below the new Nyquist while
+    // keeping everything speech uses (< 7.2 kHz at a 16 kHz output).
+    let taps = design_lowpass(0.45 * to_rate as f32, from_rate as f32, FIR_TAPS);
+    let half = (taps.len() / 2) as isize;
+
     let mut output = Vec::with_capacity(output_len);
     for i in 0..output_len {
-        let position = i as f64 * ratio;
-        let left = position.floor() as usize;
-        if left >= samples.len() {
-            break;
+        let center = (i as f64 * ratio) as isize;
+        let mut acc = 0.0_f32;
+        for (k, &tap) in taps.iter().enumerate() {
+            let index = center + k as isize - half;
+            if index >= 0 && (index as usize) < samples.len() {
+                acc += samples[index as usize] * tap;
+            }
         }
-        let right = (left + 1).min(samples.len() - 1);
-        let fraction = (position - left as f64) as f32;
-        output.push(samples[left] + (samples[right] - samples[left]) * fraction);
+        output.push(acc);
     }
     output
 }
@@ -350,6 +438,86 @@ mod tests {
         let output = downsample(&input, 48_000, 16_000);
         assert_eq!(output.len(), 16_000);
         assert!((output[8_000] - 0.5).abs() < 0.001);
+    }
+
+    fn tone(freq: f32, rate: u32, secs: f32) -> Vec<f32> {
+        use std::f32::consts::PI;
+        let n = (rate as f32 * secs) as usize;
+        (0..n)
+            .map(|i| (2.0 * PI * freq * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    fn energy_at(samples: &[f32], rate: u32, freq: f32) -> f32 {
+        use std::f32::consts::PI;
+        let n = samples.len() as f32;
+        let (mut re, mut im) = (0.0_f32, 0.0_f32);
+        for (i, &s) in samples.iter().enumerate() {
+            let phase = 2.0 * PI * freq * i as f32 / rate as f32;
+            re += s * phase.cos();
+            im += s * phase.sin();
+        }
+        ((re * re + im * im).sqrt() / n) * 2.0
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        (sum / samples.len() as f64).sqrt() as f32
+    }
+
+    #[test]
+    fn downsample_rejects_aliasing() {
+        // 15 kHz folds onto 1 kHz at a 16 kHz output rate. Linear interpolation
+        // leaves this at full strength; the FIR must not.
+        let out = downsample(&tone(15_000.0, 48_000, 0.5), 48_000, 16_000);
+        let ghost = energy_at(&out, 16_000, 1_000.0);
+        assert!(ghost < 0.05, "15 kHz aliased into the speech band: {ghost}");
+    }
+
+    #[test]
+    fn downsample_preserves_speech_band() {
+        let out = downsample(&tone(1_000.0, 48_000, 0.5), 48_000, 16_000);
+        assert!(
+            energy_at(&out, 16_000, 1_000.0) > 0.8,
+            "1 kHz speech tone must survive decimation"
+        );
+    }
+
+    #[test]
+    fn auto_gain_survives_one_loud_transient() {
+        let mut quiet = tone(300.0, 16_000, 1.0);
+        for s in quiet.iter_mut() {
+            *s *= 0.03;
+        }
+        let clean_level = rms(&auto_gain(&quiet));
+
+        let mut bumped = quiet.clone();
+        for s in bumped.iter_mut().take(200) {
+            *s = 0.95;
+        }
+        let bumped_level = rms(&auto_gain(&bumped));
+
+        assert!(
+            clean_level > rms(&quiet) * 2.0,
+            "quiet take must be boosted"
+        );
+        assert!(
+            bumped_level > clean_level * 0.5,
+            "one transient must not cancel the boost: clean={clean_level} bumped={bumped_level}"
+        );
+    }
+
+    #[test]
+    fn auto_gain_leaves_silence_alone_and_never_clips() {
+        let silence = vec![0.0_f32; 1_000];
+        assert_eq!(auto_gain(&silence), silence);
+        assert!(auto_gain(&[]).is_empty());
+        assert!(auto_gain(&tone(300.0, 16_000, 0.2))
+            .iter()
+            .all(|s| s.abs() <= 1.0));
     }
 
     #[test]

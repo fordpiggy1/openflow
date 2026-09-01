@@ -13,6 +13,7 @@ use secrets::SecretStore;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -25,7 +26,10 @@ struct AppState {
     db: Database,
     secrets: SecretStore,
     plugin_manager: PluginManager,
-    recording: Mutex<bool>,
+    /// `Some(started_at)` while capturing. Carrying the start time rather than
+    /// a bare bool lets a dropped hotkey-release event time out instead of
+    /// wedging recording until the app restarts.
+    recording: Mutex<Option<Instant>>,
     last_transcription: Mutex<Option<String>>,
     transcription_jobs: Mutex<HashMap<String, CancellationToken>>,
     speech_jobs: Mutex<HashMap<String, CancellationToken>>,
@@ -313,12 +317,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         .recording
         .lock()
         .map_err(|_| "Recording state is unavailable".to_string())?;
-    if *recording {
+    if !recording_slot_free(&recording) {
         return Err("A recording is already active".to_string());
     }
     let device = state.db.get_setting("microphone");
     state.recorder.start(device)?;
-    *recording = true;
+    *recording = Some(Instant::now());
     let _ = app.emit("recording-state", "recording");
     Ok(())
 }
@@ -333,11 +337,11 @@ async fn stop_recording_and_transcribe(
             .recording
             .lock()
             .map_err(|_| "Recording state is unavailable".to_string())?;
-        if !*recording {
+        if recording.is_none() {
             return Err("No recording is active".to_string());
         }
         let result = state.recorder.stop();
-        *recording = false;
+        *recording = None;
         result
     };
     let wav_bytes = match wav_result {
@@ -393,7 +397,30 @@ fn copy_last_transcription(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn delete_transcription(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    state.db.delete_transcription(&id)?;
+    update_tray_menu(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_history(app: AppHandle, state: State<AppState>) -> Result<usize, String> {
+    let removed = state.db.clear_history()?;
+    if let Ok(mut last) = state.last_transcription.lock() {
+        *last = None;
+    }
+    update_tray_menu(&app);
+    Ok(removed)
+}
+
+#[tauri::command]
 fn copy_text(_state: State<AppState>, text: String) -> Result<(), String> {
+    write_clipboard(&text)
+}
+
+/// Copy and paste in one step, for callers that want the keystroke.
+#[tauri::command]
+fn paste_text(_state: State<AppState>, text: String) -> Result<(), String> {
     paste_to_clipboard(&text)
 }
 
@@ -589,7 +616,22 @@ async fn run_transcription_pipeline_inner(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    state.db.save_transcription(&transcription)?;
+    // Saving is opt-out, and an optional retention window trims old rows as we go.
+    let history_enabled = state
+        .db
+        .get_setting("save_history")
+        .map(|value| value != "false")
+        .unwrap_or(true);
+    if history_enabled {
+        state.db.save_transcription(&transcription)?;
+        if let Some(days) = state
+            .db
+            .get_setting("history_retention_days")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            let _ = state.db.prune_older_than(days);
+        }
+    }
     {
         let mut last = state
             .last_transcription
@@ -609,13 +651,19 @@ async fn run_transcription_pipeline_inner(
     Ok((transcription, paste_warning))
 }
 
-fn paste_to_clipboard(text: &str) -> Result<(), String> {
+fn write_clipboard(text: &str) -> Result<(), String> {
     use arboard::Clipboard;
     let mut clipboard = Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
     clipboard
         .set_text(text)
-        .map_err(|e| format!("Clipboard set failed: {}", e))?;
+        .map_err(|e| format!("Clipboard set failed: {}", e))
+}
 
+/// Copy *and* fire a paste keystroke at whatever has focus. Correct for the
+/// tray and the re-copy hotkey, where focus is in the user's editor; wrong for
+/// a list inside OpenFlow, which would paste into OpenFlow itself.
+fn paste_to_clipboard(text: &str) -> Result<(), String> {
+    write_clipboard(text)?;
     simulate_paste()
 }
 
@@ -782,6 +830,18 @@ fn default_shortcut(action: &str) -> Option<&'static str> {
     }
 }
 
+/// A capture that has run this long is a stuck flag, not a real recording.
+const MAX_RECORDING: Duration = Duration::from_secs(300);
+
+/// True when no capture is in flight, or when the one on record is so old it
+/// can only be the residue of a lost release event.
+fn recording_slot_free(slot: &Option<Instant>) -> bool {
+    match slot {
+        None => true,
+        Some(started) => started.elapsed() > MAX_RECORDING,
+    }
+}
+
 // ── Hotkey handlers ───────────────────────────────────────
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -797,12 +857,12 @@ fn handle_hotkey_press(app: &AppHandle) {
         let _ = app.emit("transcription-error", "Recording state is unavailable");
         return;
     };
-    if !*recording {
-        *recording = true;
+    if recording_slot_free(&recording) {
+        *recording = Some(Instant::now());
         let device = state.db.get_setting("microphone");
         if let Err(e) = state.recorder.start(device) {
             eprintln!("Recording start failed: {}", e);
-            *recording = false;
+            *recording = None;
             let _ = app.emit("transcription-error", &e);
             return;
         }
@@ -814,7 +874,7 @@ fn emit_idle_if_quiescent(app: &AppHandle, state: &AppState) {
     let Ok(recording) = state.recording.lock() else {
         return;
     };
-    if *recording {
+    if recording.is_some() {
         return;
     }
     let Ok(active) = state.transcription_jobs.lock() else {
@@ -834,11 +894,11 @@ fn handle_hotkey_release(app: &AppHandle) {
             let _ = app.emit("transcription-error", "Recording state is unavailable");
             return;
         };
-        if !*recording {
+        if recording.is_none() {
             return;
         }
         let result = state.recorder.stop();
-        *recording = false;
+        *recording = None;
         result
     };
 
@@ -908,7 +968,7 @@ fn build_tray_menu(
             .build(app)?;
         builder = builder.item(&label);
 
-        for (i, t) in recents.iter().enumerate() {
+        for t in recents.iter() {
             let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
             let preview: String = text.chars().take(40).collect();
             let display = if text.chars().count() > 40 {
@@ -916,7 +976,9 @@ fn build_tray_menu(
             } else {
                 preview
             };
-            let item = MenuItemBuilder::with_id(format!("recent_{}", i), &display).build(app)?;
+            // Key by row id, not list index: indexing raced any transcription
+            // that landed between building the menu and clicking it.
+            let item = MenuItemBuilder::with_id(format!("recent:{}", t.id), &display).build(app)?;
             builder = builder.item(&item);
         }
 
@@ -1012,6 +1074,15 @@ pub fn run() {
                     .map_err(|e| format!("No app dir: {}", e))?,
             );
             migrate_secrets(&db, &secrets);
+
+            // Apply the retention policy at launch too, so a user who set it and
+            // then left the app closed still gets old rows dropped.
+            if let Some(days) = db
+                .get_setting("history_retention_days")
+                .and_then(|value| value.parse::<i64>().ok())
+            {
+                let _ = db.prune_older_than(days);
+            }
             let last_transcription = db
                 .get_history(1)?
                 .into_iter()
@@ -1023,7 +1094,7 @@ pub fn run() {
                 db,
                 secrets,
                 plugin_manager: PluginManager::new(),
-                recording: Mutex::new(false),
+                recording: Mutex::new(None),
                 last_transcription: Mutex::new(last_transcription),
                 transcription_jobs: Mutex::new(HashMap::new()),
                 speech_jobs: Mutex::new(HashMap::new()),
@@ -1070,19 +1141,13 @@ pub fn run() {
                         "quit" => {
                             app.exit(0);
                         }
-                        s if s.starts_with("recent_") => {
-                            if let Ok(idx) =
-                                s.strip_prefix("recent_").unwrap_or("").parse::<usize>()
-                            {
-                                let state = app.state::<AppState>();
-                                if let Ok(history) = state.db.get_history(20) {
-                                    if let Some(t) = history.get(idx) {
-                                        let text =
-                                            t.formatted_text.as_deref().unwrap_or(&t.raw_text);
-                                        let _ = paste_to_clipboard(text);
-                                        let _ = app.emit("recopy-success", "Copied!");
-                                    }
-                                }
+                        s if s.starts_with("recent:") => {
+                            let row_id = &s["recent:".len()..];
+                            let state = app.state::<AppState>();
+                            if let Ok(Some(t)) = state.db.get_transcription(row_id) {
+                                let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
+                                let _ = paste_to_clipboard(text);
+                                let _ = app.emit("recopy-success", "Copied!");
                             }
                         }
                         _ => {}
@@ -1119,6 +1184,8 @@ pub fn run() {
             set_setting,
             get_history,
             search_history,
+            delete_transcription,
+            clear_history,
             fetch_models,
             list_audio_devices,
             start_recording,
@@ -1129,6 +1196,7 @@ pub fn run() {
             cancel_speech,
             copy_last_transcription,
             copy_text,
+            paste_text,
             rebind_hotkey,
             list_plugins,
             enable_plugin,
@@ -1151,6 +1219,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_slot_frees_itself_after_the_watchdog_window() {
+        assert!(
+            recording_slot_free(&None),
+            "no capture means the slot is free"
+        );
+
+        let fresh = Some(Instant::now());
+        assert!(
+            !recording_slot_free(&fresh),
+            "a live capture holds the slot"
+        );
+
+        // A release event that never arrived must not wedge recording forever.
+        let stranded = Some(Instant::now() - MAX_RECORDING - Duration::from_secs(1));
+        assert!(
+            recording_slot_free(&stranded),
+            "a capture older than the watchdog window must free the slot"
+        );
+    }
 
     #[test]
     fn parses_default_record_shortcut() {

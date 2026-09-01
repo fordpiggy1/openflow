@@ -35,9 +35,19 @@ Model availability and billing are controlled by the provider. OpenFlow does not
 
 - API credentials are stored using macOS Keychain, Windows DPAPI, or Linux Secret Service. Linux requires an unlocked keyring and the `secret-tool` command.
 - Recordings are held in memory for transcription and sent to the provider selected in Settings. Cleanup sends transcript text to the selected cleanup provider. Gemini voice previews send their text to OpenRouter.
-- Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory.
+- Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory. You control it from Settings: delete individual entries, clear everything, turn saving off entirely, or set an auto-delete window (1/7/30/90 days) that is applied at launch and after each transcription.
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.
+
+## Audio pipeline
+
+Capture runs at the device's native rate and format, then downsamples to the
+16 kHz mono WAV the speech models expect. The resampler low-passes before
+decimating: skipping that step folds everything above the new 8 kHz Nyquist
+back into the speech band (a 15 kHz whine lands on 1 kHz, on top of the voice),
+and interpolation alone does not prevent it. Gain is then set from the 95th
+percentile of sample magnitude rather than the absolute peak, so a single cough
+or desk bump does not cancel the boost for an otherwise quiet recording.
 
 ## Build from source
 
