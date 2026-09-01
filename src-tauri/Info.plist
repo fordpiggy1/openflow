@@ -4,5 +4,7 @@
 <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>OpenFlow needs microphone access to transcribe your voice.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>OpenFlow uses System Events to paste completed transcriptions into the app you are using.</string>
 </dict>
 </plist>

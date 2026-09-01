@@ -1,37 +1,232 @@
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-shell";
 
 type Screen = "onboarding" | "main" | "history" | "settings" | "plugins";
 type RecordingState = "idle" | "recording" | "transcribing";
-type OnboardingStep = "provider" | "apikey" | "test" | "done";
+type OnboardingStep = "provider" | "credentials" | "models";
+type ConnectionState = "idle" | "checking" | "connected" | "error";
+type ModelTarget = "transcription" | "formatting" | "tts";
 
 interface Transcription {
-  id: string; raw_text: string; formatted_text: string | null; provider: string;
-  duration_ms: number | null; context_type: string | null; window_title: string | null;
-  language: string | null; created_at: string;
+  id: string;
+  raw_text: string;
+  formatted_text: string | null;
+  provider: string;
+  duration_ms: number | null;
+  context_type: string | null;
+  window_title: string | null;
+  language: string | null;
+  created_at: string;
 }
 
 interface PluginInfo {
-  manifest: { id: string; name: string; version: string; description: string; author: string | null; hooks: string[] };
-  enabled: boolean; path: string;
+  manifest: {
+    id: string;
+    name: string;
+    version: string;
+    description: string;
+    author: string | null;
+    hooks: string[];
+  };
+  enabled: boolean;
+  path: string;
 }
 
-interface ModelInfo { id: string; name: string; model_type: string; }
+interface ModelInfo {
+  id: string;
+  name: string;
+  model_type: "stt" | "chat" | "tts" | string;
+}
 
-const TRANSCRIPTION_PROVIDERS: Record<string, { label: string; hint: string; placeholder: string; description: string }> = {
-  groq: { label: "Groq", hint: "console.groq.com/keys", placeholder: "gsk_...", description: "Fastest. Free tier available." },
-  openai: { label: "OpenAI", hint: "platform.openai.com/api-keys", placeholder: "sk-...", description: "Most reliable. Pay-per-use." },
-  openrouter: { label: "OpenRouter", hint: "openrouter.ai/keys", placeholder: "sk-or-...", description: "300+ models including Whisper. Pay-per-use." },
-  deepgram: { label: "Deepgram", hint: "console.deepgram.com", placeholder: "...", description: "Nova models. Free tier available." },
-  custom: { label: "Custom", hint: "", placeholder: "API key", description: "Any OpenAI-compatible endpoint. Self-hosted, local, or third-party." },
+interface AudioDevice {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
+
+interface TtsChunk {
+  request_id: string;
+  sequence: number;
+  data_base64: string;
+}
+
+interface TtsFinished {
+  request_id?: string;
+}
+
+interface TtsStreamResult {
+  request_id: string;
+  mime_type: string;
+  format: string;
+  model: string;
+  bytes: number;
+}
+
+interface TtsStreamPlayback {
+  mediaSource: MediaSource;
+  sourceBuffer: SourceBuffer | null;
+  pending: Map<number, Uint8Array>;
+  nextSequence: number;
+  finished: boolean;
+  started: boolean;
+}
+
+interface ProviderDefinition {
+  label: string;
+  description: string;
+  keyUrl: string;
+  keyPlaceholder: string;
+  sttDefault: string;
+  chatDefault: string;
+  recommended?: boolean;
+}
+
+const PROVIDERS: Record<string, ProviderDefinition> = {
+  openrouter: {
+    label: "OpenRouter",
+    description: "One key for transcription, formatting, and Gemini voice.",
+    keyUrl: "https://openrouter.ai/keys",
+    keyPlaceholder: "sk-or-v1-…",
+    sttDefault: "openai/whisper-1",
+    chatDefault: "google/gemini-3.1-flash-lite-preview",
+    recommended: true,
+  },
+  groq: {
+    label: "Groq",
+    description: "Low-latency Whisper and fast text formatting.",
+    keyUrl: "https://console.groq.com/keys",
+    keyPlaceholder: "gsk_…",
+    sttDefault: "whisper-large-v3-turbo",
+    chatDefault: "llama-3.3-70b-versatile",
+  },
+  openai: {
+    label: "OpenAI",
+    description: "Reliable speech-to-text and compact formatting models.",
+    keyUrl: "https://platform.openai.com/api-keys",
+    keyPlaceholder: "sk-…",
+    sttDefault: "whisper-1",
+    chatDefault: "gpt-4o-mini",
+  },
+  deepgram: {
+    label: "Deepgram",
+    description: "Nova speech recognition with broad language coverage.",
+    keyUrl: "https://console.deepgram.com",
+    keyPlaceholder: "Paste your Deepgram key",
+    sttDefault: "nova-3",
+    chatDefault: "llama-3.3-70b-versatile",
+  },
+  custom: {
+    label: "Custom endpoint",
+    description: "Connect any OpenAI-compatible speech or chat service.",
+    keyUrl: "",
+    keyPlaceholder: "API key",
+    sttDefault: "whisper-large-v3",
+    chatDefault: "default",
+  },
 };
 
-const FORMATTING_PROVIDERS: Record<string, { label: string; hint: string; placeholder: string; description: string }> = {
-  ...TRANSCRIPTION_PROVIDERS,
-};
+const TTS_DEFAULT_MODEL = "google/gemini-3.1-flash-tts-preview";
+const TTS_VOICES = ["Kore", "Aoede", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Zephyr"];
+const LANGUAGE_OPTIONS = [
+  ["auto", "Auto-detect"], ["en", "English"], ["es", "Spanish"], ["fr", "French"],
+  ["de", "German"], ["it", "Italian"], ["pt", "Portuguese"], ["nl", "Dutch"],
+  ["ja", "Japanese"], ["ko", "Korean"], ["zh", "Chinese"], ["ar", "Arabic"],
+  ["hi", "Hindi"], ["ru", "Russian"],
+] as const;
+
+const STEP_ORDER: OnboardingStep[] = ["provider", "credentials", "models"];
+
+function isTauriRuntime() {
+  return "__TAURI_INTERNALS__" in window;
+}
+
+function initialTheme(): "dark" | "light" {
+  try {
+    const stored = window.localStorage.getItem("openflow-theme");
+    if (stored === "dark" || stored === "light") return stored;
+  } catch { /* Local storage can be unavailable in hardened webviews. */ }
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function friendlyError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/^Error:\s*/i, "").replace(/^\"|\"$/g, "");
+}
+
+function parseStoredProvider(value: string | null) {
+  if (!value) return { name: "openrouter", customUrl: "" };
+  if (value.startsWith("custom:")) return { name: "custom", customUrl: value.slice(7) };
+  return { name: PROVIDERS[value] ? value : "openrouter", customUrl: "" };
+}
+
+function providerValue(name: string, customUrl: string) {
+  return name === "custom" ? `custom:${customUrl.trim().replace(/\/+$/, "")}` : name;
+}
+
+function decodeBase64Chunks(chunks: string[]) {
+  return chunks.map((chunk) => {
+    const decoded = atob(chunk);
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
+    return bytes;
+  });
+}
+
+function pumpTtsPlayback(
+  playback: TtsStreamPlayback,
+  audio: HTMLAudioElement | null,
+  onPlaybackError: () => void,
+) {
+  const sourceBuffer = playback.sourceBuffer;
+  if (!sourceBuffer || sourceBuffer.updating || playback.mediaSource.readyState !== "open") return;
+
+  if (!playback.started && sourceBuffer.buffered.length > 0) {
+    playback.started = true;
+    void audio?.play().catch(onPlaybackError);
+  }
+
+  const next = playback.pending.get(playback.nextSequence);
+  if (next) {
+    playback.pending.delete(playback.nextSequence);
+    playback.nextSequence += 1;
+    const bytes = next.buffer.slice(next.byteOffset, next.byteOffset + next.byteLength) as ArrayBuffer;
+    sourceBuffer.appendBuffer(bytes);
+    return;
+  }
+
+  if (playback.finished) playback.mediaSource.endOfStream();
+}
+
+function Icon({ name, size = 18 }: { name: "arrow" | "check" | "clock" | "gear" | "mic" | "play" | "refresh" | "spark" | "stop" | "volume"; size?: number }) {
+  const paths: Record<typeof name, ReactNode> = {
+    arrow: <><path d="m15 18-6-6 6-6"/><path d="M9 12h10"/></>,
+    check: <path d="m5 12 4 4L19 6"/>,
+    clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
+    gear: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.86 2.86-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.55v-.1A1.7 1.7 0 0 0 8.5 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.86-2.86.06-.06A1.7 1.7 0 0 0 4.1 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H2.3V9.55h.1A1.7 1.7 0 0 0 4.1 8.5a1.7 1.7 0 0 0-.34-1.88l-.06-.06L6.56 3.7l.06.06A1.7 1.7 0 0 0 8.5 4.1a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1v-.1h4.05v.1A1.7 1.7 0 0 0 15 4.1a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.86 2.86-.06.06A1.7 1.7 0 0 0 19.4 8.5c.18.4.5.74.9.95.25.13.53.2.8.2h.1v4.05h-.1a1.7 1.7 0 0 0-1.7 1.3Z"/></>,
+    mic: <><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></>,
+    play: <path d="m9 7 8 5-8 5Z"/>,
+    refresh: <><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 8a7 7 0 0 1 11.6-2L20 8M4 16l2.3 2a7 7 0 0 0 11.6-2"/></>,
+    spark: <><path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2Z"/><path d="m18 14 .7 2.3L21 17l-2.3.7L18 20l-.7-2.3L15 17l2.3-.7Z"/></>,
+    stop: <rect x="7" y="7" width="10" height="10" rx="1"/>,
+    volume: <><path d="M11 5 6 9H3v6h3l5 4Z"/><path d="M15 9a4 4 0 0 1 0 6M17.7 6.3a8 8 0 0 1 0 11.4"/></>,
+  };
+  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+}
+
+function Toggle({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
+  return (
+    <label className="switch-control">
+      <span className="sr-only">{label}</span>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+      <span className="switch-track" aria-hidden="true"><span /></span>
+    </label>
+  );
+}
 
 function App() {
+  const [booting, setBooting] = useState(true);
   const [screen, setScreen] = useState<Screen>("onboarding");
   const [onboardingStep, setOnboardingStep] = useState<OnboardingStep>("provider");
   const [status, setStatus] = useState<RecordingState>("idle");
@@ -42,569 +237,888 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
 
-  // Settings state
-  const [transcriptionProvider, setTranscriptionProvider] = useState("groq");
+  const [transcriptionProvider, setTranscriptionProvider] = useState("openrouter");
   const [transcriptionKey, setTranscriptionKey] = useState("");
-  const [transcriptionModel, setTranscriptionModel] = useState("");
-  const [formattingProvider, setFormattingProvider] = useState("groq");
+  const [transcriptionModel, setTranscriptionModel] = useState(PROVIDERS.openrouter.sttDefault);
+  const [formattingProvider, setFormattingProvider] = useState("openrouter");
   const [formattingKey, setFormattingKey] = useState("");
-  const [formattingModel, setFormattingModel] = useState("");
+  const [formattingModel, setFormattingModel] = useState(PROVIDERS.openrouter.chatDefault);
   const [sameProvider, setSameProvider] = useState(true);
   const [language, setLanguage] = useState("auto");
-  const [theme, setTheme] = useState<"dark" | "light">("light");
+  const [theme, setTheme] = useState<"dark" | "light">(initialTheme);
   const [formatEnabled, setFormatEnabled] = useState(true);
   const [customTranscriptionUrl, setCustomTranscriptionUrl] = useState("");
-  const [customTranscriptionModel, setCustomTranscriptionModel] = useState("");
   const [customFormattingUrl, setCustomFormattingUrl] = useState("");
-  const [customFormattingModel, setCustomFormattingModel] = useState("");
   const [microphone, setMicrophone] = useState("");
-  const [microphones, setMicrophones] = useState<{ id: string; name: string; is_default: boolean }[]>([]);
+  const [microphones, setMicrophones] = useState<AudioDevice[]>([]);
+  const [microphonesLoading, setMicrophonesLoading] = useState(false);
   const [transcriptionModels, setTranscriptionModels] = useState<ModelInfo[]>([]);
   const [formattingModels, setFormattingModels] = useState<ModelInfo[]>([]);
-  const [modelsLoading, setModelsLoading] = useState(false);
+  const [ttsModels, setTtsModels] = useState<ModelInfo[]>([]);
+  const [modelsLoading, setModelsLoading] = useState<ModelTarget | null>(null);
+  const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
+  const [connectionMessage, setConnectionMessage] = useState("");
   const [recordHotkey, setRecordHotkey] = useState("Option+V");
   const [recopyHotkey, setRecopyHotkey] = useState("Ctrl+Shift+V");
+  const [hotkeyDraft, setHotkeyDraft] = useState("");
   const [editingHotkey, setEditingHotkey] = useState<null | "record" | "recopy">(null);
   const [showRecents, setShowRecents] = useState(false);
+  const [showTranscriptionKey, setShowTranscriptionKey] = useState(false);
+  const [showFormattingKey, setShowFormattingKey] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsDirty, setSettingsDirty] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      const key = await invoke<string | null>("get_api_key");
-      if (key) {
-        setTranscriptionKey(key);
-        setFormattingKey(key);
-        setScreen("main");
-      }
-      const tp = await invoke<string | null>("get_setting", { key: "provider" });
-      if (tp) { setTranscriptionProvider(tp); setFormattingProvider(tp); }
-      const sp = await invoke<string | null>("get_setting", { key: "same_provider" });
-      if (sp === "false") {
-        setSameProvider(false);
-        const fp = await invoke<string | null>("get_setting", { key: "formatting_provider" });
-        if (fp) setFormattingProvider(fp);
-        const fk = await invoke<string | null>("get_setting", { key: "formatting_api_key" });
-        if (fk) setFormattingKey(fk);
-      }
-      const lang = await invoke<string | null>("get_setting", { key: "language" });
-      if (lang) setLanguage(lang);
-      const th = await invoke<string | null>("get_setting", { key: "theme" });
-      if (th) setTheme(th as "dark" | "light");
-      const fe = await invoke<string | null>("get_setting", { key: "format_enabled" });
-      if (fe === "false") setFormatEnabled(false);
-      const sm = await invoke<string | null>("get_setting", { key: "stt_model" });
-      if (sm) setTranscriptionModel(sm);
-      const cm = await invoke<string | null>("get_setting", { key: "chat_model" });
-      if (cm) setFormattingModel(cm);
-      invoke<string | null>("get_setting", { key: "microphone" }).then((v) => { if (v) setMicrophone(v); });
-      invoke<string | null>("get_setting", { key: "hotkey_record" }).then((v) => { if (v) setRecordHotkey(v); });
-      invoke<string | null>("get_setting", { key: "hotkey_recopy" }).then((v) => { if (v) setRecopyHotkey(v); });
-      loadHistory();
-      loadMicrophones();
-    })();
+  const [ttsEnabled, setTtsEnabled] = useState(true);
+  const [ttsModel, setTtsModel] = useState(TTS_DEFAULT_MODEL);
+  const [ttsVoice, setTtsVoice] = useState("Kore");
+  const [ttsPreviewText, setTtsPreviewText] = useState("OpenFlow is ready. Your ideas can move at the speed of your voice.");
+  const [ttsStatus, setTtsStatus] = useState<"idle" | "streaming" | "ready" | "error">("idle");
+  const [ttsError, setTtsError] = useState("");
+  const [ttsAudioUrl, setTtsAudioUrl] = useState("");
+  const ttsRequestRef = useRef<string | null>(null);
+  const ttsChunksRef = useRef<Map<string, Map<number, string>>>(new Map());
+  const ttsPlaybackRef = useRef<Map<string, TtsStreamPlayback>>(new Map());
+  const ttsMimeRef = useRef("audio/mpeg");
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const cancelHotkeyEditRef = useRef(false);
+
+  const showNotification = useCallback((message: string) => {
+    setNotification(message);
+    window.setTimeout(() => setNotification(""), 2400);
   }, []);
 
-  useEffect(() => { document.documentElement.setAttribute("data-theme", theme); }, [theme]);
-
-  useEffect(() => {
-    const u1 = listen<string>("recording-state", (e) => setStatus(e.payload as RecordingState));
-    const u2 = listen<Transcription>("transcription-result", (e) => {
-      const t = e.payload;
-      setLastTranscription(t.formatted_text || t.raw_text);
-      setHistory((prev) => [t, ...prev].slice(0, 50));
-      setError("");
-    });
-    const u3 = listen<string>("transcription-error", (e) => setError(e.payload));
-    const u4 = listen<string>("recopy-success", (e) => showNotification(e.payload));
-    const u5 = listen<string>("navigate", (e) => { if (e.payload === "history") { loadHistory(); setScreen("history"); } });
-    return () => { u1.then(f => f()); u2.then(f => f()); u3.then(f => f()); u4.then(f => f()); u5.then(f => f()); };
+  const loadHistory = useCallback(async () => {
+    try { setHistory(await invoke<Transcription[]>("get_history", { limit: 50 })); } catch { /* App may be previewed outside Tauri. */ }
   }, []);
 
-  const showNotification = (msg: string) => { setNotification(msg); setTimeout(() => setNotification(""), 2000); };
-  const loadHistory = async () => { try { setHistory(await invoke<Transcription[]>("get_history", { limit: 50 })); } catch {} };
-  const loadPlugins = async () => { try { setPlugins(await invoke<PluginInfo[]>("list_plugins")); } catch {} };
-  const loadMicrophones = async () => { try { setMicrophones(await invoke<{ id: string; name: string; is_default: boolean }[]>("list_audio_devices")); } catch {} };
+  const loadPlugins = useCallback(async () => {
+    try { setPlugins(await invoke<PluginInfo[]>("list_plugins")); } catch (reason) { setError(friendlyError(reason)); }
+  }, []);
 
-  const save = async (key: string, value: string) => { await invoke("set_setting", { key, value }); };
-
-  const loadModelsFor = async (providerName: string, apiKey: string, target: "transcription" | "formatting") => {
-    setModelsLoading(true);
+  const loadMicrophones = useCallback(async () => {
+    setMicrophonesLoading(true);
     try {
-      const models = await invoke<ModelInfo[]>("fetch_models", { providerName, apiKeyOverride: apiKey });
-      if (target === "transcription") setTranscriptionModels(models.filter(m => m.model_type === "stt"));
-      else setFormattingModels(models.filter(m => m.model_type === "chat"));
-    } catch { }
-    setModelsLoading(false);
+      const devices = await invoke<AudioDevice[]>("list_audio_devices");
+      setMicrophones(devices);
+      setMicrophone((current) => {
+        if (!current || devices.some((device) => device.id === current)) return current;
+        // Migrate selections saved by older versions, which used the display
+        // name as the id and could not distinguish duplicate device names.
+        return devices.find((device) => device.name === current)?.id || "";
+      });
+    } catch (reason) {
+      setError(`Could not read microphones. ${friendlyError(reason)}`);
+    } finally {
+      setMicrophonesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    void (async () => {
+      if (!isTauriRuntime()) {
+        setBooting(false);
+        return;
+      }
+      try {
+        const secretReads = Promise.allSettled([
+          invoke<string | null>("get_api_key"),
+          invoke<string | null>("get_setting", { key: "formatting_api_key" }),
+        ]);
+        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice] = await Promise.all([
+          invoke<string | null>("get_setting", { key: "provider" }),
+          invoke<string | null>("get_setting", { key: "formatting_provider" }),
+          invoke<string | null>("get_setting", { key: "same_provider" }),
+          invoke<string | null>("get_setting", { key: "language" }),
+          invoke<string | null>("get_setting", { key: "theme" }),
+          invoke<string | null>("get_setting", { key: "format_enabled" }),
+          invoke<string | null>("get_setting", { key: "stt_model" }),
+          invoke<string | null>("get_setting", { key: "chat_model" }),
+          invoke<string | null>("get_setting", { key: "microphone" }),
+          invoke<string | null>("get_setting", { key: "hotkey_record" }),
+          invoke<string | null>("get_setting", { key: "hotkey_recopy" }),
+          invoke<string | null>("get_setting", { key: "tts_enabled" }),
+          invoke<string | null>("get_setting", { key: "tts_model" }),
+          invoke<string | null>("get_setting", { key: "tts_voice" }),
+        ]);
+        const [keyResult, formattingKeyResult] = await secretReads;
+        if (!mounted) return;
+        const key = keyResult.status === "fulfilled" ? keyResult.value : null;
+        const storedFormattingKey = formattingKeyResult.status === "fulfilled" ? formattingKeyResult.value : null;
+        const secretFailure = keyResult.status === "rejected"
+          ? keyResult.reason
+          : formattingKeyResult.status === "rejected"
+            ? formattingKeyResult.reason
+            : null;
+        if (secretFailure) {
+          setError(`Protected credentials could not be read. ${friendlyError(secretFailure)}`);
+        }
+        const transcription = parseStoredProvider(storedProvider);
+        let formatting = parseStoredProvider(storedFormattingProvider || storedProvider);
+        if (formatting.name === "deepgram") {
+          formatting = { name: "openrouter", customUrl: "" };
+        }
+        setTranscriptionProvider(transcription.name);
+        setCustomTranscriptionUrl(transcription.customUrl);
+        setFormattingProvider(formatting.name);
+        setCustomFormattingUrl(formatting.customUrl);
+        if (key) {
+          setTranscriptionKey(key);
+          setFormattingKey(storedFormattingKey || key);
+          setScreen("main");
+        }
+        setSameProvider(transcription.name === "deepgram" ? false : storedSameProvider !== "false");
+        if (storedLanguage) setLanguage(storedLanguage);
+        if (storedTheme === "dark" || storedTheme === "light") setTheme(storedTheme);
+        setFormatEnabled(storedFormatEnabled !== "false");
+        if (storedSttModel) setTranscriptionModel(storedSttModel);
+        if (storedChatModel) setFormattingModel(storedChatModel);
+        if (storedMicrophone) setMicrophone(storedMicrophone);
+        if (storedRecordHotkey) setRecordHotkey(storedRecordHotkey);
+        if (storedRecopyHotkey) setRecopyHotkey(storedRecopyHotkey);
+        setTtsEnabled(storedTtsEnabled !== "false");
+        if (storedTtsModel) setTtsModel(storedTtsModel);
+        if (storedTtsVoice) setTtsVoice(storedTtsVoice);
+      } catch (reason) {
+        if (mounted) setError(`OpenFlow settings could not be loaded. ${friendlyError(reason)}`);
+      } finally {
+        if (mounted) setBooting(false);
+      }
+      void loadHistory();
+      void loadMicrophones();
+    })();
+    return () => { mounted = false; };
+  }, [loadHistory, loadMicrophones]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    try { window.localStorage.setItem("openflow-theme", theme); } catch { /* Best effort. */ }
+  }, [theme]);
+
+  useEffect(() => {
+    // Keep the Vite/browser preview usable for visual QA. Tauri's event bridge
+    // only exists inside the packaged desktop webview.
+    if (!isTauriRuntime()) return;
+
+    const unlisteners = [
+      listen<string>("recording-state", (event) => setStatus(event.payload as RecordingState)),
+      listen<Transcription>("transcription-result", (event) => {
+        const transcription = event.payload;
+        setLastTranscription(transcription.formatted_text || transcription.raw_text);
+        setHistory((current) => [transcription, ...current.filter((item) => item.id !== transcription.id)].slice(0, 50));
+        setError("");
+      }),
+      listen<string>("transcription-error", (event) => {
+        if (event.payload === "Transcription cancelled") {
+          setError("");
+          showNotification("Transcription cancelled");
+        } else {
+          setError(event.payload);
+        }
+      }),
+      listen<string>("transcription-warning", (event) => showNotification(event.payload)),
+      listen<string>("recopy-success", (event) => showNotification(event.payload)),
+      listen<string>("navigate", (event) => {
+        if (event.payload === "history") { void loadHistory(); setScreen("history"); }
+      }),
+      listen<TtsChunk>("tts-audio-chunk", (event) => {
+        const { request_id, sequence, data_base64 } = event.payload;
+        const chunks = ttsChunksRef.current.get(request_id) || new Map<number, string>();
+        chunks.set(sequence, data_base64);
+        ttsChunksRef.current.set(request_id, chunks);
+        const playback = ttsPlaybackRef.current.get(request_id);
+        if (playback) {
+          const [bytes] = decodeBase64Chunks([data_base64]);
+          playback.pending.set(sequence, bytes);
+          pumpTtsPlayback(playback, audioRef.current, () => {
+            setTtsError("Live playback was blocked. Use the audio controls to continue.");
+          });
+        }
+      }),
+      listen<TtsFinished>("tts-finished", (event) => {
+        const requestId = event.payload?.request_id || ttsRequestRef.current;
+        if (!requestId || requestId !== ttsRequestRef.current) return;
+        const chunks = ttsChunksRef.current.get(requestId);
+        if (!chunks?.size) {
+          setTtsStatus("error");
+          setTtsError("Voice preview failed. The provider returned no audio.");
+          ttsChunksRef.current.delete(requestId);
+          ttsPlaybackRef.current.delete(requestId);
+          ttsRequestRef.current = null;
+          return;
+        }
+        const playback = ttsPlaybackRef.current.get(requestId);
+        if (playback) {
+          playback.finished = true;
+          pumpTtsPlayback(playback, audioRef.current, () => {
+            setTtsError("Live playback was blocked. Use the audio controls to continue.");
+          });
+          setTtsStatus("ready");
+          ttsChunksRef.current.delete(requestId);
+          ttsRequestRef.current = null;
+          return;
+        }
+        const ordered = [...chunks.entries()].sort(([a], [b]) => a - b).map(([, value]) => value);
+        const blob = new Blob(decodeBase64Chunks(ordered), { type: ttsMimeRef.current });
+        setTtsAudioUrl((previous) => {
+          if (previous) URL.revokeObjectURL(previous);
+          return URL.createObjectURL(blob);
+        });
+        setTtsStatus("ready");
+        ttsChunksRef.current.delete(requestId);
+        ttsRequestRef.current = null;
+      }),
+    ];
+    return () => { for (const unlisten of unlisteners) void unlisten.then((dispose) => dispose()); };
+  }, [loadHistory, showNotification]);
+
+  useEffect(() => () => { if (ttsAudioUrl) URL.revokeObjectURL(ttsAudioUrl); }, [ttsAudioUrl]);
+
+  useEffect(() => () => {
+    for (const playback of ttsPlaybackRef.current.values()) {
+      if (playback.mediaSource.readyState === "open") {
+        try { playback.mediaSource.endOfStream(); } catch { /* The stream may already be closing. */ }
+      }
+    }
+    ttsPlaybackRef.current.clear();
+  }, []);
+
+  const markDirty = () => {
+    setSettingsDirty(true);
+    setConnectionState("idle");
+    setConnectionMessage("");
+  };
+
+  const setProvider = (target: "transcription" | "formatting", nextProvider: string) => {
+    const defaults = PROVIDERS[nextProvider];
+    if (target === "transcription") {
+      setTranscriptionProvider(nextProvider);
+      setTranscriptionModel(defaults.sttDefault);
+      if (nextProvider === "deepgram") {
+        setSameProvider(false);
+        setFormattingProvider("openrouter");
+        setFormattingModel(PROVIDERS.openrouter.chatDefault);
+        setFormattingKey("");
+      } else if (sameProvider) {
+        setFormattingProvider(nextProvider);
+        setFormattingModel(defaults.chatDefault);
+      }
+    } else {
+      setFormattingProvider(nextProvider);
+      setFormattingModel(defaults.chatDefault);
+    }
+    markDirty();
+  };
+
+  const validateProviderConfiguration = (providerName: string, customUrl: string, apiKey: string) => {
+    if (!apiKey.trim()) return "Enter an API key to continue.";
+    if (providerName === "custom" && !/^https?:\/\//i.test(customUrl.trim())) return "Enter a complete endpoint URL beginning with http:// or https://.";
+    return "";
+  };
+
+  const loadModelsFor = async (providerName: string, customUrl: string, apiKey: string, target: ModelTarget) => {
+    const validationError = validateProviderConfiguration(providerName, customUrl, apiKey);
+    if (validationError) throw new Error(validationError);
+    setModelsLoading(target);
+    try {
+      const models = await invoke<ModelInfo[]>("fetch_models", {
+        providerName: providerValue(providerName, customUrl),
+        apiKeyOverride: apiKey.trim(),
+      });
+      if (target === "transcription") {
+        setTranscriptionModels(models.filter((model) => model.model_type === "stt"));
+        setTtsModels(models.filter((model) => model.model_type === "tts"));
+      } else if (target === "formatting") {
+        setFormattingModels(models.filter((model) => model.model_type === "chat"));
+      } else {
+        setTtsModels(models.filter((model) => model.model_type === "tts"));
+      }
+      return models;
+    } finally {
+      setModelsLoading(null);
+    }
+  };
+
+  const verifyConnection = async () => {
+    setConnectionState("checking");
+    setConnectionMessage("");
+    setError("");
+    try {
+      const primaryModels = await loadModelsFor(transcriptionProvider, customTranscriptionUrl, transcriptionKey, "transcription");
+      if (sameProvider) {
+        setFormattingModels(primaryModels.filter((model) => model.model_type === "chat"));
+        setTtsModels(primaryModels.filter((model) => model.model_type === "tts"));
+      } else {
+        await loadModelsFor(formattingProvider, customFormattingUrl, formattingKey, "formatting");
+      }
+      setConnectionState("connected");
+      setConnectionMessage(`Connected to ${PROVIDERS[transcriptionProvider].label}. Your key is valid and model access is ready.`);
+    } catch (reason) {
+      setConnectionState("error");
+      setConnectionMessage(`Connection failed. ${friendlyError(reason)}`);
+    }
+  };
+
+  const saveConfiguration = async () => {
+    const validationError = validateProviderConfiguration(transcriptionProvider, customTranscriptionUrl, transcriptionKey);
+    if (validationError) throw new Error(validationError);
+    if (!sameProvider) {
+      const formattingValidationError = validateProviderConfiguration(formattingProvider, customFormattingUrl, formattingKey);
+      if (formattingValidationError) throw new Error(formattingValidationError);
+    }
+    const settings: Array<[string, string]> = [
+      ["provider", providerValue(transcriptionProvider, customTranscriptionUrl)],
+      ["same_provider", String(sameProvider)],
+      ["format_enabled", String(formatEnabled)],
+      ["stt_model", transcriptionModel.trim()],
+      ["chat_model", formattingModel.trim()],
+      ["language", language === "auto" ? "" : language],
+      ["theme", theme],
+      ["microphone", microphone],
+      ["tts_enabled", String(ttsEnabled)],
+      ["tts_provider", "openrouter"],
+      ["tts_model", ttsModel.trim() || TTS_DEFAULT_MODEL],
+      ["tts_voice", ttsVoice.trim() || "Kore"],
+      ["tts_response_format", "mp3"],
+    ];
+    if (!sameProvider) {
+      settings.push(
+        ["formatting_provider", providerValue(formattingProvider, customFormattingUrl)],
+        ["formatting_api_key", formattingKey.trim()],
+      );
+    }
+    await invoke("set_api_key", { key: transcriptionKey.trim() });
+    await Promise.all(settings.map(([key, value]) => invoke("set_setting", { key, value })));
+  };
+
+  const finishOnboarding = async () => {
+    setSavingSettings(true);
+    setError("");
+    try {
+      await saveConfiguration();
+      setSettingsDirty(false);
+      setScreen("main");
+      showNotification("OpenFlow is ready");
+    } catch (reason) {
+      setError(`Setup could not be saved. ${friendlyError(reason)}`);
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const saveSettings = async () => {
+    setSavingSettings(true);
+    setError("");
+    try {
+      await saveConfiguration();
+      setSettingsDirty(false);
+      showNotification("Settings saved");
+    } catch (reason) {
+      setError(`Settings could not be saved. ${friendlyError(reason)}`);
+    } finally {
+      setSavingSettings(false);
+    }
   };
 
   const handleSearch = async () => {
-    if (!searchQuery.trim()) { loadHistory(); return; }
-    try { setHistory(await invoke<Transcription[]>("search_history", { query: searchQuery })); } catch {}
+    if (!searchQuery.trim()) { void loadHistory(); return; }
+    try { setHistory(await invoke<Transcription[]>("search_history", { query: searchQuery.trim() })); }
+    catch (reason) { setError(`Search failed. ${friendlyError(reason)}`); }
   };
 
   const handleStartRecording = async () => {
-    setError(""); setStatus("recording");
-    try { await invoke("start_recording"); } catch (e) { setError(String(e)); setStatus("idle"); }
+    if (status !== "idle") return;
+    setError("");
+    setStatus("recording");
+    try { await invoke("start_recording"); }
+    catch (reason) { setError(`Recording could not start. ${friendlyError(reason)}`); setStatus("idle"); }
   };
 
   const handleStopRecording = async () => {
+    if (status !== "recording") return;
     setStatus("transcribing");
     try {
       const result = await invoke<Transcription>("stop_recording_and_transcribe");
       setLastTranscription(result.formatted_text || result.raw_text);
-      setHistory((prev) => [result, ...prev].slice(0, 50));
-      setStatus("idle"); setError("");
-    } catch (e) { setError(String(e)); setStatus("idle"); }
-  };
-
-  const getProviderValue = (name: string, customUrl: string) =>
-    name === "custom" ? `custom:${customUrl.replace(/\/+$/, "")}` : name;
-
-  const finishOnboarding = async () => {
-    await invoke("set_api_key", { key: transcriptionKey.trim() });
-    await save("provider", getProviderValue(transcriptionProvider, customTranscriptionUrl));
-    await save("same_provider", String(sameProvider));
-    if (transcriptionModel) await save("stt_model", transcriptionModel);
-    if (customTranscriptionModel) await save("stt_model", customTranscriptionModel);
-    if (!sameProvider) {
-      await save("formatting_provider", getProviderValue(formattingProvider, customFormattingUrl));
-      await save("formatting_api_key", formattingKey.trim());
-      if (formattingModel) await save("chat_model", formattingModel);
-      if (customFormattingModel) await save("chat_model", customFormattingModel);
+      setHistory((current) => [result, ...current.filter((item) => item.id !== result.id)].slice(0, 50));
+      setStatus("idle");
+      setError("");
+    } catch (reason) {
+      const message = friendlyError(reason);
+      if (message === "Transcription cancelled") {
+        setError("");
+        showNotification("Transcription cancelled");
+      } else {
+        setError(`Transcription failed. ${message}`);
+      }
+      setStatus("idle");
     }
-    setScreen("main");
   };
 
-  const tProv = TRANSCRIPTION_PROVIDERS[transcriptionProvider as keyof typeof TRANSCRIPTION_PROVIDERS];
-  const fProv = FORMATTING_PROVIDERS[formattingProvider as keyof typeof FORMATTING_PROVIDERS];
+  const cancelTranscription = async () => {
+    try {
+      const cancelled = await invoke<boolean>("cancel_current_transcription");
+      if (cancelled) showNotification("Cancelling transcription…");
+    } catch (reason) {
+      setError(`Transcription could not be cancelled. ${friendlyError(reason)}`);
+    }
+  };
 
-  // ─── ONBOARDING ─────────────────────────────────────────
-  if (screen === "onboarding") {
+  const playTtsPreview = async () => {
+    if (!ttsPreviewText.trim()) { setTtsError("Enter a short preview sentence first."); return; }
+    if (transcriptionProvider !== "openrouter") { setTtsError("Gemini voice previews require OpenRouter as your transcription provider."); return; }
+    if (ttsStatus === "ready" && ttsAudioUrl) {
+      try {
+        if (audioRef.current) audioRef.current.currentTime = 0;
+        await audioRef.current?.play();
+      } catch { setTtsError("Playback was blocked. Use the audio controls below to play the preview."); }
+      return;
+    }
+    setTtsError("");
+    setTtsStatus("streaming");
+    const requestId = crypto.randomUUID();
+    ttsRequestRef.current = requestId;
+    ttsChunksRef.current.set(requestId, new Map());
+    ttsMimeRef.current = "audio/mpeg";
+    if ("MediaSource" in window && MediaSource.isTypeSupported("audio/mpeg")) {
+      const mediaSource = new MediaSource();
+      const playback: TtsStreamPlayback = {
+        mediaSource,
+        sourceBuffer: null,
+        pending: new Map(),
+        nextSequence: 0,
+        finished: false,
+        started: false,
+      };
+      ttsPlaybackRef.current.set(requestId, playback);
+      const streamUrl = URL.createObjectURL(mediaSource);
+      setTtsAudioUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return streamUrl;
+      });
+      mediaSource.addEventListener("sourceopen", () => {
+        if (ttsPlaybackRef.current.get(requestId) !== playback) return;
+        try {
+          playback.sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+          playback.sourceBuffer.mode = "sequence";
+          playback.sourceBuffer.addEventListener("updateend", () => {
+            pumpTtsPlayback(playback, audioRef.current, () => {
+              setTtsError("Live playback was blocked. Use the audio controls to continue.");
+            });
+          });
+          pumpTtsPlayback(playback, audioRef.current, () => {
+            setTtsError("Live playback was blocked. Use the audio controls to continue.");
+          });
+        } catch {
+          ttsPlaybackRef.current.delete(requestId);
+        }
+      }, { once: true });
+    }
+    try {
+      const result = await invoke<TtsStreamResult>("stream_speech", {
+        text: ttsPreviewText.trim(),
+        model: ttsModel.trim() || TTS_DEFAULT_MODEL,
+        voice: ttsVoice.trim() || "Kore",
+        responseFormat: "mp3",
+        requestId,
+      });
+      ttsMimeRef.current = result.mime_type || "audio/wav";
+      const chunks = ttsChunksRef.current.get(requestId);
+      if (chunks?.size && ttsRequestRef.current === requestId) {
+        const ordered = [...chunks.entries()].sort(([a], [b]) => a - b).map(([, value]) => value);
+        const blob = new Blob(decodeBase64Chunks(ordered), { type: ttsMimeRef.current });
+        setTtsAudioUrl((previous) => {
+          if (previous) URL.revokeObjectURL(previous);
+          return URL.createObjectURL(blob);
+        });
+        setTtsStatus("ready");
+        ttsChunksRef.current.delete(requestId);
+        ttsRequestRef.current = null;
+      } else if (ttsRequestRef.current === requestId) {
+        setTtsStatus("error");
+        setTtsError(result.bytes === 0
+          ? "Voice preview failed. The provider returned no audio."
+          : "Voice preview failed. Audio could not be delivered to the player.");
+        ttsChunksRef.current.delete(requestId);
+        ttsPlaybackRef.current.delete(requestId);
+        ttsRequestRef.current = null;
+      }
+    } catch (reason) {
+      if (ttsRequestRef.current === requestId) {
+        setTtsStatus("error");
+        setTtsError(`Voice preview failed. ${friendlyError(reason)}`);
+        ttsChunksRef.current.delete(requestId);
+        ttsPlaybackRef.current.delete(requestId);
+        ttsRequestRef.current = null;
+      }
+    }
+  };
+
+  const cancelTtsPreview = async () => {
+    const requestId = ttsRequestRef.current;
+    try { await invoke("cancel_speech", { requestId }); } catch { /* Cancellation is best-effort. */ }
+    if (requestId) ttsChunksRef.current.delete(requestId);
+    if (requestId) {
+      const playback = ttsPlaybackRef.current.get(requestId);
+      if (playback?.mediaSource.readyState === "open") {
+        try { playback.mediaSource.endOfStream(); } catch { /* Cancellation races with provider completion. */ }
+      }
+      ttsPlaybackRef.current.delete(requestId);
+    }
+    ttsRequestRef.current = null;
+    setTtsAudioUrl("");
+    setTtsStatus("idle");
+    setTtsError("");
+  };
+
+  const updateHotkey = async (action: "record" | "recopy", value: string) => {
+    try {
+      await invoke("rebind_hotkey", { action, shortcutStr: value });
+      if (action === "record") setRecordHotkey(value);
+      else setRecopyHotkey(value);
+      showNotification("Shortcut updated");
+    } catch (reason) {
+      setError(`Shortcut could not be updated. ${friendlyError(reason)}`);
+    } finally {
+      setEditingHotkey(null);
+    }
+  };
+
+  const openExternalKeyUrl = async (url: string) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+      if (parsed.protocol !== "https:") throw new Error("Unsupported link");
+    } catch {
+      setError("This provider key link is invalid.");
+      return;
+    }
+    if (!isTauriRuntime()) {
+      window.open(parsed.href, "_blank", "noopener,noreferrer");
+      return;
+    }
+    try {
+      await open(parsed.href);
+    } catch (reason) {
+      setError(`Could not open the provider website. ${friendlyError(reason)}`);
+    }
+  };
+
+  const selectedProvider = PROVIDERS[transcriptionProvider];
+  const selectedFormattingProvider = PROVIDERS[formattingProvider];
+
+  if (booting) {
     return (
-      <main className="container">
-        <img src="/laisy-blue.png" alt="OpenFlow" style={{ width: 48, height: 48 }} />
-        <h1>OpenFlow</h1>
-        <p className="subtitle">Open-source voice transcription</p>
+      <main className="boot-screen" aria-label="Loading OpenFlow">
+        <img src="/logo-128.png" alt="" className="boot-logo" />
+        <span className="boot-pulse" />
+      </main>
+    );
+  }
 
-        <div className="wizard">
-          <div className="wizard-steps">
-            <span className={onboardingStep === "provider" ? "step active" : "step"}>1</span>
-            <span className="step-line" />
-            <span className={onboardingStep === "apikey" ? "step active" : "step"}>2</span>
-            <span className="step-line" />
-            <span className={onboardingStep === "test" ? "step active" : "step"}>3</span>
+  if (screen === "onboarding") {
+    const currentStep = STEP_ORDER.indexOf(onboardingStep);
+    return (
+      <main className="onboarding-page">
+        <section className="onboarding-brand" aria-label="OpenFlow introduction">
+          <div className="brand-lockup"><img src="/logo-128.png" alt="" /><span>OpenFlow</span></div>
+          <div className="brand-copy">
+            <span className="eyebrow">Private by design</span>
+            <h1>Say it once.<br/><em>Keep moving.</em></h1>
+            <p>Hold a shortcut, speak naturally, and polished text lands where you’re working.</p>
           </div>
+          <div className="privacy-note"><Icon name="spark" /><span>Your key stays on this device. Audio goes only to the provider you choose.</span></div>
+        </section>
+
+        <section className="onboarding-panel" aria-labelledby="setup-title">
+          <header className="onboarding-header">
+            <div>
+              <span className="step-kicker">Setup · {currentStep + 1} of {STEP_ORDER.length}</span>
+              <h2 id="setup-title">{onboardingStep === "provider" ? "Choose how OpenFlow listens" : onboardingStep === "credentials" ? "Connect your provider" : "Make it yours"}</h2>
+            </div>
+            <ol className="progress-dots" aria-label="Setup progress">
+              {STEP_ORDER.map((step, index) => (
+                <li key={step} className={index < currentStep ? "complete" : index === currentStep ? "active" : ""} aria-current={index === currentStep ? "step" : undefined}>
+                  {index < currentStep ? <Icon name="check" size={13} /> : index + 1}
+                </li>
+              ))}
+            </ol>
+          </header>
 
           {onboardingStep === "provider" && (
-            <div className="wizard-content">
-              <h2>Choose your transcription provider</h2>
-              <p className="hint">This is the service that converts your voice to text.</p>
-              <div className="provider-cards">
-                {Object.entries(TRANSCRIPTION_PROVIDERS).map(([k, v]) => (
-                  <button
-                    key={k}
-                    className={`provider-card ${transcriptionProvider === k ? "selected" : ""}`}
-                    onClick={() => setTranscriptionProvider(k)}
-                  >
-                    <strong>{v.label}</strong>
-                    <span>{v.description}</span>
-                  </button>
+            <div className="panel-content flow-stack">
+              <p className="section-lead">OpenRouter is the easiest path: one key unlocks transcription, cleanup, and Gemini 3.1 Flash voice.</p>
+              <fieldset className="provider-grid">
+                <legend className="sr-only">Transcription provider</legend>
+                {Object.entries(PROVIDERS).map(([key, provider]) => (
+                  <label key={key} className={`provider-option ${transcriptionProvider === key ? "selected" : ""}`}>
+                    <input type="radio" name="provider" value={key} checked={transcriptionProvider === key} onChange={() => setProvider("transcription", key)} />
+                    <span className="provider-copy"><strong>{provider.label}</strong><small>{provider.description}</small></span>
+                    {provider.recommended && <span className="recommended-badge">Recommended</span>}
+                    <span className="radio-mark" aria-hidden="true" />
+                  </label>
                 ))}
+              </fieldset>
+              <div className="inline-setting">
+                <div><strong>Use the same provider for cleanup</strong><small>{transcriptionProvider === "deepgram" ? "Deepgram handles speech only; choose a separate cleanup provider." : "Best for a simple, one-key setup."}</small></div>
+                <Toggle checked={sameProvider} disabled={transcriptionProvider === "deepgram"} onChange={(checked) => { setSameProvider(checked); if (checked) { setFormattingProvider(transcriptionProvider); setFormattingKey(transcriptionKey); setFormattingModel(PROVIDERS[transcriptionProvider].chatDefault); } markDirty(); }} label="Use same provider for cleanup" />
               </div>
-
-              <div className="toggle-row">
-                <label>Use same provider for text formatting?</label>
-                <button className="toggle-btn" onClick={() => setSameProvider(!sameProvider)}>
-                  {sameProvider ? "Yes" : "No"}
-                </button>
-              </div>
-
               {!sameProvider && (
-                <>
-                  <h2 style={{ marginTop: 16 }}>Formatting provider</h2>
-                  <p className="hint">The LLM that cleans up punctuation and formatting.</p>
-                  <div className="provider-cards">
-                    {Object.entries(FORMATTING_PROVIDERS).map(([k, v]) => (
-                      <button
-                        key={k}
-                        className={`provider-card ${formattingProvider === k ? "selected" : ""}`}
-                        onClick={() => setFormattingProvider(k)}
-                      >
-                        <strong>{v.label}</strong>
-                        <span>{v.description}</span>
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-
-              <button className="btn-primary" onClick={() => setOnboardingStep("apikey")}>
-                Continue
-              </button>
-            </div>
-          )}
-
-          {onboardingStep === "apikey" && (
-            <div className="wizard-content">
-              <h2>Enter your API {sameProvider ? "key" : "keys"}</h2>
-
-              {transcriptionProvider === "custom" && (
-                <div className="field">
-                  <label className="label">Transcription endpoint URL</label>
-                  <p className="hint">OpenAI-compatible base URL (e.g. http://localhost:8080/v1)</p>
-                  <input
-                    value={customTranscriptionUrl}
-                    onChange={(e) => setCustomTranscriptionUrl(e.target.value)}
-                    placeholder="https://your-server.com/v1"
-                  />
-                  <label className="label" style={{ marginTop: 8 }}>Model name</label>
-                  <input
-                    value={customTranscriptionModel}
-                    onChange={(e) => setCustomTranscriptionModel(e.target.value)}
-                    placeholder="whisper-large-v3"
-                  />
-                </div>
-              )}
-
-              <div className="field">
-                <label className="label">
-                  {sameProvider ? "API Key" : `${tProv?.label || "Transcription"} key (transcription)`}
-                </label>
-                {tProv?.hint && (
-                  <p className="hint">
-                    Get one at <a href={`https://${tProv.hint}`} target="_blank">{tProv.hint}</a>
-                  </p>
-                )}
-                <input
-                  type="password"
-                  value={transcriptionKey}
-                  onChange={(e) => { setTranscriptionKey(e.target.value); if (sameProvider) setFormattingKey(e.target.value); }}
-                  placeholder={tProv?.placeholder}
-                />
-              </div>
-
-              {!sameProvider && (
-                <div className="field" style={{ marginTop: 16 }}>
-                  {formattingProvider === "custom" && (
-                    <>
-                      <label className="label">Formatting endpoint URL</label>
-                      <p className="hint">OpenAI-compatible chat completions base URL</p>
-                      <input
-                        value={customFormattingUrl}
-                        onChange={(e) => setCustomFormattingUrl(e.target.value)}
-                        placeholder="https://your-server.com/v1"
-                      />
-                      <label className="label" style={{ marginTop: 8 }}>Model name</label>
-                      <input
-                        value={customFormattingModel}
-                        onChange={(e) => setCustomFormattingModel(e.target.value)}
-                        placeholder="llama-3.3-70b"
-                      />
-                    </>
-                  )}
-                  <label className="label" style={{ marginTop: formattingProvider === "custom" ? 8 : 0 }}>{fProv?.label || "Formatting"} key (formatting)</label>
-                  {fProv?.hint && (
-                    <p className="hint">
-                      Get one at <a href={`https://${fProv.hint}`} target="_blank">{fProv.hint}</a>
-                    </p>
-                  )}
-                  <input
-                    type="password"
-                    value={formattingKey}
-                    onChange={(e) => setFormattingKey(e.target.value)}
-                    placeholder={fProv?.placeholder}
-                  />
-                </div>
-              )}
-
-              {error && <p className="error">{error}</p>}
-
-              <div className="wizard-nav">
-                <button className="btn-secondary" onClick={() => setOnboardingStep("provider")}>Back</button>
-                <button
-                  className="btn-primary"
-                  disabled={!transcriptionKey.trim() || (!sameProvider && !formattingKey.trim())}
-                  onClick={() => { setError(""); setOnboardingStep("test"); }}
-                >
-                  Continue
-                </button>
-              </div>
-            </div>
-          )}
-
-          {onboardingStep === "test" && (
-            <div className="wizard-content">
-              <h2>Optional: Choose models</h2>
-              <p className="hint">Load available models from your provider, or use defaults.</p>
-
-              <div className="field">
-                <label className="label">Transcription model</label>
-                <div className="model-row">
-                  <select value={transcriptionModel} onChange={(e) => setTranscriptionModel(e.target.value)}>
-                    <option value="">Default ({TRANSCRIPTION_PROVIDERS[transcriptionProvider as keyof typeof TRANSCRIPTION_PROVIDERS]?.label})</option>
-                    {transcriptionModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
+                <div className="field-group reveal">
+                  <label htmlFor="formatting-provider">Formatting provider</label>
+                  <select id="formatting-provider" value={formattingProvider} onChange={(event) => setProvider("formatting", event.target.value)}>
+                    {Object.entries(PROVIDERS).filter(([key]) => key !== "deepgram").map(([key, provider]) => <option key={key} value={key}>{provider.label}</option>)}
                   </select>
-                  <button className="btn-secondary" onClick={() => loadModelsFor(transcriptionProvider, transcriptionKey, "transcription")}>
-                    {modelsLoading ? "..." : "Load"}
-                  </button>
                 </div>
+              )}
+              <div className="panel-actions end"><button className="button primary" onClick={() => setOnboardingStep("credentials")}>Continue to connection <span aria-hidden="true">→</span></button></div>
+            </div>
+          )}
+
+          {onboardingStep === "credentials" && (
+            <div className="panel-content flow-stack">
+              <p className="section-lead">We’ll verify access before saving anything. OpenFlow never sends your key anywhere else.</p>
+              {transcriptionProvider === "custom" && (
+                <div className="field-group">
+                  <label htmlFor="custom-transcription-url">Transcription endpoint</label>
+                  <input id="custom-transcription-url" type="url" value={customTranscriptionUrl} onChange={(event) => { setCustomTranscriptionUrl(event.target.value); markDirty(); }} placeholder="https://your-server.com/v1" autoCapitalize="none" autoCorrect="off" />
+                </div>
+              )}
+              <div className="field-group">
+                <div className="label-row"><label htmlFor="transcription-key">{selectedProvider.label} API key</label>{selectedProvider.keyUrl && <a href={selectedProvider.keyUrl} onClick={(event) => { event.preventDefault(); void openExternalKeyUrl(selectedProvider.keyUrl); }}>Create a key ↗</a>}</div>
+                <div className="secret-input">
+                  <input id="transcription-key" type={showTranscriptionKey ? "text" : "password"} value={transcriptionKey} onChange={(event) => { setTranscriptionKey(event.target.value); if (sameProvider) setFormattingKey(event.target.value); setConnectionState("idle"); setConnectionMessage(""); }} placeholder={selectedProvider.keyPlaceholder} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+                  <button type="button" onClick={() => setShowTranscriptionKey((shown) => !shown)} aria-label={showTranscriptionKey ? "Hide API key" : "Show API key"}>{showTranscriptionKey ? "Hide" : "Show"}</button>
+                </div>
+                <small className="field-help">Stored in your operating system’s protected credential store.</small>
               </div>
 
-              {(formatEnabled && !sameProvider) && (
-                <div className="field">
-                  <label className="label">Formatting model</label>
-                  <div className="model-row">
-                    <select value={formattingModel} onChange={(e) => setFormattingModel(e.target.value)}>
-                      <option value="">Default ({FORMATTING_PROVIDERS[formattingProvider as keyof typeof FORMATTING_PROVIDERS]?.label})</option>
-                      {formattingModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
-                    </select>
-                    <button className="btn-secondary" onClick={() => loadModelsFor(formattingProvider, formattingKey, "formatting")}>
-                      {modelsLoading ? "..." : "Load"}
-                    </button>
+              {!sameProvider && (
+                <div className="secondary-credentials reveal">
+                  {formattingProvider === "custom" && (
+                    <div className="field-group">
+                      <label htmlFor="custom-formatting-url">Formatting endpoint</label>
+                      <input id="custom-formatting-url" type="url" value={customFormattingUrl} onChange={(event) => { setCustomFormattingUrl(event.target.value); markDirty(); }} placeholder="https://your-server.com/v1" autoCapitalize="none" autoCorrect="off" />
+                    </div>
+                  )}
+                  <div className="field-group">
+                    <div className="label-row"><label htmlFor="formatting-key">{selectedFormattingProvider.label} formatting key</label>{selectedFormattingProvider.keyUrl && <a href={selectedFormattingProvider.keyUrl} onClick={(event) => { event.preventDefault(); void openExternalKeyUrl(selectedFormattingProvider.keyUrl); }}>Create a key ↗</a>}</div>
+                    <div className="secret-input">
+                      <input id="formatting-key" type={showFormattingKey ? "text" : "password"} value={formattingKey} onChange={(event) => { setFormattingKey(event.target.value); setConnectionState("idle"); setConnectionMessage(""); }} placeholder={selectedFormattingProvider.keyPlaceholder} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+                      <button type="button" onClick={() => setShowFormattingKey((shown) => !shown)} aria-label={showFormattingKey ? "Hide formatting key" : "Show formatting key"}>{showFormattingKey ? "Hide" : "Show"}</button>
+                    </div>
                   </div>
                 </div>
               )}
 
-              <div className="wizard-nav">
-                <button className="btn-secondary" onClick={() => setOnboardingStep("apikey")}>Back</button>
-                <button className="btn-primary" onClick={finishOnboarding}>
-                  Start using OpenFlow
-                </button>
+              {connectionMessage && <div className={`connection-state ${connectionState}`} role={connectionState === "error" ? "alert" : "status"}><Icon name={connectionState === "connected" ? "check" : "spark"} /><span>{connectionMessage}</span></div>}
+              <div className="panel-actions split">
+                <button className="button quiet" onClick={() => setOnboardingStep("provider")}><Icon name="arrow" /> Back</button>
+                {connectionState === "connected" ? (
+                  <button className="button primary" onClick={() => setOnboardingStep("models")}>Continue to preferences <span aria-hidden="true">→</span></button>
+                ) : (
+                  <button className="button primary" disabled={connectionState === "checking" || modelsLoading !== null} onClick={() => void verifyConnection()}>{connectionState === "checking" || modelsLoading !== null ? <><span className="spinner" /> Checking access…</> : "Verify connection"}</button>
+                )}
               </div>
             </div>
           )}
-        </div>
+
+          {onboardingStep === "models" && (
+            <div className="panel-content flow-stack">
+              <p className="section-lead">Smart defaults are ready. Change a model now or paste any compatible model ID later.</p>
+              <div className="preference-grid">
+                <div className="field-group">
+                  <label htmlFor="onboarding-stt-model">Speech-to-text model</label>
+                  <input id="onboarding-stt-model" list="stt-models" value={transcriptionModel} onChange={(event) => setTranscriptionModel(event.target.value)} placeholder={selectedProvider.sttDefault} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+                  <datalist id="stt-models">{transcriptionModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
+                </div>
+                <div className="field-group">
+                  <label htmlFor="onboarding-chat-model">Cleanup model</label>
+                  <input id="onboarding-chat-model" list="chat-models" value={formattingModel} onChange={(event) => setFormattingModel(event.target.value)} placeholder={selectedFormattingProvider.chatDefault} autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={!formatEnabled} />
+                  <datalist id="chat-models">{formattingModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
+                </div>
+              </div>
+              {transcriptionProvider === "openrouter" && (
+                <div className="field-group voice-model-field">
+                  <div className="label-row"><label htmlFor="onboarding-tts-model">Gemini voice model</label><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div>
+                  <input id="onboarding-tts-model" list="tts-models" value={ttsModel} onChange={(event) => setTtsModel(event.target.value)} placeholder={TTS_DEFAULT_MODEL} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+                  <datalist id="tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
+                </div>
+              )}
+              <div className="field-group">
+                <div className="label-row"><label htmlFor="onboarding-microphone">Microphone</label><button className="text-button" onClick={() => void loadMicrophones()} disabled={microphonesLoading}><Icon name="refresh" size={14} /> {microphonesLoading ? "Checking…" : "Refresh"}</button></div>
+                <select id="onboarding-microphone" value={microphone} onChange={(event) => setMicrophone(event.target.value)}>
+                  <option value="">System default</option>
+                  {microphones.map((device) => <option key={device.id} value={device.id}>{device.name}{device.is_default ? " · default" : ""}</option>)}
+                </select>
+                <small className={`field-help mic-readiness ${microphones.length ? "ready" : ""}`}>{microphonesLoading ? "Checking microphone access…" : microphones.length ? `${microphones.length} microphone${microphones.length === 1 ? "" : "s"} ready. You’ll record a first sample in the workspace.` : "No microphone detected yet. Check system permission, then refresh."}</small>
+              </div>
+              {error && <div className="error-banner" role="alert">{error}</div>}
+              <div className="panel-actions split">
+                <button className="button quiet" onClick={() => setOnboardingStep("credentials")}><Icon name="arrow" /> Back</button>
+                <button className="button primary" disabled={savingSettings} onClick={() => void finishOnboarding()}>{savingSettings ? <><span className="spinner" /> Saving…</> : "Open my workspace"}</button>
+              </div>
+            </div>
+          )}
+        </section>
       </main>
     );
   }
 
-  // ─── HISTORY ────────────────────────────────────────────
+  const screenHeader = (title: string, back: () => void, action?: ReactNode) => (
+    <header className="screen-header">
+      <button className="icon-button back-button" onClick={back} aria-label="Go back"><Icon name="arrow" /></button>
+      <div><span className="screen-kicker">OpenFlow</span><h1>{title}</h1></div>
+      <div className="header-action">{action}</div>
+    </header>
+  );
+
   if (screen === "history") {
     return (
-      <main className="container history-screen">
-        <div className="nav-row">
-          <button className="nav-btn" onClick={() => setScreen("main")}>Back</button>
-          <h2>History</h2>
-          <div />
-        </div>
-        <div className="search-row">
-          <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search transcriptions..." onKeyDown={(e) => e.key === "Enter" && handleSearch()} />
-        </div>
-        <div className="history-list">
-          {history.length === 0 && <p className="empty">No transcriptions yet</p>}
-          {history.map((item) => (
-            <div key={item.id} className="history-card" onClick={() => { navigator.clipboard.writeText(item.formatted_text || item.raw_text); showNotification("Copied!"); }}>
-              <p className="history-card-text">{item.formatted_text || item.raw_text}</p>
-              <div className="history-card-meta">
-                <span>{new Date(item.created_at).toLocaleString()}</span>
-                {item.duration_ms && <span>{(item.duration_ms / 1000).toFixed(1)}s</span>}
-                <span>{item.provider}</span>
-              </div>
-            </div>
-          ))}
+      <main className="app-page">
+        {notification && <div className="toast" role="status">{notification}</div>}
+        {screenHeader("History", () => setScreen("main"))}
+        <div className="page-body history-body">
+          <form className="search-field" onSubmit={(event) => { event.preventDefault(); void handleSearch(); }}>
+            <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search what you’ve said" aria-label="Search transcriptions" />
+            <button type="submit">Search</button>
+          </form>
+          {error && <div className="error-banner" role="alert">{error}</div>}
+          <div className="history-list">
+            {history.length === 0 && <div className="empty-state"><Icon name="clock" size={26} /><h2>Nothing here yet</h2><p>Your first transcription will appear here, ready to copy again.</p><button className="button secondary" onClick={() => setScreen("main")}>Record something</button></div>}
+            {history.map((item) => (
+              <button key={item.id} className="history-item" onClick={async () => { await navigator.clipboard.writeText(item.formatted_text || item.raw_text); showNotification("Copied to clipboard"); }}>
+                <span className="history-text">{item.formatted_text || item.raw_text}</span>
+                <span className="history-meta"><time dateTime={item.created_at}>{new Date(item.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}</time>{item.duration_ms ? <span>{(item.duration_ms / 1000).toFixed(1)} sec</span> : null}<span>{item.provider.replace("custom:", "")}</span></span>
+              </button>
+            ))}
+          </div>
         </div>
       </main>
     );
   }
 
-  // ─── PLUGINS ────────────────────────────────────────────
   if (screen === "plugins") {
     return (
-      <main className="container settings-screen">
-        <div className="nav-row">
-          <button className="nav-btn" onClick={() => setScreen("settings")}>Back</button>
-          <h2>Plugins</h2>
-          <div />
-        </div>
-        <div className="settings-list">
-          {plugins.length === 0 && <div className="empty"><p>No plugins installed</p><p className="hint" style={{ marginTop: 8 }}>Plugins live in <code>~/.openflow/plugins/</code></p></div>}
-          {plugins.map((p) => (
-            <div key={p.manifest.id} className="setting-item">
-              <div><label>{p.manifest.name} <span className="setting-value">{p.manifest.version}</span></label><p className="hint" style={{ textAlign: "left", marginTop: 4 }}>{p.manifest.description}</p></div>
-              <button className="toggle-btn" onClick={async () => { if (p.enabled) await invoke("disable_plugin", { id: p.manifest.id }); else await invoke("enable_plugin", { id: p.manifest.id }); loadPlugins(); }}>{p.enabled ? "Enabled" : "Disabled"}</button>
-            </div>
-          ))}
+      <main className="app-page">
+        {screenHeader("Plugins", () => setScreen("settings"))}
+        <div className="page-body">
+          {error && <div className="error-banner" role="alert">{error}</div>}
+          <section className="settings-section">
+            <div className="section-heading"><div><h2>Installed extensions</h2><p>Small local tools that react to your transcriptions.</p></div></div>
+            {plugins.length === 0 ? <div className="empty-state compact"><Icon name="spark" size={24} /><h3>No plugins installed</h3><p>Place a plugin manifest in <code>~/.openflow/plugins/</code>, then reopen this page.</p></div> : (
+              <div className="plugin-list">{plugins.map((plugin) => (
+                <div key={plugin.manifest.id} className="plugin-row"><div><div className="plugin-title"><strong>{plugin.manifest.name}</strong><code>{plugin.manifest.version}</code></div><p>{plugin.manifest.description}</p></div><Toggle checked={plugin.enabled} label={`${plugin.enabled ? "Disable" : "Enable"} ${plugin.manifest.name}`} onChange={async (enabled) => { try { await invoke(enabled ? "enable_plugin" : "disable_plugin", { id: plugin.manifest.id }); await loadPlugins(); } catch (reason) { setError(friendlyError(reason)); } }} /></div>
+              ))}</div>
+            )}
+          </section>
         </div>
       </main>
     );
   }
 
-  // ─── SETTINGS ───────────────────────────────────────────
   if (screen === "settings") {
     return (
-      <main className="container settings-screen">
-        <div className="nav-row">
-          <button className="nav-btn" onClick={() => setScreen("main")}>Back</button>
-          <h2>Settings</h2>
-          <div />
-        </div>
-        <div className="settings-list">
-          <div className="setting-item">
-            <label>Transcription provider</label>
-            <select value={transcriptionProvider} onChange={(e) => { setTranscriptionProvider(e.target.value); save("provider", e.target.value); if (sameProvider) setFormattingProvider(e.target.value); }}>
-              {Object.entries(TRANSCRIPTION_PROVIDERS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-            </select>
-          </div>
-          <div className="setting-item">
-            <label>Transcription key</label>
-            <input type="password" value={transcriptionKey} onChange={(e) => setTranscriptionKey(e.target.value)} onBlur={() => transcriptionKey && invoke("set_api_key", { key: transcriptionKey })} />
-          </div>
-          <div className="setting-item">
-            <label>Same provider for formatting?</label>
-            <button className="toggle-btn" onClick={() => { const v = !sameProvider; setSameProvider(v); save("same_provider", String(v)); if (v) { setFormattingProvider(transcriptionProvider); setFormattingKey(transcriptionKey); } }}>
-              {sameProvider ? "Yes" : "No"}
-            </button>
-          </div>
-          {!sameProvider && (
-            <>
-              <div className="setting-item">
-                <label>Formatting provider</label>
-                <select value={formattingProvider} onChange={(e) => { setFormattingProvider(e.target.value); save("formatting_provider", e.target.value); }}>
-                  {Object.entries(FORMATTING_PROVIDERS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-                </select>
-              </div>
-              <div className="setting-item">
-                <label>Formatting key</label>
-                <input type="password" value={formattingKey} onChange={(e) => setFormattingKey(e.target.value)} onBlur={() => formattingKey && save("formatting_api_key", formattingKey)} />
-              </div>
-            </>
-          )}
-          <div className="setting-item">
-            <label>Microphone</label>
-            <select value={microphone} onChange={(e) => { setMicrophone(e.target.value); save("microphone", e.target.value); }}>
-              <option value="">System default</option>
-              {microphones.map(m => <option key={m.id} value={m.id}>{m.name}{m.is_default ? " (default)" : ""}</option>)}
-            </select>
-          </div>
-          <div className="setting-item">
-            <label>Language</label>
-            <select value={language} onChange={(e) => { setLanguage(e.target.value); save("language", e.target.value === "auto" ? "" : e.target.value); }}>
-              <option value="auto">Auto-detect</option>
-              <option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option>
-              <option value="de">German</option><option value="it">Italian</option><option value="pt">Portuguese</option>
-              <option value="nl">Dutch</option><option value="ja">Japanese</option><option value="ko">Korean</option>
-              <option value="zh">Chinese</option><option value="ar">Arabic</option><option value="hi">Hindi</option>
-              <option value="ru">Russian</option>
-            </select>
-          </div>
-          <div className="setting-item">
-            <label>LLM Formatting</label>
-            <button className="toggle-btn" onClick={() => { const v = !formatEnabled; setFormatEnabled(v); save("format_enabled", String(v)); }}>{formatEnabled ? "On" : "Off"}</button>
-          </div>
-          <div className="setting-item">
-            <label>Theme</label>
-            <button className="toggle-btn" onClick={() => { const t = theme === "dark" ? "light" : "dark"; setTheme(t); save("theme", t); }}>{theme === "dark" ? "Dark" : "Light"}</button>
-          </div>
-          <div className="setting-item">
-            <label>Record hotkey</label>
-            {editingHotkey === "record" ? (
-              <input
-                className="hotkey-input"
-                autoFocus
-                value={recordHotkey}
-                onChange={(e) => setRecordHotkey(e.target.value)}
-                onBlur={async () => {
-                  try { await invoke("rebind_hotkey", { action: "record", shortcutStr: recordHotkey }); } catch (e) { setError(String(e)); }
-                  setEditingHotkey(null);
-                }}
-                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                placeholder="e.g. Option+V"
-              />
+      <main className="app-page">
+        {notification && <div className="toast" role="status">{notification}</div>}
+        {screenHeader("Settings", () => setScreen("main"), <button className="button primary compact-button" onClick={() => void saveSettings()} disabled={savingSettings || !settingsDirty}>{savingSettings ? "Saving…" : settingsDirty ? "Save" : "Saved"}</button>)}
+        <div className="page-body settings-body">
+          {error && <div className="error-banner" role="alert">{error}</div>}
+          <section className="settings-section">
+            <div className="section-heading"><div><h2>Providers</h2><p>Choose where audio and text are processed.</p></div><span className="section-number">01</span></div>
+            <div className="settings-grid">
+              <div className="field-group"><label htmlFor="settings-provider">Transcription provider</label><select id="settings-provider" value={transcriptionProvider} onChange={(event) => setProvider("transcription", event.target.value)}>{Object.entries(PROVIDERS).map(([key, provider]) => <option key={key} value={key}>{provider.label}</option>)}</select></div>
+              {transcriptionProvider === "custom" && <div className="field-group"><label htmlFor="settings-custom-url">Endpoint URL</label><input id="settings-custom-url" type="url" value={customTranscriptionUrl} onChange={(event) => { setCustomTranscriptionUrl(event.target.value); markDirty(); }} /></div>}
+              <div className="field-group span-two"><div className="label-row"><label htmlFor="settings-key">API key</label>{selectedProvider.keyUrl && <a href={selectedProvider.keyUrl} onClick={(event) => { event.preventDefault(); void openExternalKeyUrl(selectedProvider.keyUrl); }}>Manage key ↗</a>}</div><div className="secret-input"><input id="settings-key" type={showTranscriptionKey ? "text" : "password"} value={transcriptionKey} onChange={(event) => { setTranscriptionKey(event.target.value); if (sameProvider) setFormattingKey(event.target.value); markDirty(); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><button onClick={() => setShowTranscriptionKey((shown) => !shown)}>{showTranscriptionKey ? "Hide" : "Show"}</button></div></div>
+              <div className="inline-setting span-two"><div><strong>Use for text cleanup too</strong><small>{transcriptionProvider === "deepgram" ? "Deepgram handles speech only; use another provider here." : "Keep one provider and one key."}</small></div><Toggle checked={sameProvider} disabled={transcriptionProvider === "deepgram"} label="Use same provider for text cleanup" onChange={(checked) => { setSameProvider(checked); if (checked) { setFormattingProvider(transcriptionProvider); setFormattingKey(transcriptionKey); } markDirty(); }} /></div>
+              {!sameProvider && <><div className="field-group"><label htmlFor="settings-format-provider">Formatting provider</label><select id="settings-format-provider" value={formattingProvider} onChange={(event) => setProvider("formatting", event.target.value)}>{Object.entries(PROVIDERS).filter(([key]) => key !== "deepgram").map(([key, provider]) => <option key={key} value={key}>{provider.label}</option>)}</select></div><div className="field-group"><label htmlFor="settings-format-key">Formatting key</label><div className="secret-input"><input id="settings-format-key" type={showFormattingKey ? "text" : "password"} value={formattingKey} onChange={(event) => { setFormattingKey(event.target.value); markDirty(); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><button onClick={() => setShowFormattingKey((shown) => !shown)}>{showFormattingKey ? "Hide" : "Show"}</button></div></div></>}
+            </div>
+            <div className="section-footer"><div>{connectionMessage && <span className={`inline-status ${connectionState}`}>{connectionMessage}</span>}</div><button className="button secondary" onClick={() => void verifyConnection()} disabled={connectionState === "checking" || modelsLoading !== null}><Icon name="refresh" size={15} /> {connectionState === "checking" || modelsLoading !== null ? "Checking…" : "Test connection"}</button></div>
+          </section>
+
+          <section className="settings-section">
+            <div className="section-heading"><div><h2>Models & output</h2><p>Paste any compatible model ID, including new releases.</p></div><span className="section-number">02</span></div>
+            <div className="settings-grid">
+              <div className="field-group"><label htmlFor="settings-stt-model">Speech-to-text</label><input id="settings-stt-model" list="settings-stt-models" value={transcriptionModel} onChange={(event) => { setTranscriptionModel(event.target.value); markDirty(); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-stt-models">{transcriptionModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
+              <div className="field-group"><label htmlFor="settings-chat-model">Text cleanup</label><input id="settings-chat-model" list="settings-chat-models" value={formattingModel} disabled={!formatEnabled} onChange={(event) => { setFormattingModel(event.target.value); markDirty(); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-chat-models">{formattingModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
+              <div className="field-group"><label htmlFor="settings-language">Language</label><select id="settings-language" value={language} onChange={(event) => { setLanguage(event.target.value); markDirty(); }}>{LANGUAGE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>
+              <div className="inline-setting"><div><strong>Smart text cleanup</strong><small>Add punctuation and structure.</small></div><Toggle checked={formatEnabled} label="Enable smart text cleanup" onChange={(checked) => { setFormatEnabled(checked); markDirty(); }} /></div>
+            </div>
+          </section>
+
+          <section className="settings-section voice-section">
+            <div className="section-heading"><div><div className="heading-with-badge"><h2>Gemini voice</h2><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div><p>Preview Gemini 3.1 Flash TTS through OpenRouter.</p></div><span className="section-number">03</span></div>
+            {transcriptionProvider !== "openrouter" ? (
+              <div className="capability-empty"><Icon name="volume" size={22} /><div><strong>OpenRouter connection required</strong><p>Choose OpenRouter above to stream Gemini voice previews with the same protected key.</p></div></div>
             ) : (
-              <button className="setting-value clickable" onClick={() => setEditingHotkey("record")}>{recordHotkey}</button>
+              <>
+                <div className="settings-grid">
+                  <div className="inline-setting span-two"><div><strong>Voice features</strong><small>Enable speech generation in OpenFlow.</small></div><Toggle checked={ttsEnabled} label="Enable voice features" onChange={(checked) => { setTtsEnabled(checked); markDirty(); }} /></div>
+                  <div className="field-group"><label htmlFor="settings-tts-model">Voice model</label><input id="settings-tts-model" list="settings-tts-models" value={ttsModel} disabled={!ttsEnabled} onChange={(event) => { setTtsModel(event.target.value); markDirty(); setTtsStatus("idle"); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
+                  <div className="field-group"><label htmlFor="settings-tts-voice">Voice</label><input id="settings-tts-voice" list="tts-voices" value={ttsVoice} disabled={!ttsEnabled} onChange={(event) => { setTtsVoice(event.target.value); markDirty(); setTtsStatus("idle"); }} /><datalist id="tts-voices">{TTS_VOICES.map((voice) => <option key={voice} value={voice} />)}</datalist></div>
+                </div>
+                <div className="voice-preview">
+                  <label htmlFor="tts-preview">Preview text</label>
+                  <textarea id="tts-preview" value={ttsPreviewText} maxLength={500} disabled={!ttsEnabled} onChange={(event) => { setTtsPreviewText(event.target.value); setTtsStatus("idle"); setTtsError(""); }} />
+                  <div className="voice-preview-footer"><span>{ttsPreviewText.length}/500</span><div className="voice-actions">{ttsStatus === "streaming" ? <button className="button secondary" onClick={() => void cancelTtsPreview()}><Icon name="stop" size={15} /> Stop</button> : <button className="button secondary" disabled={!ttsEnabled || !ttsPreviewText.trim()} onClick={() => void playTtsPreview()}><Icon name="play" size={15} /> {ttsStatus === "ready" ? "Play again" : "Stream preview"}</button>}</div></div>
+                  {ttsStatus === "streaming" && <div className="streaming-status" role="status"><span className="stream-bars"><i/><i/><i/><i/></span> Gemini is preparing audio…</div>}
+                  {ttsError && <div className="error-banner" role="alert">{ttsError}</div>}
+                  {ttsAudioUrl && <audio ref={audioRef} className="audio-player" controls src={ttsAudioUrl}>Your browser does not support audio playback.</audio>}
+                </div>
+              </>
             )}
-          </div>
-          <div className="setting-item">
-            <label>Re-copy hotkey</label>
-            {editingHotkey === "recopy" ? (
-              <input
-                className="hotkey-input"
-                autoFocus
-                value={recopyHotkey}
-                onChange={(e) => setRecopyHotkey(e.target.value)}
-                onBlur={async () => {
-                  try { await invoke("rebind_hotkey", { action: "recopy", shortcutStr: recopyHotkey }); } catch (e) { setError(String(e)); }
-                  setEditingHotkey(null);
-                }}
-                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                placeholder="e.g. Ctrl+Shift+V"
-              />
-            ) : (
-              <button className="setting-value clickable" onClick={() => setEditingHotkey("recopy")}>{recopyHotkey}</button>
-            )}
-          </div>
-          <div className="setting-item"><label>Plugins</label><button className="nav-btn" onClick={() => { loadPlugins(); setScreen("plugins"); }}>Manage</button></div>
+          </section>
+
+          <section className="settings-section">
+            <div className="section-heading"><div><h2>Device & shortcuts</h2><p>Control how recording feels on this computer.</p></div><span className="section-number">04</span></div>
+            <div className="settings-list">
+              <div className="settings-row"><div><label htmlFor="settings-microphone">Microphone</label><small>{microphones.length ? `${microphones.length} available` : "Permission may be required"}</small></div><select id="settings-microphone" value={microphone} onChange={(event) => { setMicrophone(event.target.value); markDirty(); }}><option value="">System default</option>{microphones.map((device) => <option key={device.id} value={device.id}>{device.name}{device.is_default ? " · default" : ""}</option>)}</select></div>
+              <div className="settings-row"><div><label htmlFor="record-hotkey">Record shortcut</label><small>Hold to record, release to transcribe.</small></div>{editingHotkey === "record" ? <input id="record-hotkey" className="hotkey-input" aria-label="Record shortcut" autoFocus value={hotkeyDraft} onChange={(event) => setHotkeyDraft(event.target.value)} onBlur={() => { if (cancelHotkeyEditRef.current) { cancelHotkeyEditRef.current = false; return; } void updateHotkey("record", hotkeyDraft); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { event.preventDefault(); cancelHotkeyEditRef.current = true; setEditingHotkey(null); } }} /> : <button id="record-hotkey" className="key-button" aria-label={`Change record shortcut, currently ${recordHotkey}`} onClick={() => { cancelHotkeyEditRef.current = false; setHotkeyDraft(recordHotkey); setEditingHotkey("record"); }}>{recordHotkey}</button>}</div>
+              <div className="settings-row"><div><label htmlFor="recopy-hotkey">Re-copy shortcut</label><small>Paste your most recent result again.</small></div>{editingHotkey === "recopy" ? <input id="recopy-hotkey" className="hotkey-input" aria-label="Re-copy shortcut" autoFocus value={hotkeyDraft} onChange={(event) => setHotkeyDraft(event.target.value)} onBlur={() => { if (cancelHotkeyEditRef.current) { cancelHotkeyEditRef.current = false; return; } void updateHotkey("recopy", hotkeyDraft); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { event.preventDefault(); cancelHotkeyEditRef.current = true; setEditingHotkey(null); } }} /> : <button id="recopy-hotkey" className="key-button" aria-label={`Change re-copy shortcut, currently ${recopyHotkey}`} onClick={() => { cancelHotkeyEditRef.current = false; setHotkeyDraft(recopyHotkey); setEditingHotkey("recopy"); }}>{recopyHotkey}</button>}</div>
+              <div className="settings-row"><div><label>Appearance</label><small>Use the theme that feels easiest on your eyes.</small></div><div className="segmented"><button className={theme === "light" ? "active" : ""} onClick={() => { setTheme("light"); markDirty(); }}>Light</button><button className={theme === "dark" ? "active" : ""} onClick={() => { setTheme("dark"); markDirty(); }}>Dark</button></div></div>
+              <div className="settings-row"><div><label>Plugins</label><small>Extend what happens after transcription.</small></div><button className="button secondary compact-button" onClick={() => { void loadPlugins(); setScreen("plugins"); }}>Manage</button></div>
+            </div>
+          </section>
         </div>
       </main>
     );
   }
 
-  // ─── MAIN ───────────────────────────────────────────────
   return (
-    <main className="container">
-      {notification && <div className="toast">{notification}</div>}
-      <div className="top-row">
-        <button className="icon-btn" onClick={() => { loadHistory(); setScreen("history"); }}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+    <main className="workspace">
+      {notification && <div className="toast" role="status">{notification}</div>}
+      <header className="workspace-header">
+        <button className="icon-button" onClick={() => { void loadHistory(); setScreen("history"); }} aria-label="Open transcription history"><Icon name="clock" /></button>
+        <button className="brand-button" onClick={() => { if (!history.length) void loadHistory(); setShowRecents((shown) => !shown); }} aria-expanded={showRecents} aria-haspopup="dialog"><img src="/logo-128.png" alt=""/><span>OpenFlow</span></button>
+        <button className="icon-button" onClick={() => { setError(""); setSettingsDirty(false); setScreen("settings"); }} aria-label="Open settings"><Icon name="gear" /></button>
+        {showRecents && <div className="recents-popover" role="dialog" aria-label="Recent transcriptions"><div className="popover-heading"><span>Recent</span><button onClick={() => setShowRecents(false)} aria-label="Close recent transcriptions">×</button></div>{history.length === 0 ? <p className="popover-empty">Your recent words will appear here.</p> : history.slice(0, 6).map((item) => <button key={item.id} onClick={async () => { await navigator.clipboard.writeText(item.formatted_text || item.raw_text); showNotification("Copied to clipboard"); setShowRecents(false); }}>{item.formatted_text || item.raw_text}</button>)}{history.length > 0 && <button className="popover-footer" onClick={() => { setShowRecents(false); setScreen("history"); }}>View all history</button>}</div>}
+      </header>
+
+      <section className="recording-workspace" aria-labelledby="recording-title">
+        <div className={`voice-orbit ${status}`} aria-hidden="true"><span className="orbit-line one"/><span className="orbit-line two"/><div className="voice-core"><Icon name="mic" size={30} /></div></div>
+        <div className="recording-copy"><span className="eyebrow">{status === "idle" ? "Ready when you are" : status === "recording" ? "Listening now" : "Turning speech into text"}</span><h1 id="recording-title">{status === "idle" ? "Hold to speak" : status === "recording" ? "Keep talking…" : "One moment…"}</h1><p>{status === "idle" ? "Release when you’re done. OpenFlow cleans it up and pastes it for you." : status === "recording" ? "Your audio is captured only while you hold the button." : "Your provider is transcribing and formatting the result."}</p></div>
+        <button
+          className={`record-button ${status}`}
+          disabled={status === "transcribing"}
+          onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); void handleStartRecording(); }}
+          onPointerUp={() => void handleStopRecording()}
+          onPointerCancel={() => void handleStopRecording()}
+          onKeyDown={(event) => { if ((event.key === " " || event.key === "Enter") && !event.repeat) { event.preventDefault(); void handleStartRecording(); } }}
+          onKeyUp={(event) => { if (event.key === " " || event.key === "Enter") { event.preventDefault(); void handleStopRecording(); } }}
+        >
+          {status === "idle" && <><Icon name="mic" /> Hold to record</>}
+          {status === "recording" && <><span className="live-dot" /> Release to finish</>}
+          {status === "transcribing" && <><span className="spinner" /> Transcribing…</>}
         </button>
-        <div className="logo-wrapper">
-          <img
-            src="/logo-128.png"
-            alt="OpenFlow"
-            className="topbar-logo"
-            onClick={() => { if (history.length === 0) loadHistory(); setShowRecents(!showRecents); }}
-            style={{ cursor: "pointer" }}
-          />
-          {showRecents && (
-            <div className="recents-dropdown" onMouseLeave={() => setShowRecents(false)}>
-              <div className="recents-header">Recent</div>
-              {history.length === 0 && <div className="recents-empty">No transcriptions yet</div>}
-              {history.slice(0, 20).map((item, i) => (
-                <div
-                  key={item.id || i}
-                  className="recents-item"
-                  onClick={() => {
-                    const text = item.formatted_text || item.raw_text;
-                    navigator.clipboard.writeText(text);
-                    showNotification("Copied!");
-                    setShowRecents(false);
-                  }}
-                >
-                  {(item.formatted_text || item.raw_text).slice(0, 40)}
-                  {(item.formatted_text || item.raw_text).length > 40 ? "..." : ""}
-                </div>
-              ))}
-              {history.length > 0 && (
-                <div className="recents-footer" onClick={() => { setShowRecents(false); setScreen("history"); }}>
-                  All History
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-        <button className="icon-btn" onClick={() => setScreen("settings")}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2m-9-11h2m18 0h2m-4.2-5.8l-1.4 1.4M5.6 18.4l-1.4 1.4m0-13.8l1.4 1.4m12.8 12.8l1.4 1.4"/></svg>
-        </button>
-      </div>
-      <div className="status-ring" data-status={status}>
-        <div className="status-inner">
-          {status === "idle" && "Ready"}
-          {status === "recording" && "Recording..."}
-          {status === "transcribing" && "Transcribing..."}
-        </div>
-      </div>
-      <button className="record-btn" onMouseDown={handleStartRecording} onMouseUp={handleStopRecording} disabled={status === "transcribing"}>
-        {status === "idle" && "Hold to Record"}
-        {status === "recording" && "Release to Transcribe"}
-        {status === "transcribing" && "Processing..."}
-      </button>
-      <p className="hint"><strong>{recordHotkey}</strong> anywhere &middot; <strong>{recopyHotkey}</strong> re-copy</p>
-      {error && <p className="error">{error}</p>}
-      {lastTranscription && (
-        <div className="result">
-          <p className="result-label">Copied to clipboard</p>
-          <p className="result-text">{lastTranscription}</p>
-        </div>
-      )}
+        {status === "transcribing" && <button className="button quiet cancel-transcription" onClick={() => void cancelTranscription()}><Icon name="stop" size={15} /> Cancel transcription</button>}
+        <p className="shortcut-hint"><kbd>{recordHotkey}</kbd> works from any app <span>·</span> <kbd>{recopyHotkey}</kbd> pastes again</p>
+      </section>
+
+      <section className="workspace-feedback" aria-live="polite">
+        {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}
+        {lastTranscription ? <button className="last-result" onClick={async () => { await navigator.clipboard.writeText(lastTranscription); showNotification("Copied to clipboard"); }}><span className="result-status"><Icon name="check" size={15} /> Copied to clipboard</span><span className="result-copy">{lastTranscription}</span><span className="copy-affordance">Copy again</span></button> : <div className="first-sample"><span className="sample-line"/><p>Your first transcription will settle here.</p><span className="sample-line"/></div>}
+      </section>
     </main>
   );
 }

@@ -18,6 +18,7 @@
         align-items: center;
         justify-content: center;
         cursor: grab;
+        touch-action: none;
         transition: width 0.2s ease, border-radius 0.2s ease,
                     border-color 0.2s ease, box-shadow 0.2s ease;
         border: 1px solid rgba(255,255,255,0.06);
@@ -124,6 +125,10 @@
 
       @keyframes pulse { 0%,100% { opacity: 0.25; } 50% { opacity: 1; } }
 
+      @media (prefers-reduced-motion: reduce) {
+        .overlay, .wave-bar, .dots span { animation: none; transition: none; }
+      }
+
       .status-label {
         display: none;
         font-family: -apple-system, system-ui, sans-serif;
@@ -154,16 +159,22 @@
 
     <script type="module">
       import { listen } from '@tauri-apps/api/event';
-      import { getCurrentWindow } from '@tauri-apps/api/window';
+      import {
+        LogicalSize,
+        PhysicalPosition,
+        currentMonitor,
+        getCurrentWindow,
+        primaryMonitor,
+      } from '@tauri-apps/api/window';
       import { invoke } from '@tauri-apps/api/core';
 
       const overlay = document.getElementById('overlay');
       let position = 'left-center';
       let isDragging = false;
+      let dragReady = false;
       let dragStartX, dragStartY;
-
-      const sw = window.screen.width;
-      const sh = window.screen.height;
+      let winX = 0, winY = 0;
+      let activeScale = 1;
 
       const POSITIONS = {
         'top-left':      { x: 0, y: 0 },
@@ -188,46 +199,62 @@
         } catch {}
 
         overlay.setAttribute('data-pos', position);
-        snapToPosition(win, position, 28);
+        await snapToPosition(win, position, 28);
 
-        listen('recording-state', (event) => {
+        await listen('recording-state', async (event) => {
           const status = event.payload;
           overlay.setAttribute('data-status', status);
+          overlay.querySelector('.status-label').textContent = status === 'transcribing' ? 'Working' : '';
           const w = status === 'recording' ? 82 : status === 'transcribing' ? 72 : 28;
-          win.setSize({ type: 'Logical', width: w, height: 28 });
-          snapToPosition(win, position, w);
+          await win.setSize(new LogicalSize(w, 28));
+          await snapToPosition(win, position, w);
         });
 
-        let winX = 0, winY = 0;
-
-        overlay.addEventListener('mousedown', (e) => {
+        overlay.addEventListener('pointerdown', async (e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
           isDragging = true;
+          dragReady = false;
+          overlay.setPointerCapture(e.pointerId);
           dragStartX = e.screenX;
           dragStartY = e.screenY;
-          const coords = POSITIONS[position];
-          const curW = getWidth();
-          winX = Math.round(coords.x * (sw - curW));
-          winY = Math.round(coords.y * (sh - 28));
           overlay.style.cursor = 'grabbing';
+
+          const [origin, monitor] = await Promise.all([win.outerPosition(), getActiveMonitor()]);
+          if (!isDragging) return;
+          winX = origin.x;
+          winY = origin.y;
+          activeScale = monitor?.scaleFactor || await win.scaleFactor();
+          dragReady = true;
         });
 
-        document.addEventListener('mousemove', (e) => {
-          if (!isDragging) return;
-          winX += e.screenX - dragStartX;
-          winY += e.screenY - dragStartY;
+        overlay.addEventListener('pointermove', (e) => {
+          if (!isDragging || !dragReady) return;
+          const dx = (e.screenX - dragStartX) * activeScale;
+          const dy = (e.screenY - dragStartY) * activeScale;
+          winX += dx;
+          winY += dy;
           dragStartX = e.screenX;
           dragStartY = e.screenY;
-          win.setPosition({ type: 'Logical', x: winX, y: winY });
+          win.setPosition(new PhysicalPosition(Math.round(winX), Math.round(winY)));
         });
 
-        document.addEventListener('mouseup', () => {
+        const finishDrag = async (e) => {
           if (!isDragging) return;
           isDragging = false;
+          dragReady = false;
+          if (overlay.hasPointerCapture(e.pointerId)) overlay.releasePointerCapture(e.pointerId);
           overlay.style.cursor = 'grab';
 
+          const monitor = await getActiveMonitor();
+          if (!monitor) return;
+          const actualPosition = await win.outerPosition();
           const curW = getWidth();
-          const px = winX / Math.max(sw - curW, 1);
-          const py = winY / Math.max(sh - 28, 1);
+          const physicalWidth = curW * monitor.scaleFactor;
+          const physicalHeight = 28 * monitor.scaleFactor;
+          const area = monitor.workArea;
+          const px = (actualPosition.x - area.position.x) / Math.max(area.size.width - physicalWidth, 1);
+          const py = (actualPosition.y - area.position.y) / Math.max(area.size.height - physicalHeight, 1);
 
           let nearest = 'left-center';
           let minDist = Infinity;
@@ -238,9 +265,12 @@
 
           position = nearest;
           overlay.setAttribute('data-pos', position);
-          snapToPosition(win, position, curW);
+          await snapToPosition(win, position, curW, monitor);
           invoke('set_setting', { key: 'overlay_position', value: position }).catch(() => {});
-        });
+        };
+
+        overlay.addEventListener('pointerup', finishDrag);
+        overlay.addEventListener('pointercancel', finishDrag);
       }
 
       function getWidth() {
@@ -248,14 +278,23 @@
         return s === 'recording' ? 82 : s === 'transcribing' ? 72 : 28;
       }
 
-      function snapToPosition(win, pos, w) {
-        const coords = POSITIONS[pos];
-        const x = Math.round(coords.x * (sw - w));
-        const y = Math.round(coords.y * (sh - 28));
-        win.setPosition({ type: 'Logical', x, y });
+      async function getActiveMonitor() {
+        return await currentMonitor() || await primaryMonitor();
       }
 
-      init();
+      async function snapToPosition(win, pos, w, selectedMonitor) {
+        const monitor = selectedMonitor || await getActiveMonitor();
+        if (!monitor) return;
+        const coords = POSITIONS[pos];
+        const physicalWidth = w * monitor.scaleFactor;
+        const physicalHeight = 28 * monitor.scaleFactor;
+        const area = monitor.workArea;
+        const x = area.position.x + Math.round(coords.x * (area.size.width - physicalWidth));
+        const y = area.position.y + Math.round(coords.y * (area.size.height - physicalHeight));
+        await win.setPosition(new PhysicalPosition(x, y));
+      }
+
+      init().catch(() => {});
     </script>
   </body>
 </html>
