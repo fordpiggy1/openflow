@@ -187,6 +187,16 @@
         'bottom-right':  { x: 1, y: 1 },
       };
 
+      /// Read fresh every time rather than caching: the setting then takes
+      /// effect the moment it is saved, with no restart and no extra event.
+      async function hideWhenIdle() {
+        try {
+          return (await invoke('get_setting', { key: 'overlay_only_while_recording' })) === 'true';
+        } catch {
+          return false;
+        }
+      }
+
       async function init() {
         const win = getCurrentWindow();
 
@@ -201,6 +211,12 @@
         overlay.setAttribute('data-pos', position);
         await snapToPosition(win, position, 28);
 
+        // The window is configured visible, and only this line takes it away.
+        // The reverse -- configuring it hidden and revealing it here -- would
+        // mean any failure above (init runs under a catch-all) leaves the
+        // overlay gone for good, turning a default setting into a dead feature.
+        if (await hideWhenIdle()) await win.hide();
+
         await listen('recording-state', async (event) => {
           const status = event.payload;
           overlay.setAttribute('data-status', status);
@@ -208,6 +224,14 @@
           const w = status === 'recording' ? 82 : status === 'transcribing' ? 72 : 28;
           await win.setSize(new LogicalSize(w, 28));
           await snapToPosition(win, position, w);
+          // Size and position first, then reveal: showing before the resize
+          // lands would flash the idle width at the recording moment.
+          if (await hideWhenIdle()) {
+            if (status === 'idle') await win.hide();
+            else await win.show();
+          } else {
+            await win.show();
+          }
         });
 
         overlay.addEventListener('pointerdown', async (e) => {
