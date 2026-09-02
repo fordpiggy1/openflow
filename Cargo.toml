@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/openflow-core", "src-tauri"]
+members = ["crates/openflow-core", "crates/openflow-native", "src-tauri"]
 
 # One version per dependency for the whole tree. The core library and the
 # Tauri shell share the same `reqwest`, `rusqlite` and `serde`, so pinning them

@@ -1,0 +1,43 @@
+[package]
+name = "openflow-native"
+version = "0.1.0"
+description = "OpenFlow as a native AppKit app: no webview, one process"
+authors = ["laisyio"]
+edition = "2021"
+
+# Named `openflow-native`, not `openflow`: `src-tauri`'s bin is already
+# `openflow`, and two bin targets writing target/release/openflow is a cargo
+# output-filename collision that silently clobbers whichever built first. The
+# bundle script installs it into the app as `Contents/MacOS/openflow`, so the
+# shipped executable still has the plain name. Milestone C retires `src-tauri`
+# and this can go back to `openflow`.
+[[bin]]
+name = "openflow-native"
+path = "src/main.rs"
+
+# The binary is macOS only. On any other target the crate root compiles to a
+# `main` that says so and exits, so `cargo clippy --workspace` still covers the
+# whole tree on Linux CI without dragging AppKit, tray-icon or rodio into it.
+[dependencies]
+openflow-core = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The host owns the runtime, not the engine: a task holding the last `Arc<Engine>`
+# would otherwise drop the runtime from one of its own worker threads.
+tokio = { workspace = true }
+# AppKit. Already in the tree via tao/wry, so nothing compiles here that did not
+# compile before.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["block2"] }
+objc2-foundation = { version = "0.3", features = ["block2"] }
+block2 = "0.6"
+# Main-thread hops for events raised on tokio workers and the hotkey thread.
+dispatch2 = "0.3"
+# The same crates Tauri's tray and global-shortcut plugins are built on.
+global-hotkey = { workspace = true }
+tray-icon = "0.23"
+muda = "0.19"
+# Decoding the embedded tray icon into the RGBA buffer tray-icon wants.
+png = "0.17"
+# `flock` for the single-instance guard.
+libc = "0.2"

@@ -1,0 +1,37 @@
+//! OpenFlow as a native macOS app: an `NSApplication` in accessory mode with a
+//! status item, a borderless overlay panel and one settings window, driven by
+//! the same [`openflow_core::engine::Engine`] the Tauri shell drives.
+//!
+//! There is no webview and no polling anywhere. Everything that moves is either
+//! an AppKit event, a `global-hotkey` callback, a `muda` menu callback, or the
+//! engine finishing a job on its own runtime; each of those hops to the main
+//! thread through `dispatch2` before it touches a window.
+//!
+//! The crate is macOS only. On any other target it compiles to a `main` that
+//! says so, which keeps `cargo clippy --workspace` honest on Linux CI without
+//! pulling AppKit, tray-icon or rodio into the build.
+
+#[cfg(target_os = "macos")]
+mod events;
+#[cfg(target_os = "macos")]
+mod hotkeys;
+#[cfg(target_os = "macos")]
+mod instance;
+#[cfg(target_os = "macos")]
+mod tray;
+
+#[cfg(target_os = "macos")]
+mod app;
+
+#[cfg(target_os = "macos")]
+fn main() {
+    app::main();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!(
+        "openflow-native is the macOS AppKit build of OpenFlow. \
+         On this platform, build the Tauri app in src-tauri instead."
+    );
+}
