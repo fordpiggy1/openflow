@@ -2722,15 +2722,21 @@ dependencies = [
 name = "openflow-core"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "base64 0.22.1",
  "chrono",
+ "core-graphics 0.24.0",
  "cpal",
  "dirs-next",
+ "futures-util",
+ "global-hotkey",
  "hound",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 

@@ -19,3 +19,13 @@ rusqlite = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 dirs-next = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+arboard = { workspace = true }
+global-hotkey = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Synthesized keystrokes carrying a unicode payload, for the "type" insert
+# method. Only macOS is implemented; other platforms fall back to pasting.
+core-graphics = { workspace = true }
