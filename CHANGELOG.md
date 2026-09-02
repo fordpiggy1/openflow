@@ -4,6 +4,16 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Cargo workspace with a UI-free `openflow-core`
+By: Titan (with Claude)
+Impact: `Cargo.toml`, `crates/openflow-core/*`, `src-tauri/src/lib.rs`, `src-tauri/Cargo.toml`, `package.json`, `.github/workflows/ci.yml`
+
+- Milestone A, unit A1 of the native port (`docs/native-port/PLAN.md`). The repo is now a workspace, and everything the app does that does not draw a window lives in `crates/openflow-core`: `audio`, `transcribe`, `db`, `secrets` and `plugins` moved with `git mv` so their history follows, joined by new `insert`, `speech`, `hotkey`, `settings` and `engine` modules split out of `lib.rs`.
+- `engine.rs` holds what `AppState` held (database, keychain, capture slot and its watchdog, cancellation tokens, plugin manager) and every pipeline body, and reports through an `EngineEvents` sink the host supplies. The Tauri host implements that sink with `app.emit` under today's event names, so `App.tsx` and `overlay.html` are untouched and every command keeps its name, arguments and return type.
+- `settings.rs` is the one place that reads a setting: typed accessors whose defaults match what the settings UI shows for an unset key, plus the `is_secret_setting` gate and the plaintext-to-keychain migration.
+- `src-tauri` now depends on `openflow-core`, `tauri` and two plugins, and on nothing that touches audio, HTTP or sqlite. `lib.rs` went from 1711 lines to 469.
+- No behaviour changed. The watchdog window, the silence gate naming the device, the dictionary prompt, plugin hooks, history save and retention, and the clipboard policy per call site all work as before, and the 36 existing tests moved to the modules that now own them. Seven tests were added for the settings defaults, the hotkey table and the recording-state names.
+
 ### Resource sweep: idle footprint and stop-path cost
 By: Titan (with Claude)
 Impact: `src-tauri/src/audio.rs`, `src-tauri/src/transcribe.rs`, `overlay.html`

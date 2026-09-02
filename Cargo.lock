@@ -2700,22 +2700,11 @@ dependencies = [
 name = "openflow"
 version = "0.1.0"
 dependencies = [
- "arboard",
- "base64 0.22.1",
- "chrono",
- "core-graphics 0.24.0",
- "futures-util",
  "openflow-core",
- "reqwest",
- "serde",
- "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-shell",
- "tokio",
- "tokio-util",
- "uuid",
 ]
 
 [[package]]
