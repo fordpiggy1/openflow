@@ -1,15 +1,10 @@
-mod audio;
-mod db;
-mod plugins;
-mod secrets;
-mod transcribe;
-
-use audio::{wav_duration_ms, AudioDevice, AudioRecorder};
 use base64::Engine;
-use db::{Database, Transcription};
 use futures_util::StreamExt;
-use plugins::{HookPayload, PluginInfo, PluginManager};
-use secrets::SecretStore;
+use openflow_core::audio::{wav_duration_ms, AudioDevice, AudioRecorder};
+use openflow_core::db::{Database, Transcription};
+use openflow_core::plugins::{HookPayload, PluginInfo, PluginManager};
+use openflow_core::secrets::SecretStore;
+use openflow_core::transcribe::{self, ModelInfo, Provider};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -19,7 +14,6 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio_util::sync::CancellationToken;
-use transcribe::{ModelInfo, Provider};
 
 struct AppState {
     recorder: AudioRecorder,

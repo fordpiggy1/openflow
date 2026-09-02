@@ -2704,12 +2704,9 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "core-graphics 0.24.0",
- "cpal",
- "dirs-next",
  "futures-util",
- "hound",
+ "openflow-core",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "tauri",
@@ -2718,6 +2715,22 @@ dependencies = [
  "tauri-plugin-shell",
  "tokio",
  "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "openflow-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "cpal",
+ "dirs-next",
+ "hound",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 

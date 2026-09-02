@@ -23,6 +23,10 @@ pub struct AudioRecorder {
 }
 
 impl AudioRecorder {
+    // The move into the library crate makes this constructor public API, which
+    // is the only reason clippy now asks for a `Default`. Adding one would be a
+    // new API, not a move.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RecordCommand>();
 

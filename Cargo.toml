@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/openflow-core", "src-tauri"]
+
+# One version per dependency for the whole tree. The core library and the
+# Tauri shell share the same `reqwest`, `rusqlite` and `serde`, so pinning them
+# here keeps a single copy compiled and a single behaviour at run time.
+[workspace.dependencies]
+openflow-core = { path = "crates/openflow-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cpal = "0.15"
+hound = "3.5"
+reqwest = { version = "0.13", default-features = false, features = ["multipart", "json", "stream", "rustls", "http2", "charset", "system-proxy"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+arboard = "3"
+base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+dirs-next = "2"
+# The crate under tauri-plugin-global-shortcut: `Shortcut` is a re-export of
+# `global_hotkey::hotkey::HotKey`, so a parsed chord crosses the boundary as is.
+global-hotkey = "0.7"
+# Synthesized keystrokes carrying a unicode payload, for the "type" insert
+# method. Only macOS is implemented; other platforms fall back to pasting.
+core-graphics = "0.24"

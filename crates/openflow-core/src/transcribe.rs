@@ -21,6 +21,10 @@ pub enum Provider {
 }
 
 impl Provider {
+    // Public API since the move into the library crate, so clippy now compares it
+    // with `std::str::FromStr`. This one is infallible and falls back to Groq;
+    // the trait's `Result` signature would change every call site.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Self::OpenAI,
