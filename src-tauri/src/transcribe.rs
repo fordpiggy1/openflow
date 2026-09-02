@@ -1,6 +1,7 @@
 use base64::Engine;
 use reqwest::{multipart, Response};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
@@ -533,12 +534,24 @@ pub fn speech_mime(format: &str) -> &'static str {
     }
 }
 
+/// One client for the process, not one per request.
+///
+/// A `reqwest::Client` owns its connection pool, so building a fresh one each
+/// time threw the pool away and made every call open a new connection. On the
+/// LAN that costs a handshake; against a hosted provider it costs a TLS
+/// handshake too, which is the larger half of a short request. Cloning is
+/// cheap by design -- the client is an `Arc` around the shared pool.
 fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .user_agent("OpenFlow/0.1")
-        .build()
-        .map_err(|error| format!("Could not initialize network client: {}", error))
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .user_agent("OpenFlow/0.1")
+                .build()
+                .map_err(|error| format!("Could not initialize network client: {}", error))
+        })
+        .clone()
 }
 
 /// Attaches the Authorization header only when there is a key to attach.

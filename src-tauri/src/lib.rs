@@ -385,6 +385,9 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
     let device = state.db.get_setting("microphone");
     state.recorder.start(device)?;
     *recording = Some(Instant::now());
+    if insert_method(&state.db) == InsertMethod::Type {
+        prewarm_typing();
+    }
     let _ = app.emit("recording-state", "recording");
     Ok(())
 }
@@ -771,6 +774,42 @@ fn paste_to_clipboard(text: &str, method: InsertMethod) -> Result<(), String> {
     }
 }
 
+/// Pay the first-post cost while the user is still talking.
+///
+/// A process's first posted event costs ~40ms. Left where `type_text` pays it,
+/// the user waits through it *after* the transcription has already come back,
+/// where it is a sixth of the whole round trip. Posted once when recording
+/// starts, it lands in the seconds spent speaking and costs nothing visible.
+///
+/// Keycode 255 is not a key any keyboard reports, and no unicode payload is
+/// attached, so nothing reaches the focused application. Measured alternatives,
+/// both rejected: a modifier key only half-warms (12-16ms left on the next
+/// post) and Fn may be bound to the emoji picker or an input-source switch; a
+/// null event also only half-warms. With this one the next post is ~16us.
+///
+/// Fire and forget on its own thread: recording must not wait on it.
+#[cfg(target_os = "macos")]
+fn prewarm_typing() {
+    use core_graphics::event::{CGEvent, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    std::thread::spawn(|| {
+        const UNASSIGNED_KEYCODE: u16 = 255;
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            return;
+        };
+        if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), UNASSIGNED_KEYCODE, true) {
+            down.post(CGEventTapLocation::HID);
+        }
+        if let Ok(up) = CGEvent::new_keyboard_event(source, UNASSIGNED_KEYCODE, false) {
+            up.post(CGEventTapLocation::HID);
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prewarm_typing() {}
+
 /// Send `text` as a synthesized keystroke, unicode payload and all.
 ///
 /// Three things here are load-bearing, each one measured rather than assumed:
@@ -1020,6 +1059,9 @@ fn handle_hotkey_press(app: &AppHandle) {
             *recording = None;
             let _ = app.emit("transcription-error", &e);
             return;
+        }
+        if insert_method(&state.db) == InsertMethod::Type {
+            prewarm_typing();
         }
         let _ = app.emit("recording-state", "recording");
     }
