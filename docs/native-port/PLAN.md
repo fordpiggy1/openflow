@@ -63,18 +63,20 @@ Not used: cacao (beta, unmaintained), tauri anything inside the native crate.
 ```rust
 pub enum EngineEvent {
     RecordingState(RecordingState),            // Idle | Recording | Transcribing | Formatting
-    TranscriptionResult { raw: String, formatted: Option<String>, id: i64 },
+    TranscriptionResult(Transcription),        // the db row, unchanged
     TranscriptionWarning(String),
     TranscriptionError(String),
-    RecopySuccess,
-    Tts(TtsEvent),                              // Started{format}, Chunk(Vec<u8>), Finished, Error(String)
+    RecopySuccess(String),
+    HistoryChanged,                             // the recents list is stale
+    TtsStarted(SpeechStarted), TtsChunk(SpeechChunk),
+    TtsFinished(SpeechResult), TtsError(SpeechError),
     Navigate(String),                           // tray "Settings", "History" etc.
 }
-pub trait EngineEvents: Send + Sync + 'static { fn emit(&self, event: EngineEvent); }
+pub trait EngineEvents: Send + Sync + 'static { fn emit(&self, event: EngineEvent) -> Result<(), String>; }
 
-pub struct Engine { /* db, secrets, capture slot, watchdog, cancel tokens, plugin manager, runtime */ }
+pub struct Engine { /* db, secrets, capture slot, watchdog, cancel tokens, plugin manager, spawner */ }
 impl Engine {
-    pub fn new(sink: Arc<dyn EngineEvents>) -> Result<Arc<Self>, String>;
+    pub fn new(app_dir: PathBuf, sink: Arc<dyn EngineEvents>, spawn: Spawner) -> Result<Arc<Self>, String>;
     pub fn start_recording(&self) -> Result<(), String>;
     pub fn stop_and_transcribe(self: &Arc<Self>);       // spawns on the tokio runtime, emits events
     pub fn cancel_transcription(&self) -> bool;
@@ -88,6 +90,8 @@ impl Engine {
     pub fn fetch_models(&self, provider, key, base_url) -> impl Future<...>;
 }
 ```
+
+The payloads are the structs the app already had (`Transcription`, `SpeechStarted`, `SpeechChunk`, `SpeechResult`, `SpeechError`), byte-identical on the wire, which is what let A1 move the pipeline without touching the frontend. `emit` returns a `Result` because the speech stream stops when a chunk cannot be delivered; every other emit ignores it. Two rules bind any implementation: it runs on whichever thread finished the work, and it can run while the engine holds its own locks, so it must never call back into the engine synchronously. The *host* owns the tokio runtime and hands the engine a spawner over its handle; an engine that owned the runtime could have a task drop it from one of its own worker threads.
 
 The Tauri glue implements `EngineEvents` with `app.emit(name, payload)` using today's event names so `App.tsx` and `overlay.html` need no changes. The native crate implements it by hopping to the main thread and updating the overlay, tray, and open windows directly. The existing pipeline semantics move verbatim: watchdog, silence gate error naming the device, dictionary prompt, formatting fallback, plugin hooks, history save and retention, clipboard policy per call site (pipeline and paste use the setting, recopy/tray/copy keep).
 

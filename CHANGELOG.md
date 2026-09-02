@@ -4,6 +4,17 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Native macOS app: Rust + AppKit, no webview (Milestone A)
+By: Titan (with Claude)
+Impact: `crates/openflow-native/*`, `crates/openflow-core/src/engine.rs`, `Cargo.toml`, `scripts/bundle-native.sh`, `README.md`
+
+- Milestone A of the native port (`docs/native-port/PLAN.md`). A second host over `openflow-core`: `NSApplication` in accessory mode, a `tray-icon` status item, a borderless `NSPanel` overlay and one `NSTabView` settings window, with no WebKit process tree and no JS bridge on the hotkey path. `cargo build -p openflow-native --release` produces `openflow-native` (the plain name is taken by the Tauri bin until Milestone C retires it, and the bundle installs it as `Contents/MacOS/openflow`); `scripts/bundle-native.sh` assembles and ad hoc signs `OpenFlow.app`.
+- The overlay pill is ported from `overlay.html` rather than reinterpreted: 28 px tall, 28/82/72 px wide, the same body colour, the same per-position corner radii, the same ten waveform bars and three pulsing dots, the same eight anchors and drag-to-snap. It animates on one 30 Hz `NSTimer` that exists only while recording or transcribing, and positions against the screen's visible frame so it never sits under the menu bar or behind the Dock.
+- The settings window covers every key in the parity checklist, autosaving on change with no Save button, with the three credentials in `NSSecureTextField`s that write to the keychain. First launch with no provider saved opens it on Providers.
+- The event sink packages each event and hops to the main queue with `dispatch2`. It never calls back into the engine, because the engine emits with its own locks held; the one event whose delivery matters, a speech chunk, is refused synchronously when no preview is listening, which is what stops a cancelled download.
+- The host owns the tokio runtime in a static that outlives the run loop, and `Engine::with_owned_runtime` is gone. An engine that owned its runtime could have a transcription task hold the last `Arc<Engine>` and drop the runtime from one of its own worker threads, which tokio turns into a panic. `EngineEvents` now documents both constraints on an implementation.
+- Not yet here, all Milestone B: the onboarding wizard, the History window, the Plugins window, the local transcription runner, and streaming TTS beyond the settings preview. The tray's History item is present but disabled, and the Tauri app still builds and passes.
+
 ### Cargo workspace with a UI-free `openflow-core`
 By: Titan (with Claude)
 Impact: `Cargo.toml`, `crates/openflow-core/*`, `src-tauri/src/lib.rs`, `src-tauri/Cargo.toml`, `package.json`, `.github/workflows/ci.yml`

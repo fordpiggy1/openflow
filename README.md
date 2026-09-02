@@ -130,6 +130,25 @@ npm run tauri:build
 
 CI runs these checks from a clean install and compiles the desktop app on macOS, Windows, and Ubuntu.
 
+## Native build (experimental, macOS only)
+
+`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, a native settings window, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. The plan is `docs/native-port/PLAN.md`; onboarding, the History and Plugins windows and the local runner are Milestone B.
+
+```bash
+# Build the binary
+cargo build -p openflow-native --release
+
+# Prove the engine comes up without opening a window
+./target/release/openflow-native --self-check
+
+# Assemble target/OpenFlow.app, ad hoc signed; add --dmg for a disk image
+bash scripts/bundle-native.sh
+```
+
+The cargo target is `openflow-native` because `src-tauri` already builds a bin called `openflow`; inside the bundle the executable is `Contents/MacOS/openflow`, and the suffix goes away when `src-tauri` is retired.
+
+Launch it with `open -a target/OpenFlow.app`, not from a shell. macOS binds microphone and accessibility grants to the *code signature* of whatever asked, and a binary started from a terminal inherits the terminal's identity, so the grant lands on the terminal and the app appears to have been refused. The ad hoc signature the bundle script applies also changes on every rebuild, so expect to grant microphone access again after each one until a stable signing identity lands in Milestone C.
+
 ## How dictation works
 
 1. Hold the record shortcut and speak.
