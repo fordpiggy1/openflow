@@ -72,6 +72,19 @@ pub enum EngineEvent {
 /// `emit` returns a result because one caller depends on delivery: a speech
 /// stream stops when its chunks stop arriving, rather than downloading a clip
 /// nobody can hear. Every other emit ignores the result, as it does today.
+///
+/// Two constraints on any implementation, both of them load-bearing:
+///
+/// - **It runs on whatever thread finished the work.** A tokio worker for the
+///   pipeline and the speech stream, the host's hotkey callback thread for a
+///   press or release, the main thread for a menu action. An implementation
+///   that touches a UI toolkit must hop to that toolkit's thread itself.
+/// - **It can run while the engine holds its own locks.**
+///   [`Engine::emit_idle_if_quiescent`] emits with the recording lock held on
+///   purpose, so a new capture cannot publish "recording" before a stale
+///   "idle"; [`Engine::hotkey_pressed`] does the same. So `emit` must not call
+///   back into the engine synchronously: any engine read the host needs belongs
+///   after its own hop, never inside `emit`.
 pub trait EngineEvents: Send + Sync + 'static {
     fn emit(&self, event: EngineEvent) -> Result<(), String>;
 }
@@ -107,10 +120,11 @@ pub struct Engine {
     transcription_jobs: Mutex<HashMap<String, CancellationToken>>,
     speech_jobs: Mutex<HashMap<String, CancellationToken>>,
     events: Arc<dyn EngineEvents>,
+    /// How background work is started. The *host* owns the runtime this spawns
+    /// onto, and must keep it alive past the engine: a task that ends up
+    /// holding the last `Arc<Engine>` would otherwise drop the runtime from one
+    /// of its own worker threads, which tokio turns into a panic.
     spawn: Spawner,
-    /// Only set when the engine had to build its own runtime, which keeps that
-    /// runtime alive for as long as the engine can spawn onto it.
-    _runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Engine {
@@ -118,35 +132,13 @@ impl Engine {
     /// secrets out of the settings table, apply the retention window, and
     /// remember the most recent transcript so the re-copy hotkey works from a
     /// cold start.
+    ///
+    /// `spawn` runs background work on a runtime the *host* owns. There is
+    /// deliberately no constructor that builds one here; see the `spawn` field.
     pub fn new(
         app_dir: PathBuf,
         events: Arc<dyn EngineEvents>,
         spawn: Spawner,
-    ) -> Result<Arc<Self>, String> {
-        Self::build(app_dir, events, spawn, None)
-    }
-
-    /// Same, for a host with no async runtime of its own.
-    pub fn with_owned_runtime(
-        app_dir: PathBuf,
-        events: Arc<dyn EngineEvents>,
-    ) -> Result<Arc<Self>, String> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("Could not start the async runtime: {}", error))?;
-        let handle = runtime.handle().clone();
-        let spawn: Spawner = Box::new(move |future| {
-            handle.spawn(future);
-        });
-        Self::build(app_dir, events, spawn, Some(runtime))
-    }
-
-    fn build(
-        app_dir: PathBuf,
-        events: Arc<dyn EngineEvents>,
-        spawn: Spawner,
-        runtime: Option<tokio::runtime::Runtime>,
     ) -> Result<Arc<Self>, String> {
         let db =
             Database::new(app_dir.clone()).map_err(|e| format!("Database init failed: {}", e))?;
@@ -175,7 +167,6 @@ impl Engine {
             speech_jobs: Mutex::new(HashMap::new()),
             events,
             spawn,
-            _runtime: runtime,
         }))
     }
 
