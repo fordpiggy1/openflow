@@ -11,6 +11,8 @@
     "core:window:allow-outer-size",
     "core:window:allow-current-monitor",
     "core:window:allow-primary-monitor",
+    "core:window:allow-show",
+    "core:window:allow-hide",
     "core:window:allow-set-visible-on-all-workspaces",
     "core:event:default",
     "shell:allow-open",
