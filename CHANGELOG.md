@@ -4,6 +4,14 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Keep the user's clipboard across dictations
+By: Titan (with Claude)
+Impact: `src-tauri/src/lib.rs`, `src/App.tsx`, `README.md`
+
+- New `preserve_clipboard` setting, on by default. Under Paste, the previous clipboard contents (text or image) are snapshotted before the transcript is written and put back 500 ms after Cmd+V, and only if the clipboard still holds the transcript, so a copy the user made in between is never clobbered. Under Type, the clipboard is not written at all.
+- The re-copy shortcut, tray recents, and the app's own copy buttons keep the transcript on the clipboard, since that is what they are for.
+- Files and rich content cannot be captured through the clipboard crate and are left replaced; the setting's help text says so.
+
 ### Socket-level test for the credential isolation guarantee
 By: Ford
 Impact: `src-tauri/src/lib.rs`
