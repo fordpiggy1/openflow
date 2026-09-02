@@ -64,21 +64,51 @@ impl Provider {
         }
     }
 
+    /// Groq retired its Llama endpoints for new accounts; gpt-oss-20b is the
+    /// fastest model left and, with reasoning turned down, answers immediately.
     pub fn default_chat_model(&self) -> &str {
         match self {
-            Self::Groq => "llama-3.3-70b-versatile",
+            Self::Groq => "openai/gpt-oss-20b",
             Self::OpenAI => "gpt-4o-mini",
-            Self::OpenRouter => "google/gemini-3-flash-preview",
-            Self::Deepgram => "llama-3.3-70b-versatile",
+            Self::OpenRouter => "google/gemini-3.1-flash-lite-preview",
+            Self::Deepgram => "openai/gpt-oss-20b",
             Self::Custom { .. } => "default",
         }
     }
 
-    fn authorization(&self, api_key: &str) -> String {
+    pub fn default_tts_model(&self) -> &str {
         match self {
+            Self::Groq => "canopylabs/orpheus-v1-english",
+            Self::OpenAI | Self::Custom { .. } => "tts-1",
+            _ => GEMINI_TTS_MODEL,
+        }
+    }
+
+    pub fn default_tts_voice(&self) -> &str {
+        match self {
+            Self::Groq => "troy",
+            Self::OpenAI | Self::Custom { .. } => "alloy",
+            _ => "Kore",
+        }
+    }
+
+    /// `None` when there is no key to send.
+    ///
+    /// Self-hosted OpenAI-compatible servers on a LAN (Kokoro, llama.cpp,
+    /// vLLM, ...) usually run with no auth at all, and several of them reject a
+    /// request carrying `Bearer ` with an empty value. Omit the header instead.
+    fn authorization(&self, api_key: &str) -> Option<String> {
+        if api_key.trim().is_empty() {
+            return None;
+        }
+        Some(match self {
             Self::Deepgram => format!("Token {}", api_key),
             _ => format!("Bearer {}", api_key),
-        }
+        })
+    }
+
+    pub fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
     }
 
     pub fn is_openrouter(&self) -> bool {
@@ -94,7 +124,7 @@ pub struct ModelInfo {
 }
 
 pub async fn fetch_models(api_key: &str, provider: &Provider) -> Result<Vec<ModelInfo>, String> {
-    ensure_api_key(api_key)?;
+    ensure_api_key(api_key, provider)?;
     if matches!(provider, Provider::Deepgram) {
         return Ok(vec![
             ModelInfo {
@@ -111,9 +141,7 @@ pub async fn fetch_models(api_key: &str, provider: &Provider) -> Result<Vec<Mode
     }
     let client = client()?;
     let response = with_openrouter_headers(
-        client
-            .get(provider.endpoint("models")?)
-            .bearer_auth(api_key),
+        with_auth(client.get(provider.endpoint("models")?), provider, api_key),
         provider,
     )
     .timeout(Duration::from_secs(15))
@@ -220,15 +248,16 @@ pub async fn transcribe_audio(
     language: Option<&str>,
     provider: &Provider,
     model: Option<&str>,
+    dictionary: Option<&str>,
 ) -> Result<String, String> {
-    ensure_api_key(api_key)?;
+    ensure_api_key(api_key, provider)?;
     if wav_bytes.len() > 50 * 1024 * 1024 {
         return Err("Recording is too large to transcribe".to_string());
     }
     match provider {
         Provider::Deepgram => transcribe_deepgram(wav_bytes, api_key, language, model).await,
         Provider::OpenRouter => transcribe_openrouter(wav_bytes, api_key, language, model).await,
-        _ => transcribe_whisper(wav_bytes, api_key, language, provider, model).await,
+        _ => transcribe_whisper(wav_bytes, api_key, language, provider, model, dictionary).await,
     }
 }
 
@@ -265,6 +294,7 @@ async fn transcribe_whisper(
     language: Option<&str>,
     provider: &Provider,
     model: Option<&str>,
+    dictionary: Option<&str>,
 ) -> Result<String, String> {
     let file = multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
@@ -280,10 +310,17 @@ async fn transcribe_whisper(
     if let Some(language) = normalize_language(language) {
         form = form.text("language", language.to_string());
     }
+    // Whisper reads `prompt` as preceding text and copies its spellings, so a
+    // list of names and terms is the cheapest personal dictionary there is.
+    if let Some(dictionary) = dictionary_prompt(dictionary) {
+        form = form.text("prompt", dictionary);
+    }
     let response = with_openrouter_headers(
-        client()?
-            .post(provider.endpoint("audio/transcriptions")?)
-            .header("Authorization", provider.authorization(api_key)),
+        with_auth(
+            client()?.post(provider.endpoint("audio/transcriptions")?),
+            provider,
+            api_key,
+        ),
         provider,
     )
     .multipart(form)
@@ -364,7 +401,7 @@ pub async fn format_text(
     provider: &Provider,
     chat_model: Option<&str>,
 ) -> Result<String, String> {
-    ensure_api_key(api_key)?;
+    ensure_api_key(api_key, provider)?;
     if matches!(provider, Provider::Deepgram) {
         return Err("Deepgram provides transcription but not chat formatting. Choose a separate formatting provider or disable formatting.".to_string());
     }
@@ -372,16 +409,18 @@ pub async fn format_text(
         .filter(|ctx| !ctx.trim().is_empty())
         .map(|ctx| format!("Context: {}\n\nDictation: {}", ctx, raw_text))
         .unwrap_or_else(|| raw_text.to_string());
-    let body = serde_json::json!({
-        "model": chat_model.unwrap_or(provider.default_chat_model()),
+    let model = chat_model.unwrap_or(provider.default_chat_model());
+    let mut body = serde_json::json!({
+        "model": model,
         "messages": [{"role":"system","content":FORMAT_SYSTEM_PROMPT},{"role":"user","content":user_content}],
         "temperature": 0.3, "max_tokens": 2048
     });
+    if let Some(effort) = reasoning_effort(provider, model) {
+        body["reasoning_effort"] = effort.into();
+    }
     let endpoint = provider.endpoint("chat/completions")?;
     let response = with_openrouter_headers(
-        client()?
-            .post(endpoint)
-            .header("Authorization", provider.authorization(api_key)),
+        with_auth(client()?.post(endpoint), provider, api_key),
         provider,
     )
     .json(&body)
@@ -416,7 +455,7 @@ pub async fn request_speech(
     voice: &str,
     response_format: &str,
 ) -> Result<Response, String> {
-    ensure_api_key(api_key)?;
+    ensure_api_key(api_key, provider)?;
     if text.trim().is_empty() {
         return Err("Text to speak cannot be empty".to_string());
     }
@@ -434,16 +473,16 @@ pub async fn request_speech(
     {
         return Err("Speech voice is invalid".to_string());
     }
-    if matches!(provider, Provider::Deepgram | Provider::Groq) {
-        return Err(
-            "This provider does not expose an OpenAI-compatible speech endpoint".to_string(),
-        );
+    if matches!(provider, Provider::Deepgram) {
+        return Err("Deepgram does not expose an OpenAI-compatible speech endpoint".to_string());
     }
     let body = serde_json::json!({ "model": model, "input": text, "voice": voice, "response_format": response_format });
     let response = with_openrouter_headers(
-        client()?
-            .post(provider.endpoint("audio/speech")?)
-            .header("Authorization", provider.authorization(api_key)),
+        with_auth(
+            client()?.post(provider.endpoint("audio/speech")?),
+            provider,
+            api_key,
+        ),
         provider,
     )
     .json(&body)
@@ -502,6 +541,18 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|error| format!("Could not initialize network client: {}", error))
 }
 
+/// Attaches the Authorization header only when there is a key to attach.
+fn with_auth(
+    builder: reqwest::RequestBuilder,
+    provider: &Provider,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    match provider.authorization(api_key) {
+        Some(value) => builder.header("Authorization", value),
+        None => builder,
+    }
+}
+
 fn with_openrouter_headers(
     builder: reqwest::RequestBuilder,
     provider: &Provider,
@@ -515,20 +566,37 @@ fn with_openrouter_headers(
     }
 }
 
+/// gpt-oss models think before they answer unless told not to. Cleanup needs
+/// none of that, and Groq only accepts the parameter for these models.
+fn reasoning_effort(provider: &Provider, model: &str) -> Option<&'static str> {
+    (matches!(provider, Provider::Groq) && model.contains("gpt-oss")).then_some("low")
+}
+
+/// Whisper caps the prompt at 224 tokens; 800 characters stays well under it.
+fn dictionary_prompt(dictionary: Option<&str>) -> Option<String> {
+    let text = dictionary?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(800).collect())
+}
+
 fn normalize_language(language: Option<&str>) -> Option<&str> {
     language
         .map(str::trim)
         .filter(|language| !language.is_empty() && *language != "auto")
 }
 
-fn ensure_api_key(api_key: &str) -> Result<(), String> {
-    if api_key.trim().is_empty() {
-        Err("No API key set. Add one in Settings.".to_string())
-    } else if api_key.len() > 16_384 {
-        Err("API key is unexpectedly large".to_string())
-    } else {
-        Ok(())
+/// Self-hosted servers on a LAN usually run without auth, so an empty key is
+/// only an error for hosted providers. Saying so early beats a 401 later.
+fn ensure_api_key(api_key: &str, provider: &Provider) -> Result<(), String> {
+    if api_key.len() > 16_384 {
+        return Err("API key is unexpectedly large".to_string());
     }
+    if api_key.trim().is_empty() && !provider.is_custom() {
+        return Err("No API key set. Add one in Settings.".to_string());
+    }
+    Ok(())
 }
 
 fn api_error(label: &str, status: reqwest::StatusCode, body: &str) -> String {
@@ -586,6 +654,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_api_key_sends_no_authorization_header() {
+        // Self-hosted servers on a LAN are usually unauthenticated, and some
+        // reject a request carrying `Bearer ` with an empty value.
+        let custom = Provider::from_str("custom:http://192.168.1.10:8880/v1");
+        assert_eq!(custom.authorization(""), None);
+        assert_eq!(custom.authorization("   "), None);
+        assert_eq!(
+            custom.authorization("sk-local"),
+            Some("Bearer sk-local".to_string())
+        );
+        assert_eq!(
+            Provider::from_str("deepgram").authorization("abc"),
+            Some("Token abc".to_string())
+        );
+    }
+
+    #[test]
+    fn custom_provider_accepts_plain_http_lan_addresses() {
+        // No TLS on a home network, so http:// has to survive validation.
+        let provider = Provider::from_str("custom:http://192.168.100.121:8880/v1");
+        assert!(provider.is_custom());
+        assert_eq!(
+            provider.endpoint("audio/speech").unwrap(),
+            "http://192.168.100.121:8880/v1/audio/speech"
+        );
+    }
+
+    #[test]
+    fn custom_provider_with_no_url_reports_a_usable_error() {
+        let broken = Provider::from_str("custom:not a url");
+        assert!(broken.endpoint("audio/speech").is_err());
+    }
+
+    #[test]
     fn custom_provider_rejects_non_http_urls() {
         assert!(
             matches!(Provider::from_str("custom:file:///tmp/api"), Provider::Custom { base_url } if base_url.is_empty())
@@ -593,6 +695,53 @@ mod tests {
         assert!(
             matches!(Provider::from_str("custom:https://localhost:8080/v1/"), Provider::Custom { base_url } if base_url == "https://localhost:8080/v1")
         );
+    }
+
+    #[test]
+    fn empty_api_key_is_allowed_only_for_custom_endpoints() {
+        let custom = Provider::from_str("custom:http://192.168.1.10:8880/v1");
+        assert!(ensure_api_key("", &custom).is_ok());
+        assert!(ensure_api_key("   ", &custom).is_ok());
+        assert!(ensure_api_key("", &Provider::OpenRouter).is_err());
+        assert!(ensure_api_key("sk-x", &Provider::OpenRouter).is_ok());
+        assert!(ensure_api_key(&"x".repeat(16_385), &custom).is_err());
+    }
+
+    #[test]
+    fn reasoning_is_turned_down_only_for_gpt_oss_on_groq() {
+        assert_eq!(
+            reasoning_effort(&Provider::Groq, "openai/gpt-oss-20b"),
+            Some("low")
+        );
+        assert_eq!(reasoning_effort(&Provider::Groq, "qwen/qwen3.6-27b"), None);
+        assert_eq!(
+            reasoning_effort(&Provider::OpenRouter, "openai/gpt-oss-20b"),
+            None
+        );
+    }
+
+    #[test]
+    fn dictionary_prompt_is_trimmed_and_bounded() {
+        assert_eq!(dictionary_prompt(None), None);
+        assert_eq!(dictionary_prompt(Some("   ")), None);
+        assert_eq!(
+            dictionary_prompt(Some(" ENTRO.LY, FastPay ")),
+            Some("ENTRO.LY, FastPay".to_string())
+        );
+        assert_eq!(
+            dictionary_prompt(Some(&"x".repeat(2_000))).map(|p| p.len()),
+            Some(800)
+        );
+    }
+
+    #[test]
+    fn groq_speech_defaults_point_at_orpheus() {
+        assert_eq!(
+            Provider::Groq.default_tts_model(),
+            "canopylabs/orpheus-v1-english"
+        );
+        assert_eq!(Provider::Groq.default_tts_voice(), "troy");
+        assert_eq!(Provider::OpenRouter.default_tts_model(), GEMINI_TTS_MODEL);
     }
 
     #[test]

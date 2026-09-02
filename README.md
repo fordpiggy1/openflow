@@ -6,38 +6,81 @@ The project is currently an early source build. There are no official pre-built 
 
 ## What works
 
-- Guided onboarding for Groq, OpenAI, OpenRouter, Deepgram, and custom OpenAI-compatible endpoints
+- Guided onboarding for Groq (recommended), OpenAI, OpenRouter, Deepgram, and custom OpenAI-compatible endpoints
+- A personal dictionary of names and terms, sent to Whisper as a spelling hint on Groq, OpenAI, and custom endpoints
 - Configurable transcription and cleanup models with provider model discovery
 - Global hold-to-record shortcut (`Option+V` by default) and re-copy shortcut (`Ctrl+Shift+V` by default)
 - Searchable local transcription history
 - Microphone selection, language hints, light/dark themes, a system tray menu, and a movable status overlay
 - Optional LLM cleanup for punctuation, paragraphs, and spoken editing commands
 - OpenRouter Gemini 3.1 Flash TTS Preview with selectable voices and cancellable response streaming
+- Self-hosted speech-to-text and speech synthesis on your own network, with no API key required
 - Local executable hooks after transcription and formatting
 
 ### Streaming scope
 
-Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download.
+Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download. Groq's Orpheus returns WAV only, which cannot be streamed through Media Source Extensions, so it always plays after the download completes.
 
 ## Providers
 
 | Provider | Transcription | Text cleanup | TTS preview |
 | --- | --- | --- | --- |
+| Groq | Whisper models | gpt-oss and Qwen models | Orpheus, after a one-time terms acceptance in the Groq console |
 | OpenRouter | Whisper models | Chat models | Gemini 3.1 Flash TTS Preview |
-| Groq | Whisper models | Chat models | No |
-| OpenAI | Whisper-compatible endpoint | Chat models | Not exposed in the current UI |
+| OpenAI | Whisper-compatible endpoint | Chat models | OpenAI-compatible speech endpoint, when OpenAI is also the transcription provider |
 | Deepgram | Nova models | Use a separate cleanup provider or disable cleanup | No |
-| Custom | OpenAI-compatible audio/transcriptions endpoint | OpenAI-compatible chat/completions endpoint | Not exposed in the current UI |
+| Custom | OpenAI-compatible audio/transcriptions endpoint | OpenAI-compatible chat/completions endpoint | Self-hosted OpenAI-compatible audio/speech endpoint |
 
 Model availability and billing are controlled by the provider. OpenFlow does not proxy requests or include hosted inference.
 
 ## Privacy and permissions
 
 - API credentials are stored using macOS Keychain, Windows DPAPI, or Linux Secret Service. Linux requires an unlocked keyring and the `secret-tool` command.
-- Recordings are held in memory for transcription and sent to the provider selected in Settings. Cleanup sends transcript text to the selected cleanup provider. Gemini voice previews send their text to OpenRouter.
-- Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory.
+- Recordings are held in memory for transcription and sent to the provider selected in Settings. Cleanup sends transcript text to the selected cleanup provider. Voice previews send their text to the selected speech endpoint. Your transcription key is only ever reused by that same service; a different hosted provider or a self-hosted server never receives it.
+- Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory. You control it from Settings: delete individual entries, clear everything, turn saving off entirely, or set an auto-delete window (1/7/30/90 days) that is applied at launch and after each transcription.
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.
+
+## Self-hosting on your LAN
+
+Both speech-to-text and speech synthesis can point at a machine on your own
+network, so audio never leaves it and there is no per-request cost.
+
+Pick **Custom** as the transcription provider, or **Self-hosted / LAN** as the
+speech endpoint, and give the OpenAI-compatible base URL:
+
+```
+http://192.168.1.10:8880/v1
+```
+
+OpenFlow appends the standard paths under it (`/audio/transcriptions`,
+`/chat/completions`, `/audio/speech`). Plain `http` is accepted, and an empty
+API key is fine -- when there is no key, no `Authorization` header is sent at
+all, which is what unauthenticated local servers expect.
+
+Servers that work as-is:
+
+| Role | Server | Notes |
+|------|--------|-------|
+| Speech synthesis | [`kokoro-fastapi`](https://github.com/remsky/Kokoro-FastAPI) | Serves `/v1/audio/speech`, supports streaming. Model `kokoro`, voices like `af_bella`. |
+| Speech synthesis | [`openedai-speech`](https://github.com/matatonic/openedai-speech) | Wraps Piper or XTTS behind the OpenAI API. Lighter on CPU-only boxes. |
+| Transcription | [`faster-whisper-server`](https://github.com/fedirz/faster-whisper-server) | Serves `/v1/audio/transcriptions`. |
+| Transcription | `whisper.cpp` server | Built-in OpenAI-compatible mode. |
+
+On macOS the first connection to a LAN address triggers the system's local
+network permission prompt. Approve it, or the requests fail in a way that looks
+exactly like the server being down. (Settings -> Privacy & Security -> Local
+Network if it was denied once.)
+
+## Audio pipeline
+
+Capture runs at the device's native rate and format, then downsamples to the
+16 kHz mono WAV the speech models expect. The resampler low-passes before
+decimating: skipping that step folds everything above the new 8 kHz Nyquist
+back into the speech band (a 15 kHz whine lands on 1 kHz, on top of the voice),
+and interpolation alone does not prevent it. Gain is then set from the 95th
+percentile of sample magnitude rather than the absolute peak, so a single cough
+or desk bump does not cancel the boost for an otherwise quiet recording.
 
 ## Build from source
 

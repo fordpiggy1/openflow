@@ -13,6 +13,7 @@ use secrets::SecretStore;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -25,7 +26,10 @@ struct AppState {
     db: Database,
     secrets: SecretStore,
     plugin_manager: PluginManager,
-    recording: Mutex<bool>,
+    /// `Some(started_at)` while capturing. Carrying the start time rather than
+    /// a bare bool lets a dropped hotkey-release event time out instead of
+    /// wedging recording until the app restarts.
+    recording: Mutex<Option<Instant>>,
     last_transcription: Mutex<Option<String>>,
     transcription_jobs: Mutex<HashMap<String, CancellationToken>>,
     speech_jobs: Mutex<HashMap<String, CancellationToken>>,
@@ -88,9 +92,11 @@ async fn fetch_models(
         .or_else(|| state.db.get_setting("provider"))
         .unwrap_or_else(|| "groq".to_string());
     let provider = Provider::from_str(&provider_str);
+    // An empty key is valid for a self-hosted endpoint; transcribe::fetch_models
+    // rejects it for every hosted provider.
     let api_key = api_key_override
         .or_else(|| state.secrets.get("api_key").ok().flatten())
-        .ok_or("No API key available")?;
+        .unwrap_or_default();
     transcribe::fetch_models(&api_key, &provider).await
 }
 
@@ -149,25 +155,85 @@ fn speech_settings(
             .get_setting("tts_provider")
             .unwrap_or_else(|| "openrouter".to_string()),
     );
-    let api_key = state
-        .secrets
-        .get("tts_api_key")?
-        .or_else(|| state.secrets.get("api_key").ok().flatten())
-        .ok_or("No API key set. Add your OpenRouter key in Settings.")?;
+    let transcription_provider = Provider::from_str(
+        &state
+            .db
+            .get_setting("provider")
+            .unwrap_or_else(|| "groq".to_string()),
+    );
+    let api_key = resolve_speech_key(
+        &provider,
+        state.secrets.get("tts_api_key")?,
+        state.secrets.get("api_key")?,
+        same_endpoint(&provider, &transcription_provider),
+    )?;
+    // Each provider has its own model and voice names, so blank falls back
+    // per provider rather than to Gemini's.
     let model = model
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| state.db.get_setting("tts_model"))
-        .unwrap_or_else(|| transcribe::GEMINI_TTS_MODEL.to_string());
+        .or_else(|| {
+            state
+                .db
+                .get_setting("tts_model")
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| provider.default_tts_model().to_string());
     let voice = voice
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| state.db.get_setting("tts_voice"))
-        .unwrap_or_else(|| "Kore".to_string());
+        .or_else(|| {
+            state
+                .db
+                .get_setting("tts_voice")
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| provider.default_tts_voice().to_string());
     let format = response_format
         .filter(|value| !value.trim().is_empty())
         .or_else(|| state.db.get_setting("tts_response_format"))
         .unwrap_or_else(|| "mp3".to_string())
         .to_ascii_lowercase();
     Ok((provider, api_key, model, voice, format))
+}
+
+/// True when two provider settings name the same service, so one credential
+/// is valid for both. Two custom endpoints are the same only if their URLs are.
+fn same_endpoint(a: &Provider, b: &Provider) -> bool {
+    match (a, b) {
+        (Provider::Custom { base_url: x }, Provider::Custom { base_url: y }) => x == y,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
+/// Which credential a speech request may carry.
+///
+/// The transcription key is shared only with the same endpoint. A different
+/// hosted provider cannot use it (an OpenRouter key is worthless at OpenAI),
+/// and a self-hosted server must not receive it: that would send a cloud
+/// credential in clear text across the LAN. With no usable key, a custom
+/// endpoint proceeds unauthenticated and a hosted one is refused up front.
+fn resolve_speech_key(
+    provider: &Provider,
+    dedicated: Option<String>,
+    shared: Option<String>,
+    same_endpoint_as_transcription: bool,
+) -> Result<String, String> {
+    let present = |key: Option<String>| key.filter(|value| !value.trim().is_empty());
+    if let Some(key) = present(dedicated) {
+        return Ok(key);
+    }
+    if same_endpoint_as_transcription {
+        if let Some(key) = present(shared) {
+            return Ok(key);
+        }
+    }
+    if provider.is_custom() {
+        return Ok(String::new());
+    }
+    Err(if same_endpoint_as_transcription {
+        "No API key set. Add your key in Settings.".to_string()
+    } else {
+        "The voice provider needs its own API key. Use the provider you transcribe with, or point the speech endpoint at a self-hosted server.".to_string()
+    })
 }
 
 #[tauri::command]
@@ -313,12 +379,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         .recording
         .lock()
         .map_err(|_| "Recording state is unavailable".to_string())?;
-    if *recording {
+    if !recording_slot_free(&recording) {
         return Err("A recording is already active".to_string());
     }
     let device = state.db.get_setting("microphone");
     state.recorder.start(device)?;
-    *recording = true;
+    *recording = Some(Instant::now());
     let _ = app.emit("recording-state", "recording");
     Ok(())
 }
@@ -333,11 +399,11 @@ async fn stop_recording_and_transcribe(
             .recording
             .lock()
             .map_err(|_| "Recording state is unavailable".to_string())?;
-        if !*recording {
+        if recording.is_none() {
             return Err("No recording is active".to_string());
         }
         let result = state.recorder.stop();
-        *recording = false;
+        *recording = None;
         result
     };
     let wav_bytes = match wav_result {
@@ -393,7 +459,30 @@ fn copy_last_transcription(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn delete_transcription(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    state.db.delete_transcription(&id)?;
+    update_tray_menu(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_history(app: AppHandle, state: State<AppState>) -> Result<usize, String> {
+    let removed = state.db.clear_history()?;
+    if let Ok(mut last) = state.last_transcription.lock() {
+        *last = None;
+    }
+    update_tray_menu(&app);
+    Ok(removed)
+}
+
+#[tauri::command]
 fn copy_text(_state: State<AppState>, text: String) -> Result<(), String> {
+    write_clipboard(&text)
+}
+
+/// Copy and paste in one step, for callers that want the keystroke.
+#[tauri::command]
+fn paste_text(_state: State<AppState>, text: String) -> Result<(), String> {
     paste_to_clipboard(&text)
 }
 
@@ -501,10 +590,9 @@ async fn run_transcription_pipeline_inner(
 ) -> Result<(Transcription, Option<String>), String> {
     let duration_ms = wav_duration_ms(&wav_bytes);
 
-    let transcription_key = state
-        .secrets
-        .get("api_key")?
-        .ok_or("No API key set. Add your API key in settings.")?;
+    // Empty is valid for a self-hosted endpoint; transcribe_audio rejects it
+    // for every hosted provider.
+    let transcription_key = state.secrets.get("api_key")?.unwrap_or_default();
     let language = state.db.get_setting("language");
     let provider_str = state
         .db
@@ -523,10 +611,11 @@ async fn run_transcription_pipeline_inner(
         .unwrap_or(true);
     let stt_model = state.db.get_setting("stt_model");
     let chat_model = state.db.get_setting("chat_model");
+    let dictionary = state.db.get_setting("dictionary");
 
     let raw_text = tokio::select! {
         _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
-        result = transcribe::transcribe_audio(wav_bytes, &transcription_key, language.as_deref(), &transcription_provider, stt_model.as_deref()) => result?,
+        result = transcribe::transcribe_audio(wav_bytes, &transcription_key, language.as_deref(), &transcription_provider, stt_model.as_deref(), dictionary.as_deref()) => result?,
     };
     let raw_text = state
         .plugin_manager
@@ -550,11 +639,19 @@ async fn run_transcription_pipeline_inner(
                 .db
                 .get_setting("formatting_provider")
                 .unwrap_or(provider_str.clone());
+            let fmt_provider = Provider::from_str(&fp);
+            // Share the transcription key only with the same endpoint. A
+            // different server, hosted or on the LAN, never receives it.
             let fk = state
                 .secrets
                 .get("formatting_api_key")?
-                .unwrap_or(transcription_key.clone());
-            (Provider::from_str(&fp), fk)
+                .filter(|key| !key.trim().is_empty())
+                .or_else(|| {
+                    same_endpoint(&fmt_provider, &transcription_provider)
+                        .then(|| transcription_key.clone())
+                })
+                .unwrap_or_default();
+            (fmt_provider, fk)
         };
         tokio::select! {
             _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
@@ -589,7 +686,22 @@ async fn run_transcription_pipeline_inner(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    state.db.save_transcription(&transcription)?;
+    // Saving is opt-out, and an optional retention window trims old rows as we go.
+    let history_enabled = state
+        .db
+        .get_setting("save_history")
+        .map(|value| value != "false")
+        .unwrap_or(true);
+    if history_enabled {
+        state.db.save_transcription(&transcription)?;
+        if let Some(days) = state
+            .db
+            .get_setting("history_retention_days")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            let _ = state.db.prune_older_than(days);
+        }
+    }
     {
         let mut last = state
             .last_transcription
@@ -609,13 +721,19 @@ async fn run_transcription_pipeline_inner(
     Ok((transcription, paste_warning))
 }
 
-fn paste_to_clipboard(text: &str) -> Result<(), String> {
+fn write_clipboard(text: &str) -> Result<(), String> {
     use arboard::Clipboard;
     let mut clipboard = Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
     clipboard
         .set_text(text)
-        .map_err(|e| format!("Clipboard set failed: {}", e))?;
+        .map_err(|e| format!("Clipboard set failed: {}", e))
+}
 
+/// Copy *and* fire a paste keystroke at whatever has focus. Correct for the
+/// tray and the re-copy hotkey, where focus is in the user's editor; wrong for
+/// a list inside OpenFlow, which would paste into OpenFlow itself.
+fn paste_to_clipboard(text: &str) -> Result<(), String> {
+    write_clipboard(text)?;
     simulate_paste()
 }
 
@@ -782,6 +900,18 @@ fn default_shortcut(action: &str) -> Option<&'static str> {
     }
 }
 
+/// A capture that has run this long is a stuck flag, not a real recording.
+const MAX_RECORDING: Duration = Duration::from_secs(300);
+
+/// True when no capture is in flight, or when the one on record is so old it
+/// can only be the residue of a lost release event.
+fn recording_slot_free(slot: &Option<Instant>) -> bool {
+    match slot {
+        None => true,
+        Some(started) => started.elapsed() > MAX_RECORDING,
+    }
+}
+
 // ── Hotkey handlers ───────────────────────────────────────
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -797,12 +927,12 @@ fn handle_hotkey_press(app: &AppHandle) {
         let _ = app.emit("transcription-error", "Recording state is unavailable");
         return;
     };
-    if !*recording {
-        *recording = true;
+    if recording_slot_free(&recording) {
+        *recording = Some(Instant::now());
         let device = state.db.get_setting("microphone");
         if let Err(e) = state.recorder.start(device) {
             eprintln!("Recording start failed: {}", e);
-            *recording = false;
+            *recording = None;
             let _ = app.emit("transcription-error", &e);
             return;
         }
@@ -814,7 +944,7 @@ fn emit_idle_if_quiescent(app: &AppHandle, state: &AppState) {
     let Ok(recording) = state.recording.lock() else {
         return;
     };
-    if *recording {
+    if recording.is_some() {
         return;
     }
     let Ok(active) = state.transcription_jobs.lock() else {
@@ -834,11 +964,11 @@ fn handle_hotkey_release(app: &AppHandle) {
             let _ = app.emit("transcription-error", "Recording state is unavailable");
             return;
         };
-        if !*recording {
+        if recording.is_none() {
             return;
         }
         let result = state.recorder.stop();
-        *recording = false;
+        *recording = None;
         result
     };
 
@@ -908,7 +1038,7 @@ fn build_tray_menu(
             .build(app)?;
         builder = builder.item(&label);
 
-        for (i, t) in recents.iter().enumerate() {
+        for t in recents.iter() {
             let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
             let preview: String = text.chars().take(40).collect();
             let display = if text.chars().count() > 40 {
@@ -916,7 +1046,9 @@ fn build_tray_menu(
             } else {
                 preview
             };
-            let item = MenuItemBuilder::with_id(format!("recent_{}", i), &display).build(app)?;
+            // Key by row id, not list index: indexing raced any transcription
+            // that landed between building the menu and clicking it.
+            let item = MenuItemBuilder::with_id(format!("recent:{}", t.id), &display).build(app)?;
             builder = builder.item(&item);
         }
 
@@ -1012,6 +1144,15 @@ pub fn run() {
                     .map_err(|e| format!("No app dir: {}", e))?,
             );
             migrate_secrets(&db, &secrets);
+
+            // Apply the retention policy at launch too, so a user who set it and
+            // then left the app closed still gets old rows dropped.
+            if let Some(days) = db
+                .get_setting("history_retention_days")
+                .and_then(|value| value.parse::<i64>().ok())
+            {
+                let _ = db.prune_older_than(days);
+            }
             let last_transcription = db
                 .get_history(1)?
                 .into_iter()
@@ -1023,7 +1164,7 @@ pub fn run() {
                 db,
                 secrets,
                 plugin_manager: PluginManager::new(),
-                recording: Mutex::new(false),
+                recording: Mutex::new(None),
                 last_transcription: Mutex::new(last_transcription),
                 transcription_jobs: Mutex::new(HashMap::new()),
                 speech_jobs: Mutex::new(HashMap::new()),
@@ -1070,19 +1211,13 @@ pub fn run() {
                         "quit" => {
                             app.exit(0);
                         }
-                        s if s.starts_with("recent_") => {
-                            if let Ok(idx) =
-                                s.strip_prefix("recent_").unwrap_or("").parse::<usize>()
-                            {
-                                let state = app.state::<AppState>();
-                                if let Ok(history) = state.db.get_history(20) {
-                                    if let Some(t) = history.get(idx) {
-                                        let text =
-                                            t.formatted_text.as_deref().unwrap_or(&t.raw_text);
-                                        let _ = paste_to_clipboard(text);
-                                        let _ = app.emit("recopy-success", "Copied!");
-                                    }
-                                }
+                        s if s.starts_with("recent:") => {
+                            let row_id = &s["recent:".len()..];
+                            let state = app.state::<AppState>();
+                            if let Ok(Some(t)) = state.db.get_transcription(row_id) {
+                                let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
+                                let _ = paste_to_clipboard(text);
+                                let _ = app.emit("recopy-success", "Copied!");
                             }
                         }
                         _ => {}
@@ -1119,6 +1254,8 @@ pub fn run() {
             set_setting,
             get_history,
             search_history,
+            delete_transcription,
+            clear_history,
             fetch_models,
             list_audio_devices,
             start_recording,
@@ -1129,6 +1266,7 @@ pub fn run() {
             cancel_speech,
             copy_last_transcription,
             copy_text,
+            paste_text,
             rebind_hotkey,
             list_plugins,
             enable_plugin,
@@ -1151,6 +1289,70 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_slot_frees_itself_after_the_watchdog_window() {
+        assert!(
+            recording_slot_free(&None),
+            "no capture means the slot is free"
+        );
+
+        let fresh = Some(Instant::now());
+        assert!(
+            !recording_slot_free(&fresh),
+            "a live capture holds the slot"
+        );
+
+        // A release event that never arrived must not wedge recording forever.
+        let stranded = Some(Instant::now() - MAX_RECORDING - Duration::from_secs(1));
+        assert!(
+            recording_slot_free(&stranded),
+            "a capture older than the watchdog window must free the slot"
+        );
+    }
+
+    #[test]
+    fn speech_key_never_leaks_across_endpoints() {
+        let lan = Provider::from_str("custom:http://192.168.1.10:8880/v1");
+        let shared = Some("sk-or-hosted".to_string());
+
+        // A self-hosted server gets no key unless it has its own.
+        assert_eq!(
+            resolve_speech_key(&lan, None, shared.clone(), false),
+            Ok(String::new())
+        );
+        assert_eq!(
+            resolve_speech_key(&lan, Some("local".to_string()), shared.clone(), false),
+            Ok("local".to_string())
+        );
+        // The same self-hosted server that transcribes may reuse its key.
+        assert_eq!(
+            resolve_speech_key(&lan, None, shared.clone(), true),
+            Ok("sk-or-hosted".to_string())
+        );
+        // A hosted voice provider shares the key only with itself.
+        assert_eq!(
+            resolve_speech_key(&Provider::OpenRouter, None, shared.clone(), true),
+            Ok("sk-or-hosted".to_string())
+        );
+        assert!(resolve_speech_key(&Provider::OpenAI, None, shared.clone(), false).is_err());
+        assert!(resolve_speech_key(&Provider::OpenRouter, None, None, true).is_err());
+        assert!(
+            resolve_speech_key(&Provider::OpenRouter, Some("  ".to_string()), None, true).is_err()
+        );
+    }
+
+    #[test]
+    fn same_endpoint_compares_custom_urls_and_hosted_variants() {
+        let a = Provider::from_str("custom:http://10.0.0.5:8880/v1");
+        let b = Provider::from_str("custom:http://10.0.0.5:8880/v1/");
+        let c = Provider::from_str("custom:http://10.0.0.9:8880/v1");
+        assert!(same_endpoint(&a, &b));
+        assert!(!same_endpoint(&a, &c));
+        assert!(same_endpoint(&Provider::OpenRouter, &Provider::OpenRouter));
+        assert!(!same_endpoint(&Provider::OpenRouter, &Provider::OpenAI));
+        assert!(!same_endpoint(&Provider::OpenRouter, &a));
+    }
 
     #[test]
     fn parses_default_record_shortcut() {

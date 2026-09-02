@@ -135,6 +135,71 @@ impl Database {
         Ok(results)
     }
 
+    /// Fetch one row by id. The tray menu needs this so it can key entries by
+    /// identity instead of by their position in a list that keeps changing.
+    pub fn get_transcription(&self, id: &str) -> Result<Option<Transcription>, String> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, raw_text, formatted_text, provider, duration_ms, context_type, window_title, language, created_at
+                 FROM transcriptions WHERE id = ?1",
+            )
+            .map_err(|e| format!("Query failed: {}", e))?;
+
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(Transcription {
+                    id: row.get(0)?,
+                    raw_text: row.get(1)?,
+                    formatted_text: row.get(2)?,
+                    provider: row.get(3)?,
+                    duration_ms: row.get(4)?,
+                    context_type: row.get(5)?,
+                    window_title: row.get(6)?,
+                    language: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| format!("Query map failed: {}", e))?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(|e| format!("Row error: {}", e))?)),
+            None => Ok(None),
+        }
+    }
+
+    // ── Privacy controls ──────────────────────────────────
+    // Dictation captures whatever the user says out loud: passwords, medical
+    // details, private conversation. Storing all of it with no way to remove
+    // any of it is the largest privacy gap the app can have.
+
+    pub fn delete_transcription(&self, id: &str) -> Result<(), String> {
+        let conn = self.connection()?;
+        conn.execute("DELETE FROM transcriptions WHERE id = ?1", params![id])
+            .map_err(|e| format!("Delete failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn clear_history(&self) -> Result<usize, String> {
+        let conn = self.connection()?;
+        conn.execute("DELETE FROM transcriptions", [])
+            .map_err(|e| format!("Clear failed: {}", e))
+    }
+
+    /// Drops anything older than `days`. Backs the optional retention setting.
+    pub fn prune_older_than(&self, days: i64) -> Result<usize, String> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let conn = self.connection()?;
+        conn.execute(
+            "DELETE FROM transcriptions WHERE created_at < ?1",
+            params![cutoff],
+        )
+        .map_err(|e| format!("Prune failed: {}", e))
+    }
+
     pub fn get_setting(&self, key: &str) -> Option<String> {
         self.connection()
             .ok()?
