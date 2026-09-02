@@ -4,6 +4,16 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Resource sweep: idle footprint and stop-path cost
+By: Titan (with Claude)
+Impact: `src-tauri/src/audio.rs`, `src-tauri/src/transcribe.rs`, `overlay.html`
+
+- The capture buffer is moved out and dropped after every take. `clear()` kept its capacity, so one long recording pinned up to 230 MB for the life of the app.
+- The 95th-percentile level uses a selection instead of a full sort: O(n) rather than O(n log n) on the stop path, where the user is waiting.
+- One `reqwest::Client` for the life of the process. Each request used to build its own TLS configuration and connection pool and discard them, forcing a new TCP and TLS handshake every call.
+- The overlay pill no longer uses `backdrop-filter`, which re-renders a blur every frame anything moves behind it, for a 28 px element that is on screen from launch to quit.
+- Measured idle: every animation in the app is scoped to an active state (boot, recording, transcribing, streaming), and the app plus its four WebKit helpers sit near 0.1% CPU.
+
 ### Keep the user's clipboard across dictations
 By: Titan (with Claude)
 Impact: `src-tauri/src/lib.rs`, `src/App.tsx`, `README.md`
