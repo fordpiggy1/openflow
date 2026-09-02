@@ -697,7 +697,14 @@ impl SettingsWindow {
                 crate::app::with_app(|app| app.overlay().set_position(&value));
                 written
             }
-            TAG_THEME => settings.set("theme", selected_value(&controls.theme, THEMES)),
+            TAG_THEME => {
+                let value = selected_value(&controls.theme, THEMES);
+                let written = settings.set("theme", value);
+                if let Some(mtm) = MainThreadMarker::new() {
+                    crate::app::apply_theme(settings.theme().as_deref(), mtm);
+                }
+                written
+            }
             TAG_LANGUAGE => settings.set("language", selected_value(&controls.language, LANGUAGES)),
             TAG_PROVIDER | TAG_PROVIDER_URL => settings.set(
                 "provider",

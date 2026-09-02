@@ -23,7 +23,10 @@ use std::sync::{Arc, OnceLock};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate};
+use objc2_app_kit::{
+    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSApplicationActivationPolicy, NSApplicationDelegate,
+};
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol};
 
 use openflow_core::engine::{Engine, EngineEvent, EngineEvents, RecordingState, Spawner};
@@ -180,6 +183,18 @@ fn first_line(text: &str) -> String {
     }
 }
 
+/// Force the app's windows light or dark, or follow the system when the
+/// setting holds neither. `Settings::theme` already filters anything that is
+/// not "dark" or "light" to `None`, which is what "follow the system" is.
+pub fn apply_theme(theme: Option<&str>, mtm: MainThreadMarker) {
+    let appearance = match theme {
+        Some("dark") => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }),
+        Some("light") => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }),
+        _ => None,
+    };
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+}
+
 /// `~/Library/Application Support/io.laisy.openflow`, the exact directory
 /// Tauri's `app_data_dir()` resolves to, so the two builds share one database.
 pub fn default_app_dir() -> Result<PathBuf, String> {
@@ -284,6 +299,7 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     crate::hotkeys::install_handler();
     crate::tray::install_handler();
 
+    apply_theme(app.engine.settings().theme().as_deref(), mtm);
     app.overlay.apply_visibility_setting();
     // A fresh install has no provider saved, and setup is what it needs first.
     if !app.engine.settings().onboarding_complete() {
