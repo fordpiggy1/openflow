@@ -29,6 +29,7 @@ use objc2_foundation::{
 };
 
 use openflow_core::engine::Engine;
+use openflow_core::speech::SpeechRequest;
 use openflow_core::transcribe::ModelInfo;
 
 use crate::hotkeys;
@@ -45,6 +46,8 @@ const TAB_HEIGHT: f64 = 496.0;
 /// The dictionary is sent to the transcriber as a spelling hint and the web
 /// settings screen caps it here.
 pub const DICTIONARY_LIMIT: usize = 800;
+/// The voice preview textarea's cap, matching the web screen.
+pub const PREVIEW_LIMIT: usize = 500;
 
 // ── Option tables ─────────────────────────────────────────
 // The stored value first, the menu title second. Index in the table is the
@@ -186,6 +189,7 @@ struct Controls {
     tts_voice: Retained<NSComboBox>,
     tts_format: Retained<NSPopUpButton>,
     preview_text: Retained<NSTextField>,
+    voice_status: Retained<NSTextField>,
 
     dictionary: Retained<NSTextView>,
     dictionary_count: Retained<NSTextField>,
@@ -206,6 +210,8 @@ pub struct SettingsIvars {
     /// The event monitor a hotkey field installs while it is listening.
     monitor: RefCell<Option<Retained<AnyObject>>>,
     recording_action: RefCell<Option<String>>,
+    /// The speech request currently previewing, for the Stop button.
+    preview_request: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -270,6 +276,16 @@ define_class!(
         #[unsafe(method(fetchModels:))]
         fn fetch_models(&self, _sender: &NSControl) {
             self.request_models();
+        }
+
+        #[unsafe(method(previewVoice:))]
+        fn preview_voice(&self, _sender: &NSControl) {
+            self.start_preview();
+        }
+
+        #[unsafe(method(stopVoice:))]
+        fn stop_voice(&self, _sender: &NSControl) {
+            self.stop_preview();
         }
 
         #[unsafe(method(clearHistory:))]
@@ -351,6 +367,7 @@ impl SettingsWindow {
             controls,
             monitor: RefCell::new(None),
             recording_action: RefCell::new(None),
+            preview_request: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -467,6 +484,10 @@ impl SettingsWindow {
             _ => return,
         };
         self.ivars().tabs.selectTabViewItemAtIndex(index);
+    }
+
+    pub fn set_voice_status(&self, message: &str) {
+        self.set_text(&self.ivars().controls.voice_status, message);
     }
 
     fn set_text(&self, field: &NSTextField, text: &str) {
@@ -875,6 +896,42 @@ impl SettingsWindow {
             Err(error) => self.set_text(&controls.models_status, error),
         }
     }
+
+    fn start_preview(&self) {
+        let ivars = self.ivars();
+        let text = string_value(&ivars.controls.preview_text);
+        let text: String = text.trim().chars().take(PREVIEW_LIMIT).collect();
+        if text.is_empty() {
+            self.set_voice_status("Type something to preview first.");
+            return;
+        }
+        self.stop_preview();
+
+        let request_id = format!("preview-{}", std::process::id());
+        *ivars.preview_request.borrow_mut() = Some(request_id.clone());
+        self.set_voice_status("Generating...");
+
+        let engine = Arc::clone(&ivars.engine);
+        let request = SpeechRequest {
+            text,
+            model: Some(string_value(&ivars.controls.tts_model).trim().to_string()),
+            voice: Some(string_value(&ivars.controls.tts_voice).trim().to_string()),
+            response_format: Some(
+                selected_value(&ivars.controls.tts_format, TTS_FORMATS).to_string(),
+            ),
+            request_id: Some(request_id),
+        };
+        crate::app::spawn(async move {
+            let _ = engine.stream_speech(request).await;
+        });
+    }
+
+    fn stop_preview(&self) {
+        let ivars = self.ivars();
+        let request = ivars.preview_request.borrow_mut().take();
+        let _ = ivars.engine.cancel_speech(request.as_deref());
+        crate::app::with_app(|app| app.tts().stop());
+    }
 }
 
 // ── Value helpers ─────────────────────────────────────────
@@ -1175,6 +1232,19 @@ fn build_tabs(
     ));
     form.add(&preview_text);
 
+    let c = form.control_only(ROW);
+    let half = NSRect::new(c.origin, NSSize::new(120.0, c.size.height));
+    let play = button(mtm, half, "Preview", 0);
+    form.add(&play);
+    let stop_frame = NSRect::new(
+        NSPoint::new(c.origin.x + 128.0, c.origin.y),
+        NSSize::new(90.0, c.size.height),
+    );
+    let stop = button(mtm, stop_frame, "Stop", 0);
+    form.add(&stop);
+    let n = form.control_only(28.0);
+    let voice_status = note(mtm, "", n);
+    form.add(&voice_status);
     let voice = form.view.clone();
 
     // Privacy
@@ -1247,18 +1317,24 @@ fn build_tabs(
         tts_voice,
         tts_format,
         preview_text,
+        voice_status,
         dictionary,
         dictionary_count,
         save_history,
         retention,
         history_status,
-        actions: vec![fetch, clear],
+        actions: vec![fetch, play, stop, clear],
     };
     (general, providers, voice, privacy, controls)
 }
 
 /// The action buttons, in the order `build_tabs` creates them.
-const ACTION_SELECTORS: [fn() -> Sel; 2] = [|| sel!(fetchModels:), || sel!(clearHistory:)];
+const ACTION_SELECTORS: [fn() -> Sel; 4] = [
+    || sel!(fetchModels:),
+    || sel!(previewVoice:),
+    || sel!(stopVoice:),
+    || sel!(clearHistory:),
+];
 
 /// A switch is 38 px wide whatever the column is; left-align it in the column.
 fn switch_rect(column: NSRect) -> NSRect {

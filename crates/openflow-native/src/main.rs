@@ -22,6 +22,8 @@ mod overlay;
 #[cfg(target_os = "macos")]
 mod tray;
 #[cfg(target_os = "macos")]
+mod tts_player;
+#[cfg(target_os = "macos")]
 mod ui;
 
 #[cfg(target_os = "macos")]

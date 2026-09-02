@@ -16,13 +16,66 @@
 //! queue, return. Every read of the engine happens in the main-queue closure,
 //! after the hop.
 
+use std::sync::{Arc, Mutex};
+
 use dispatch2::DispatchQueue;
 use openflow_core::engine::{EngineEvent, EngineEvents};
 
-pub struct NativeEvents;
+/// Whether a voice preview is still listening for audio.
+///
+/// `speech::stream` stops when a chunk cannot be delivered, which is what keeps
+/// a cancelled preview from downloading a clip nobody will hear. The main-queue
+/// hop is asynchronous, so "delivered" cannot mean "the player has it"; it means
+/// a player for this request id is still open. That is a synchronous read of a
+/// plain mutex, not of the engine, so it is safe inside `emit`.
+#[derive(Default)]
+pub struct PreviewGate {
+    request_id: Mutex<Option<String>>,
+}
+
+impl PreviewGate {
+    /// A preview is starting: from now on chunks carrying this id are wanted.
+    pub fn open(&self, request_id: &str) {
+        if let Ok(mut slot) = self.request_id.lock() {
+            *slot = Some(request_id.to_string());
+        }
+    }
+
+    /// The preview ended, was cancelled, or its playback died.
+    pub fn close(&self) {
+        if let Ok(mut slot) = self.request_id.lock() {
+            *slot = None;
+        }
+    }
+
+    pub fn is_listening(&self, request_id: &str) -> bool {
+        self.request_id
+            .lock()
+            .map(|slot| slot.as_deref() == Some(request_id))
+            .unwrap_or(false)
+    }
+}
+
+pub struct NativeEvents {
+    preview: Arc<PreviewGate>,
+}
+
+impl NativeEvents {
+    pub fn new(preview: Arc<PreviewGate>) -> Self {
+        Self { preview }
+    }
+}
 
 impl EngineEvents for NativeEvents {
     fn emit(&self, event: EngineEvent) -> Result<(), String> {
+        // The one event whose delivery the engine acts on. Refusing here is how
+        // a cancelled preview stops the download.
+        if let EngineEvent::TtsChunk(chunk) = &event {
+            if !self.preview.is_listening(&chunk.request_id) {
+                return Err("The voice preview is no longer listening".to_string());
+            }
+        }
+
         DispatchQueue::main().exec_async(move || {
             crate::app::with_app(|app| app.handle_event(event));
         });

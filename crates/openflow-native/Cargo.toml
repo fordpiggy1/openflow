@@ -37,7 +37,14 @@ dispatch2 = "0.3"
 global-hotkey = { workspace = true }
 tray-icon = "0.23"
 muda = "0.19"
+# Voice preview playback. `wav` for Groq's Orpheus, `mp3` for everything else.
+rodio = { version = "0.22", default-features = false, features = [
+    "playback",
+    "wav",
+    "mp3",
+] }
 # Decoding the embedded tray icon into the RGBA buffer tray-icon wants.
 png = "0.17"
+base64 = { workspace = true }
 # `flock` for the single-instance guard.
 libc = "0.2"

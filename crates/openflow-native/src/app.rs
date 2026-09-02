@@ -28,11 +28,12 @@ use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol};
 
 use openflow_core::engine::{Engine, EngineEvent, EngineEvents, RecordingState, Spawner};
 
-use crate::events::NativeEvents;
+use crate::events::{NativeEvents, PreviewGate};
 use crate::hotkeys::Hotkeys;
 use crate::instance::InstanceLock;
 use crate::overlay::Overlay;
 use crate::tray::Tray;
+use crate::tts_player::TtsPlayer;
 use crate::ui::settings::SettingsWindow;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
@@ -63,6 +64,7 @@ pub struct App {
     overlay: Overlay,
     tray: Tray,
     hotkeys: RefCell<Hotkeys>,
+    tts: TtsPlayer,
     settings: RefCell<Option<Retained<SettingsWindow>>>,
     mtm: MainThreadMarker,
 }
@@ -74,6 +76,10 @@ impl App {
 
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
+    }
+
+    pub fn tts(&self) -> &TtsPlayer {
+        &self.tts
     }
 
     pub fn hotkeys(&self) -> &RefCell<Hotkeys> {
@@ -104,10 +110,10 @@ impl App {
     /// to read the engine back.
     pub fn handle_event(self: &Rc<Self>, event: EngineEvent) {
         match event {
-            // `Formatting` is never emitted by the pipeline; anything that is
-            // not Recording or Transcribing reads as the resting state rather
-            // than a fourth thing to render.
             EngineEvent::RecordingState(state) => {
+                // `Formatting` is never emitted by the pipeline; treat anything
+                // that is not Recording or Transcribing as the resting state
+                // rather than inventing a fourth pill.
                 self.overlay.set_state(state);
                 self.tray.set_status(state);
             }
@@ -126,12 +132,33 @@ impl App {
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
             EngineEvent::HistoryChanged => self.tray.rebuild(&self.engine),
+            EngineEvent::TtsStarted(started) => self.tts.started(&started),
+            EngineEvent::TtsChunk(chunk) => self.tts.chunk(&chunk),
+            EngineEvent::TtsFinished(result) => {
+                self.tts.finished(&result);
+                // A player thread that failed to open the device or decode the
+                // clip has nowhere else to report; surface it here.
+                let message = self
+                    .tts
+                    .last_error()
+                    .unwrap_or_else(|| "Playing the preview.".to_string());
+                if let Some(window) = self.settings.borrow().as_ref() {
+                    window.set_voice_status(&message);
+                }
+            }
+            EngineEvent::TtsError(error) => {
+                self.tts.failed(&error);
+                if let Some(window) = self.settings.borrow().as_ref() {
+                    window.set_voice_status(&error.error);
+                }
+            }
             EngineEvent::Navigate(target) => match target.as_str() {
-                "quit" => NSApplication::sharedApplication(self.mtm).terminate(None),
-                tab => self.show_settings(Some(tab)),
+                "quit" => {
+                    let app = NSApplication::sharedApplication(self.mtm);
+                    app.terminate(None);
+                }
+                other => self.show_settings(Some(other)),
             },
-            // The voice preview lands in the commit that follows.
-            _ => {}
         }
     }
 
@@ -164,7 +191,7 @@ pub fn default_app_dir() -> Result<PathBuf, String> {
 }
 
 /// Build the engine on the process-wide runtime.
-pub fn build_engine(app_dir: PathBuf) -> Result<Arc<Engine>, String> {
+pub fn build_engine(app_dir: PathBuf) -> Result<(Arc<Engine>, Arc<PreviewGate>), String> {
     let runtime = match RUNTIME.get() {
         Some(runtime) => runtime,
         None => {
@@ -180,16 +207,10 @@ pub fn build_engine(app_dir: PathBuf) -> Result<Arc<Engine>, String> {
         handle.spawn(future);
     });
 
-    let events: Arc<dyn EngineEvents> = Arc::new(NativeEvents);
-    Engine::new(app_dir, events, spawn)
-}
-
-/// Run a future on the process runtime. The settings window uses it for the
-/// two calls that are async in core: fetching models and streaming a preview.
-pub fn spawn(future: impl std::future::Future<Output = ()> + Send + 'static) {
-    if let Some(runtime) = RUNTIME.get() {
-        runtime.spawn(future);
-    }
+    let preview = Arc::new(PreviewGate::default());
+    let events: Arc<dyn EngineEvents> = Arc::new(NativeEvents::new(Arc::clone(&preview)));
+    let engine = Engine::new(app_dir, events, spawn)?;
+    Ok((engine, preview))
 }
 
 // ── App delegate ──────────────────────────────────────────
@@ -240,16 +261,19 @@ impl Delegate {
 /// Everything that needs a live engine, in the order the pieces depend on
 /// each other.
 fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
-    let engine = build_engine(app_dir)?;
+    let (engine, _preview) = build_engine(app_dir)?;
+
     let overlay = Overlay::new(&engine, mtm);
     let tray = Tray::new(&engine)?;
     let hotkeys = Hotkeys::new(engine.settings())?;
+    let tts = TtsPlayer::new(_preview);
 
     let app = Rc::new(App {
         engine,
         overlay,
         tray,
         hotkeys: RefCell::new(hotkeys),
+        tts,
         settings: RefCell::new(None),
         mtm,
     });
@@ -274,7 +298,7 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
 /// startup path that reads one.
 fn self_check() -> i32 {
     let dir = std::env::temp_dir().join(format!("openflow-self-check-{}", std::process::id()));
-    let result = build_engine(dir.clone()).and_then(|engine| {
+    let result = build_engine(dir.clone()).and_then(|(engine, _)| {
         let position = engine.settings().overlay_position();
         let record = engine.settings().shortcut("record")?;
         let recopy = engine.settings().shortcut("recopy")?;
@@ -337,4 +361,12 @@ pub fn main() {
 
     ns_app.run();
     drop(lock);
+}
+
+/// Run a future on the process runtime. The settings window uses it for the
+/// two calls that are async in core: fetching models and streaming a preview.
+pub fn spawn(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    if let Some(runtime) = RUNTIME.get() {
+        runtime.spawn(future);
+    }
 }
