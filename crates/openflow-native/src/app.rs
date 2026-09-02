@@ -31,6 +31,7 @@ use openflow_core::engine::{Engine, EngineEvent, EngineEvents, RecordingState, S
 use crate::events::NativeEvents;
 use crate::hotkeys::Hotkeys;
 use crate::instance::InstanceLock;
+use crate::overlay::Overlay;
 use crate::tray::Tray;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
@@ -58,6 +59,7 @@ pub fn with_app<R>(body: impl FnOnce(&Rc<App>) -> R) -> Option<R> {
 /// Everything the main thread owns.
 pub struct App {
     engine: Arc<Engine>,
+    overlay: Overlay,
     tray: Tray,
     hotkeys: RefCell<Hotkeys>,
     mtm: MainThreadMarker,
@@ -80,7 +82,10 @@ impl App {
             // `Formatting` is never emitted by the pipeline; anything that is
             // not Recording or Transcribing reads as the resting state rather
             // than a fourth thing to render.
-            EngineEvent::RecordingState(state) => self.tray.set_status(state),
+            EngineEvent::RecordingState(state) => {
+                self.overlay.set_state(state);
+                self.tray.set_status(state);
+            }
             EngineEvent::TranscriptionResult(transcription) => {
                 let text = transcription
                     .formatted_text
@@ -91,6 +96,7 @@ impl App {
             EngineEvent::TranscriptionWarning(warning) => self.notify("OpenFlow", &warning),
             EngineEvent::TranscriptionError(error) => {
                 self.notify("OpenFlow could not finish", &error);
+                self.overlay.set_state(RecordingState::Idle);
                 self.tray.set_status(RecordingState::Idle);
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
@@ -98,8 +104,8 @@ impl App {
             EngineEvent::Navigate(target) if target == "quit" => {
                 NSApplication::sharedApplication(self.mtm).terminate(None);
             }
-            // The overlay pill and the settings window land in the commits that
-            // follow; until then a Navigate to a tab has nowhere to go.
+            // The settings window lands in the commit that follows; until then
+            // a Navigate to a tab has nowhere to go.
             _ => {}
         }
     }
@@ -194,21 +200,25 @@ impl Delegate {
 /// each other.
 fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     let engine = build_engine(app_dir)?;
+    let overlay = Overlay::new(&engine, mtm);
     let tray = Tray::new(&engine)?;
     let hotkeys = Hotkeys::new(engine.settings())?;
 
     let app = Rc::new(App {
         engine,
+        overlay,
         tray,
         hotkeys: RefCell::new(hotkeys),
         mtm,
     });
-    APP.with(|slot| *slot.borrow_mut() = Some(app));
+    APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
 
     // The handlers are installed only once the app exists, so a hotkey or menu
     // click during startup cannot reach a half-built state.
     crate::hotkeys::install_handler();
     crate::tray::install_handler();
+
+    app.overlay.apply_visibility_setting();
     Ok(())
 }
 

@@ -18,7 +18,11 @@ mod hotkeys;
 #[cfg(target_os = "macos")]
 mod instance;
 #[cfg(target_os = "macos")]
+mod overlay;
+#[cfg(target_os = "macos")]
 mod tray;
+#[cfg(target_os = "macos")]
+mod ui;
 
 #[cfg(target_os = "macos")]
 mod app;
