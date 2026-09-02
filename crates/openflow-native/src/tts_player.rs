@@ -18,17 +18,13 @@
 use std::cell::RefCell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use openflow_core::speech::{SpeechChunk, SpeechError, SpeechResult, SpeechStarted};
 
 use crate::events::PreviewGate;
-
-/// Chunks queued ahead of the decoder before the sender blocks. The engine is
-/// on a tokio worker, so blocking it briefly is back-pressure, not a stall.
-const QUEUE_DEPTH: usize = 64;
 
 /// A `Read + Seek` view over bytes that are still arriving.
 ///
@@ -120,7 +116,14 @@ struct Playback {
     request_id: String,
     /// `None` once the stream has ended: dropping the sender is the reader's
     /// end-of-file.
-    chunks: Option<SyncSender<Vec<u8>>>,
+    ///
+    /// Unbounded on purpose. `chunk` runs on the main thread and the receiver
+    /// is drained by the decoder at playback speed, so a bounded channel would
+    /// block the whole UI -- no redraw, no menu, no hotkey -- for as long as
+    /// the download outran the speaker. `StreamBuffer` keeps every byte it is
+    /// sent anyway, so a queue depth bought no memory either; the ceiling is
+    /// `MAX_SPEECH_BYTES` in core, which is what actually bounds a clip.
+    chunks: Option<Sender<Vec<u8>>>,
     /// Set for a WAV preview, which plays only when the download completes.
     buffered: Option<Vec<u8>>,
     cancelled: Arc<AtomicBool>,
@@ -147,11 +150,30 @@ impl TtsPlayer {
         self.last_error.lock().ok().and_then(|slot| slot.clone())
     }
 
-    /// A stream is starting. Opens the gate so chunks are accepted, and for a
-    /// streamable container starts the decoder straight away.
+    /// Arm the gate for a preview that is about to be requested.
+    ///
+    /// This runs *before* the stream is spawned, and it has to: `speech::stream`
+    /// emits `TtsStarted` and then the first chunk from a tokio worker, while
+    /// this host only learns about `TtsStarted` after a main-queue hop. Opening
+    /// the gate in `started` would lose that race whenever the first chunk
+    /// arrives before the hop runs -- a local TTS endpoint, or a busy main
+    /// thread -- and `emit` would refuse the chunk, killing the stream with
+    /// "Could not deliver speech audio".
+    pub fn arm(&self, request_id: &str) {
+        self.stop_playback();
+        self.preview.open(request_id);
+    }
+
+    /// A stream is starting. For a streamable container the decoder starts
+    /// straight away.
     pub fn started(&self, started: &SpeechStarted) {
-        self.stop();
-        self.preview.open(&started.request_id);
+        // Tear down any previous player, but never the gate: `arm` already
+        // opened it for this request, and closing it here would drop the chunks
+        // that are already in flight behind this event.
+        if !self.preview.is_listening(&started.request_id) {
+            self.stop_playback();
+            self.preview.open(&started.request_id);
+        }
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = None;
         }
@@ -161,7 +183,7 @@ impl TtsPlayer {
         let chunks = if buffered_only {
             None
         } else {
-            let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
+            let (sender, receiver) = channel::<Vec<u8>>();
             let reader = StreamBuffer::new(receiver, Arc::clone(&cancelled));
             spawn_player(reader, Arc::clone(&cancelled), Arc::clone(&self.last_error));
             Some(sender)
@@ -229,11 +251,17 @@ impl TtsPlayer {
 
     /// Stop whatever is playing and stop accepting audio for it.
     pub fn stop(&self) {
+        self.stop_playback();
+        self.preview.close();
+    }
+
+    /// Stop the player without touching the gate, for the paths that are about
+    /// to open it again for a new request.
+    fn stop_playback(&self) {
         if let Some(playback) = self.playback.borrow_mut().take() {
             playback.cancelled.store(true, Ordering::SeqCst);
             drop(playback.chunks);
         }
-        self.preview.close();
     }
 }
 
@@ -275,7 +303,7 @@ mod tests {
     use super::*;
 
     fn buffer_from(chunks: Vec<&'static [u8]>) -> (StreamBuffer, std::thread::JoinHandle<()>) {
-        let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
+        let (sender, receiver) = channel::<Vec<u8>>();
         let cancelled = Arc::new(AtomicBool::new(false));
         let feeder = std::thread::spawn(move || {
             for chunk in chunks {
@@ -324,7 +352,7 @@ mod tests {
     /// come, or the player thread would live for the life of the process.
     #[test]
     fn cancelling_ends_the_stream_for_the_reader() {
-        let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
+        let (sender, receiver) = channel::<Vec<u8>>();
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut buffer = StreamBuffer::new(receiver, Arc::clone(&cancelled));
         sender.send(b"abc".to_vec()).expect("first chunk");
@@ -340,6 +368,43 @@ mod tests {
             "a cancelled stream must report end-of-file, not wait"
         );
         drop(sender);
+    }
+
+    /// The whole point of arming the gate before the stream starts is that
+    /// `TtsStarted` must not close it again: the first chunk can overtake the
+    /// main-queue hop, and a gate that closed and reopened would refuse it.
+    #[test]
+    fn started_does_not_close_a_gate_already_armed_for_the_same_request() {
+        let gate = Arc::new(PreviewGate::default());
+        let player = TtsPlayer::new(Arc::clone(&gate));
+
+        player.arm("preview-1");
+        assert!(gate.is_listening("preview-1"), "arming opens the gate");
+
+        // WAV, so no audio device is opened: buffered playback starts only on
+        // `finished`, which keeps this test off the machine's speakers.
+        player.started(&SpeechStarted {
+            request_id: "preview-1".to_string(),
+            model: "orpheus".to_string(),
+            format: "wav".to_string(),
+        });
+        assert!(
+            gate.is_listening("preview-1"),
+            "the gate must still be open after the event it was armed for"
+        );
+
+        // A stream this host never armed still opens the gate for itself,
+        // rather than dropping audio nobody asked it to refuse.
+        player.started(&SpeechStarted {
+            request_id: "preview-2".to_string(),
+            model: "orpheus".to_string(),
+            format: "wav".to_string(),
+        });
+        assert!(!gate.is_listening("preview-1"));
+        assert!(gate.is_listening("preview-2"));
+
+        player.stop();
+        assert!(!gate.is_listening("preview-2"));
     }
 
     /// The gate is what tells the engine to stop downloading. Closing it has to

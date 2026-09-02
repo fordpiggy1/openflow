@@ -230,19 +230,39 @@ define_class!(
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             self.stop_recording_hotkey();
+            // Resigning first responder ends editing, which is what commits a
+            // key or a URL the user typed and never tabbed out of.
+            self.ivars().window.makeFirstResponder(None);
             self.ivars().window.orderOut(None);
             false
         }
     }
 
     unsafe impl NSControlTextEditingDelegate for SettingsWindow {
+        /// Live autosave, for the fields where a write is a row in SQLite.
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, notification: &NSNotification) {
-            let Some(object) = ({ notification.object() }) else {
+            let Some(tag) = notified_tag(notification) else {
                 return;
             };
-            let tag: isize = unsafe { msg_send![&*object, tag] };
-            self.write(tag);
+            if !writes_on_end_editing(tag) {
+                self.write(tag);
+            }
+        }
+
+        /// Deferred autosave, for the fields where a write is a keychain item
+        /// or an endpoint URL. Writing those per keystroke meant one keychain
+        /// round trip per character typed into a key, and a delete the moment
+        /// the field was momentarily empty; a half-typed URL is not an endpoint
+        /// worth saving either.
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn control_text_did_end_editing(&self, notification: &NSNotification) {
+            let Some(tag) = notified_tag(notification) else {
+                return;
+            };
+            if writes_on_end_editing(tag) {
+                self.write(tag);
+            }
         }
     }
 
@@ -794,6 +814,9 @@ impl SettingsWindow {
         self.stop_recording_hotkey();
         let ivars = self.ivars();
         *ivars.recording_action.borrow_mut() = Some(action.to_string());
+        // Take the current chord off the system first, or pressing it to
+        // re-record it starts a capture instead of reaching the monitor.
+        crate::app::with_app(|app| app.hotkeys().borrow_mut().suspend(action));
         let field = self.field_for(action);
         field.setTitle(&NSString::from_str("Press a shortcut..."));
 
@@ -851,6 +874,9 @@ impl SettingsWindow {
         if let Some(monitor) = ivars.monitor.borrow_mut().take() {
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
+        // Put the suspended chord back before any rebind: `rebind` releases the
+        // old registration itself, and it has to be there to release.
+        crate::app::with_app(|app| app.hotkeys().borrow_mut().resume());
         if let Some(action) = ivars.recording_action.borrow_mut().take() {
             let current = binding_text(ivars.engine.settings(), &action);
             self.field_for(&action)
@@ -914,9 +940,18 @@ impl SettingsWindow {
         }
         self.stop_preview();
 
-        let request_id = format!("preview-{}", std::process::id());
+        // A fresh id per preview. Reusing one raced `speech::stream`'s job
+        // table: a cancelled request is only removed once its task unwinds, so
+        // Preview pressed twice in a row was refused as "already running".
+        let request_id = format!("preview-{}", uuid::Uuid::new_v4());
         *ivars.preview_request.borrow_mut() = Some(request_id.clone());
         self.set_voice_status("Generating...");
+
+        // Arm the gate before the stream exists. `speech::stream` emits the
+        // first chunk from a tokio worker, and this host only sees `TtsStarted`
+        // after a main-queue hop; opening the gate on that event would refuse
+        // any chunk that overtook it.
+        crate::app::with_app(|app| app.tts().arm(&request_id));
 
         let engine = Arc::clone(&ivars.engine);
         let request = SpeechRequest {
@@ -926,11 +961,28 @@ impl SettingsWindow {
             response_format: Some(
                 selected_value(&ivars.controls.tts_format, TTS_FORMATS).to_string(),
             ),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
         };
         crate::app::spawn(async move {
-            let _ = engine.stream_speech(request).await;
+            // Failures before `TtsStarted` -- a bad key, an unreachable
+            // endpoint, a colliding id -- never reach the event sink, so
+            // without this the status line reads "Generating..." forever.
+            if let Err(error) = engine.stream_speech(request).await {
+                crate::events::on_main(move || {
+                    crate::app::with_app(|app| {
+                        app.with_settings(|window| window.set_voice_status_for(&request_id, &error))
+                    });
+                });
+            }
         });
+    }
+
+    /// Set the voice status only while `request_id` is still the preview on
+    /// screen, so a stale failure cannot overwrite a newer "Generating...".
+    fn set_voice_status_for(&self, request_id: &str, message: &str) {
+        if self.ivars().preview_request.borrow().as_deref() == Some(request_id) {
+            self.set_voice_status(message);
+        }
     }
 
     fn stop_preview(&self) {
@@ -942,6 +994,28 @@ impl SettingsWindow {
 }
 
 // ── Value helpers ─────────────────────────────────────────
+
+/// The tag on the control a text-editing notification came from.
+fn notified_tag(notification: &NSNotification) -> Option<isize> {
+    let object = notification.object()?;
+    // SAFETY: every control this object is the delegate of is an `NSControl`,
+    // and `tag` is declared on `NSView`.
+    Some(unsafe { msg_send![&*object, tag] })
+}
+
+/// Whether a field's value is committed when editing ends rather than on every
+/// keystroke: the three keychain slots and the three endpoint URLs.
+fn writes_on_end_editing(tag: isize) -> bool {
+    matches!(
+        tag,
+        TAG_API_KEY
+            | TAG_FORMATTING_KEY
+            | TAG_TTS_KEY
+            | TAG_PROVIDER_URL
+            | TAG_FORMATTING_URL
+            | TAG_TTS_URL
+    )
+}
 
 /// The binding for `action` as the recorder spells it.
 fn binding_text(settings: &openflow_core::settings::Settings, action: &str) -> String {
@@ -1417,6 +1491,35 @@ mod tests {
         }
         assert_eq!(options[3].0, "left-center");
         assert_eq!(options[3].1, "Left Center");
+    }
+
+    /// A keystroke in a key field must not reach the keychain, and a keystroke
+    /// in a URL field must not save half an endpoint. Everything else stays on
+    /// the live path, or the window stops feeling like autosave.
+    #[test]
+    fn only_credentials_and_endpoints_wait_for_editing_to_end() {
+        for tag in [
+            TAG_API_KEY,
+            TAG_FORMATTING_KEY,
+            TAG_TTS_KEY,
+            TAG_PROVIDER_URL,
+            TAG_FORMATTING_URL,
+            TAG_TTS_URL,
+        ] {
+            assert!(writes_on_end_editing(tag), "tag {tag} should be deferred");
+        }
+        for tag in [
+            TAG_STT_MODEL,
+            TAG_CHAT_MODEL,
+            TAG_TTS_MODEL,
+            TAG_TTS_VOICE,
+            TAG_MICROPHONE,
+            TAG_THEME,
+            TAG_RETENTION,
+            0,
+        ] {
+            assert!(!writes_on_end_editing(tag), "tag {tag} should be live");
+        }
     }
 
     /// The two boolean spellings the settings table understands.

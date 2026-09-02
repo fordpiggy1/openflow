@@ -147,6 +147,8 @@ bash scripts/bundle-native.sh
 
 The cargo target is `openflow-native` because `src-tauri` already builds a bin called `openflow`; inside the bundle the executable is `Contents/MacOS/openflow`, and the suffix goes away when `src-tauri` is retired.
 
+The first launch raises a keychain prompt for each saved API key. That is expected: the keychain items were created by the Tauri build, under its code signature, and macOS asks before letting a differently signed binary read them. Choose Always Allow to be asked once rather than once per launch.
+
 Launch it with `open -a target/OpenFlow.app`, not from a shell. macOS binds microphone and accessibility grants to the *code signature* of whatever asked, and a binary started from a terminal inherits the terminal's identity, so the grant lands on the terminal and the app appears to have been refused. The ad hoc signature the bundle script applies also changes on every rebuild, so expect to grant microphone access again after each one until a stable signing identity lands in Milestone C.
 
 ## How dictation works

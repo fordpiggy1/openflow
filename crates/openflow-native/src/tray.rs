@@ -47,11 +47,15 @@ pub fn status_line(state: RecordingState) -> &'static str {
 pub struct Tray {
     icon: TrayIcon,
     status: RefCell<RecordingState>,
+    /// The disabled first line. Retained so a state change can retitle it
+    /// instead of rebuilding the menu, which costs a history query and ~25
+    /// items on the main thread three times per dictation.
+    status_item: RefCell<MenuItem>,
 }
 
 impl Tray {
     pub fn new(engine: &Arc<Engine>) -> Result<Self, String> {
-        let menu = build_menu(engine, RecordingState::Idle)?;
+        let (menu, status_item) = build_menu(engine, RecordingState::Idle)?;
         let icon = TrayIconBuilder::new()
             .with_id("main_tray")
             .with_menu(Box::new(menu))
@@ -64,6 +68,7 @@ impl Tray {
         Ok(Self {
             icon,
             status: RefCell::new(RecordingState::Idle),
+            status_item: RefCell::new(status_item),
         })
     }
 
@@ -73,36 +78,35 @@ impl Tray {
         }
         *self.status.borrow_mut() = state;
         let _ = self.icon.set_tooltip(Some(status_line(state)));
-        crate::app::with_app(|app| self.rebuild(app.engine()));
+        self.status_item.borrow().set_text(status_line(state));
     }
 
     pub fn set_tooltip(&self, text: &str) {
         let _ = self.icon.set_tooltip(Some(text));
     }
 
-    /// Rebuild the whole menu. Called when history changes and when the status
-    /// line changes, which is the only state the menu carries.
+    /// Rebuild the whole menu. Only the recents can change shape, so this runs
+    /// on `HistoryChanged` and nowhere else.
     pub fn rebuild(&self, engine: &Arc<Engine>) {
         let state = *self.status.borrow();
-        if let Ok(menu) = build_menu(engine, state) {
+        if let Ok((menu, status_item)) = build_menu(engine, state) {
             self.icon.set_menu(Some(Box::new(menu)));
+            *self.status_item.borrow_mut() = status_item;
         }
     }
 }
 
-fn build_menu(engine: &Arc<Engine>, state: RecordingState) -> Result<Menu, String> {
+/// Build the menu, handing back the status line so the caller can retitle it
+/// without rebuilding.
+fn build_menu(engine: &Arc<Engine>, state: RecordingState) -> Result<(Menu, MenuItem), String> {
     let menu = Menu::new();
     let append = |item: &dyn muda::IsMenuItem| -> Result<(), String> {
         menu.append(item)
             .map_err(|error| format!("Could not build the menu: {}", error))
     };
 
-    append(&MenuItem::with_id(
-        MenuId::new("_status"),
-        status_line(state),
-        false,
-        None,
-    ))?;
+    let status_item = MenuItem::with_id(MenuId::new("_status"), status_line(state), false, None);
+    append(&status_item)?;
 
     let recents = engine.history(RECENTS).unwrap_or_default();
     if !recents.is_empty() {
@@ -141,7 +145,7 @@ fn build_menu(engine: &Arc<Engine>, state: RecordingState) -> Result<Menu, Strin
     ))?;
     append(&PredefinedMenuItem::separator())?;
     append(&MenuItem::with_id(MenuId::new(ID_QUIT), "Quit", true, None))?;
-    Ok(menu)
+    Ok((menu, status_item))
 }
 
 /// The same 22 px template icon the Tauri tray uses, decoded to the RGBA buffer
@@ -171,8 +175,10 @@ pub fn install_handler() {
         let id = event.id().as_ref().to_string();
         crate::events::on_main(move || {
             crate::app::with_app(|app| match id.as_str() {
-                ID_SETTINGS => app.handle_event(EngineEvent::Navigate("Providers".to_string())),
-                ID_HISTORY => app.handle_event(EngineEvent::Navigate("Privacy".to_string())),
+                // No tab: the window reopens where the user left it. The
+                // History item is disabled until Milestone B builds that
+                // window, and deliberately routes nowhere in the meantime.
+                ID_SETTINGS => app.handle_event(EngineEvent::Navigate("settings".to_string())),
                 ID_QUIT => app.handle_event(EngineEvent::Navigate("quit".to_string())),
                 other => {
                     if let Some(row) = other.strip_prefix(RECENT_PREFIX) {

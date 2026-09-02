@@ -20,7 +20,7 @@ use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSPanel, NSScreen, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSTimer};
+use objc2_foundation::{NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSTimer};
 
 use openflow_core::engine::{Engine, RecordingState};
 
@@ -616,9 +616,15 @@ impl Overlay {
             ivars.elapsed.set(ivars.elapsed.get() + 1.0 / 30.0);
             view.setNeedsDisplay(true);
         });
-        let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0 / 30.0, true, &block)
-        };
+        // Built unscheduled and added in the common modes, not scheduled in the
+        // default mode: a timer in the default mode alone stops firing while a
+        // menu is tracking, so opening the menu bar item mid-recording froze
+        // the waveform until the menu closed.
+        let timer =
+            unsafe { NSTimer::timerWithTimeInterval_repeats_block(1.0 / 30.0, true, &block) };
+        unsafe {
+            NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+        }
         *self.timer.borrow_mut() = Some(timer);
     }
 

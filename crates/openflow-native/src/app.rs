@@ -29,7 +29,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol};
 
-use openflow_core::engine::{Engine, EngineEvent, EngineEvents, RecordingState, Spawner};
+use openflow_core::engine::{Engine, EngineEvent, EngineEvents, Spawner};
 
 use crate::events::{NativeEvents, PreviewGate};
 use crate::hotkeys::Hotkeys;
@@ -98,9 +98,17 @@ impl App {
     }
 
     /// Show the settings window, building it on first use, and select `tab`.
+    /// `None` leaves the window on whichever tab the user left it.
     pub fn show_settings(self: &Rc<Self>, tab: Option<&str>) {
-        let mut slot = self.settings.borrow_mut();
-        let window = slot.get_or_insert_with(|| SettingsWindow::new(self, self.mtm));
+        // The borrow ends before the window is touched. Building, reloading and
+        // presenting all run AppKit code that can call back in here, and a
+        // `borrow_mut` held across any of it is a panic waiting for the first
+        // callback that wants the window.
+        let window = {
+            let mut slot = self.settings.borrow_mut();
+            slot.get_or_insert_with(|| SettingsWindow::new(self, self.mtm))
+                .clone()
+        };
         if let Some(tab) = tab {
             window.select_tab(tab);
         }
@@ -128,10 +136,13 @@ impl App {
                 self.notify("OpenFlow", &first_line(text));
             }
             EngineEvent::TranscriptionWarning(warning) => self.notify("OpenFlow", &warning),
+            // Report it and stop there. The engine decides when the pill rests,
+            // through `emit_idle_if_quiescent`, which only says "idle" once no
+            // capture is running and no job is left. Forcing idle here would
+            // blank the pill mid-recording whenever a previous take failed
+            // while the user was already holding the key down again.
             EngineEvent::TranscriptionError(error) => {
-                self.notify("OpenFlow could not finish", &error);
-                self.overlay.set_state(RecordingState::Idle);
-                self.tray.set_status(RecordingState::Idle);
+                self.notify("OpenFlow could not finish", &error)
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
             EngineEvent::HistoryChanged => self.tray.rebuild(&self.engine),
@@ -160,7 +171,10 @@ impl App {
                     let app = NSApplication::sharedApplication(self.mtm);
                     app.terminate(None);
                 }
-                other => self.show_settings(Some(other)),
+                // The menu bar's Settings item names no tab, so the window
+                // reopens where the user left it.
+                "settings" => self.show_settings(None),
+                tab => self.show_settings(Some(tab)),
             },
         }
     }

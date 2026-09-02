@@ -46,5 +46,8 @@ rodio = { version = "0.22", default-features = false, features = [
 # Decoding the embedded tray icon into the RGBA buffer tray-icon wants.
 png = "0.17"
 base64 = { workspace = true }
+# One id per voice preview. Reusing one made a second Preview collide with the
+# first inside `speech::stream`'s job table.
+uuid = { workspace = true }
 # `flock` for the single-instance guard.
 libc = "0.2"

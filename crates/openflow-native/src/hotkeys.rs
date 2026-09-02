@@ -20,6 +20,10 @@ pub struct Hotkeys {
     manager: GlobalHotKeyManager,
     record: Option<HotKey>,
     recopy: Option<HotKey>,
+    /// The binding a hotkey recorder has temporarily taken off the system, so
+    /// pressing it types a chord instead of starting a capture. At most one,
+    /// because only one recorder can be listening.
+    suspended: Option<(String, HotKey)>,
 }
 
 impl Hotkeys {
@@ -33,6 +37,7 @@ impl Hotkeys {
             manager,
             record: None,
             recopy: None,
+            suspended: None,
         };
         for action in ACTIONS {
             let shortcut = settings.shortcut(action)?;
@@ -60,6 +65,34 @@ impl Hotkeys {
             "record" => self.record,
             "recopy" => self.recopy,
             _ => None,
+        }
+    }
+
+    /// Release `action`'s chord while a recorder is listening for it.
+    ///
+    /// Without this, pressing the current record shortcut to re-record it would
+    /// start a capture instead: the global registration wins, and the local
+    /// event monitor never sees the key. The binding is remembered, not
+    /// forgotten, and [`Self::resume`] puts it back.
+    pub fn suspend(&mut self, action: &str) {
+        self.resume();
+        let Some(shortcut) = self.current(action) else {
+            return;
+        };
+        if self.manager.unregister(shortcut).is_ok() {
+            self.suspended = Some((action.to_string(), shortcut));
+        }
+    }
+
+    /// Put back whatever [`Self::suspend`] took, if anything. A chord another
+    /// app grabbed in the meantime leaves the action unbound rather than
+    /// leaving the table claiming a registration that does not exist.
+    pub fn resume(&mut self) {
+        let Some((action, shortcut)) = self.suspended.take() else {
+            return;
+        };
+        if self.manager.register(shortcut).is_err() {
+            self.remember(&action, None);
         }
     }
 
