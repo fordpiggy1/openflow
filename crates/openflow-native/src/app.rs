@@ -33,6 +33,7 @@ use crate::hotkeys::Hotkeys;
 use crate::instance::InstanceLock;
 use crate::overlay::Overlay;
 use crate::tray::Tray;
+use crate::ui::settings::SettingsWindow;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
 /// one set of keychain items.
@@ -62,6 +63,7 @@ pub struct App {
     overlay: Overlay,
     tray: Tray,
     hotkeys: RefCell<Hotkeys>,
+    settings: RefCell<Option<Retained<SettingsWindow>>>,
     mtm: MainThreadMarker,
 }
 
@@ -70,8 +72,31 @@ impl App {
         &self.engine
     }
 
+    pub fn overlay(&self) -> &Overlay {
+        &self.overlay
+    }
+
     pub fn hotkeys(&self) -> &RefCell<Hotkeys> {
         &self.hotkeys
+    }
+
+    /// Run `body` against the settings window if it has been built. Nothing to
+    /// do when it has not: whatever the result was, `reload` will read it back
+    /// the next time the window opens.
+    pub fn with_settings<R>(&self, body: impl FnOnce(&SettingsWindow) -> R) -> Option<R> {
+        let window = self.settings.borrow().clone();
+        window.as_deref().map(body)
+    }
+
+    /// Show the settings window, building it on first use, and select `tab`.
+    pub fn show_settings(self: &Rc<Self>, tab: Option<&str>) {
+        let mut slot = self.settings.borrow_mut();
+        let window = slot.get_or_insert_with(|| SettingsWindow::new(self, self.mtm));
+        if let Some(tab) = tab {
+            window.select_tab(tab);
+        }
+        window.reload();
+        window.present();
     }
 
     /// Apply one engine event. Always called on the main thread, after the
@@ -101,11 +126,11 @@ impl App {
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
             EngineEvent::HistoryChanged => self.tray.rebuild(&self.engine),
-            EngineEvent::Navigate(target) if target == "quit" => {
-                NSApplication::sharedApplication(self.mtm).terminate(None);
-            }
-            // The settings window lands in the commit that follows; until then
-            // a Navigate to a tab has nowhere to go.
+            EngineEvent::Navigate(target) => match target.as_str() {
+                "quit" => NSApplication::sharedApplication(self.mtm).terminate(None),
+                tab => self.show_settings(Some(tab)),
+            },
+            // The voice preview lands in the commit that follows.
             _ => {}
         }
     }
@@ -159,6 +184,14 @@ pub fn build_engine(app_dir: PathBuf) -> Result<Arc<Engine>, String> {
     Engine::new(app_dir, events, spawn)
 }
 
+/// Run a future on the process runtime. The settings window uses it for the
+/// two calls that are async in core: fetching models and streaming a preview.
+pub fn spawn(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    if let Some(runtime) = RUNTIME.get() {
+        runtime.spawn(future);
+    }
+}
+
 // ── App delegate ──────────────────────────────────────────
 
 pub struct DelegateIvars {
@@ -186,6 +219,14 @@ define_class!(
                 NSApplication::sharedApplication(mtm).terminate(None);
             }
         }
+
+        /// Clicking the app in the Dock or Launchpad on an accessory app lands
+        /// here; the Tauri build opens its window on the same signal.
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn should_handle_reopen(&self, _sender: &NSApplication, _has_visible: bool) -> bool {
+            with_app(|app| app.show_settings(None));
+            true
+        }
     }
 );
 
@@ -209,6 +250,7 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         overlay,
         tray,
         hotkeys: RefCell::new(hotkeys),
+        settings: RefCell::new(None),
         mtm,
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
@@ -219,6 +261,10 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     crate::tray::install_handler();
 
     app.overlay.apply_visibility_setting();
+    // A fresh install has no provider saved, and setup is what it needs first.
+    if !app.engine.settings().onboarding_complete() {
+        app.show_settings(Some("Providers"));
+    }
     Ok(())
 }
 

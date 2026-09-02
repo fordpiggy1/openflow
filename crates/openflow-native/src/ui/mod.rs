@@ -1,15 +1,234 @@
-//! Shared AppKit helpers.
+//! Stock AppKit controls, laid out by hand.
+//!
+//! No auto layout: every window here is a fixed size with a two-column form, so
+//! frames are shorter to read than constraints and there is nothing to solve at
+//! run time.
+
+pub mod settings;
+
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{
+    NSAnimationContext, NSBezelStyle, NSButton, NSComboBox, NSControl, NSFont, NSPopUpButton,
+    NSScrollView, NSSecureTextField, NSSwitch, NSTextAlignment, NSTextField, NSTextView, NSView,
+};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+/// Height of one form row.
+pub const ROW: f64 = 24.0;
+/// Vertical gap between rows.
+pub const GAP: f64 = 10.0;
+/// Width of the label column.
+pub const LABEL_WIDTH: f64 = 132.0;
+/// Where the control column starts.
+pub const CONTROL_X: f64 = LABEL_WIDTH + 10.0;
 
 /// Run `body` inside an animation group of `duration` seconds. Unlike
 /// `setFrame:display:animate:` this does not block the main thread, which
 /// matters because the hotkey path runs on it.
 pub fn animate(duration: f64, body: impl Fn()) {
-    let block = block2::RcBlock::new(
-        move |context: core::ptr::NonNull<objc2_app_kit::NSAnimationContext>| {
-            // SAFETY: AppKit hands us a live context for the duration of the block.
-            unsafe { context.as_ref() }.setDuration(duration);
-            body();
-        },
+    let block = block2::RcBlock::new(move |context: core::ptr::NonNull<NSAnimationContext>| {
+        // SAFETY: AppKit hands us a live context for the duration of the block.
+        unsafe { context.as_ref() }.setDuration(duration);
+        body();
+    });
+    NSAnimationContext::runAnimationGroup(&block);
+}
+
+/// A top-down cursor over a form's content view.
+pub struct Form {
+    pub view: Retained<NSView>,
+    y: f64,
+    width: f64,
+}
+
+impl Form {
+    pub fn new(mtm: MainThreadMarker, width: f64, height: f64) -> Self {
+        let view = {
+            NSView::initWithFrame(
+                NSView::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
+            )
+        };
+        Self {
+            view,
+            y: height - 18.0,
+            width,
+        }
+    }
+
+    /// A labelled row: the label frame and the control frame beside it.
+    pub fn row(&mut self, height: f64) -> (NSRect, NSRect) {
+        self.y -= height;
+        let label = NSRect::new(
+            NSPoint::new(0.0, self.y + (height - 17.0) / 2.0),
+            NSSize::new(LABEL_WIDTH, 17.0),
+        );
+        let control = NSRect::new(
+            NSPoint::new(CONTROL_X, self.y),
+            NSSize::new(self.width - CONTROL_X, height),
+        );
+        self.y -= GAP;
+        (label, control)
+    }
+
+    /// A row with no label column, spanning the whole width.
+    pub fn full(&mut self, height: f64) -> NSRect {
+        self.y -= height;
+        let frame = NSRect::new(NSPoint::new(0.0, self.y), NSSize::new(self.width, height));
+        self.y -= GAP;
+        frame
+    }
+
+    /// A control column row with nothing in the label column, for a button or a
+    /// status line that belongs to the row above it.
+    pub fn control_only(&mut self, height: f64) -> NSRect {
+        self.y -= height;
+        let frame = NSRect::new(
+            NSPoint::new(CONTROL_X, self.y),
+            NSSize::new(self.width - CONTROL_X, height),
+        );
+        self.y -= GAP;
+        frame
+    }
+
+    pub fn add(&self, view: &NSView) {
+        self.view.addSubview(view);
+    }
+}
+
+pub fn label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
+    let field = { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
+    {
+        field.setFrame(frame);
+        field.setAlignment(NSTextAlignment::Right);
+        field.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+    }
+    field
+}
+
+/// A muted line of explanatory text under a control.
+pub fn note(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
+    let field = { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
+    {
+        field.setFrame(frame);
+        field.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        field.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+    }
+    field
+}
+
+pub fn text_field(mtm: MainThreadMarker, frame: NSRect, tag: isize) -> Retained<NSTextField> {
+    let field = { NSTextField::initWithFrame(NSTextField::alloc(mtm), frame) };
+    {
+        field.setTag(tag);
+        field.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+    }
+    field
+}
+
+pub fn secure_field(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    tag: isize,
+) -> Retained<NSSecureTextField> {
+    let field = { NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame) };
+    {
+        field.setTag(tag);
+        field.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+    }
+    field
+}
+
+pub fn popup(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    tag: isize,
+    titles: &[&str],
+) -> Retained<NSPopUpButton> {
+    let button =
+        { NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), frame, false) };
+    {
+        button.setTag(tag);
+        button.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        for title in titles {
+            button.addItemWithTitle(&NSString::from_str(title));
+        }
+    }
+    button
+}
+
+/// An editable popup: the fetched models are offered, but any model id can be
+/// typed, which is what the web settings screen allows.
+pub fn combo(mtm: MainThreadMarker, frame: NSRect, tag: isize) -> Retained<NSComboBox> {
+    let box_ = { NSComboBox::initWithFrame(NSComboBox::alloc(mtm), frame) };
+    {
+        box_.setTag(tag);
+        box_.setCompletes(true);
+        box_.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+    }
+    box_
+}
+
+pub fn switch_control(mtm: MainThreadMarker, frame: NSRect, tag: isize) -> Retained<NSSwitch> {
+    let switch = { NSSwitch::initWithFrame(NSSwitch::alloc(mtm), frame) };
+    switch.setTag(tag);
+    switch
+}
+
+pub fn button(mtm: MainThreadMarker, frame: NSRect, title: &str, tag: isize) -> Retained<NSButton> {
+    let button = { NSButton::initWithFrame(NSButton::alloc(mtm), frame) };
+    {
+        button.setTitle(&NSString::from_str(title));
+        button.setBezelStyle(NSBezelStyle::Push);
+        button.setTag(tag);
+        button.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+    }
+    button
+}
+
+/// A scrollable text view, for the dictionary.
+pub fn text_view(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+) -> (Retained<NSScrollView>, Retained<NSTextView>) {
+    let scroll = { NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame) };
+    let content = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(frame.size.width, frame.size.height),
     );
-    objc2_app_kit::NSAnimationContext::runAnimationGroup(&block);
+    let view = { NSTextView::initWithFrame(NSTextView::alloc(mtm), content) };
+    {
+        scroll.setHasVerticalScroller(true);
+        scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
+        view.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        view.setRichText(false);
+        view.setAutomaticQuoteSubstitutionEnabled(false);
+        view.setAutomaticSpellingCorrectionEnabled(false);
+        scroll.setDocumentView(Some(&view));
+    }
+    (scroll, view)
+}
+
+/// Wire a control to `action` on `target`.
+pub fn wire(control: &NSControl, target: &AnyObject, action: objc2::runtime::Sel) {
+    unsafe {
+        control.setTarget(Some(target));
+        control.setAction(Some(action));
+    }
 }

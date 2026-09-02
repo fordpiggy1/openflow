@@ -557,6 +557,16 @@ impl Overlay {
         }
     }
 
+    /// Move the pill to whichever anchor the settings window just chose.
+    pub fn set_position(&self, position: &str) {
+        if !is_known_position(position) {
+            return;
+        }
+        *self.view.ivars().position.borrow_mut() = position.to_string();
+        self.snap(self.panel.frame().size.width, false);
+        self.view.setNeedsDisplay(true);
+    }
+
     pub fn set_state(&self, state: RecordingState) {
         let previous = self.state.get();
         self.state.set(state);
