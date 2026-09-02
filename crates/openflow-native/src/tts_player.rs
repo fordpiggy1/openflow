@@ -166,13 +166,16 @@ impl TtsPlayer {
 
     /// A stream is starting. For a streamable container the decoder starts
     /// straight away.
+    ///
+    /// The gate decides whether this event is still wanted, and it is the only
+    /// thing that does. Every preview passes through [`Self::arm`] first, so an
+    /// id the gate is not holding is an event that has been overtaken: Stop was
+    /// pressed while `TtsStarted` was crossing the main-queue hop, or a second
+    /// Preview armed a newer request. Acting on either would restart a preview
+    /// the user already dismissed, or hijack the newer one's playback.
     pub fn started(&self, started: &SpeechStarted) {
-        // Tear down any previous player, but never the gate: `arm` already
-        // opened it for this request, and closing it here would drop the chunks
-        // that are already in flight behind this event.
         if !self.preview.is_listening(&started.request_id) {
-            self.stop_playback();
-            self.preview.open(&started.request_id);
+            return;
         }
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = None;
@@ -242,11 +245,30 @@ impl TtsPlayer {
         self.preview.close();
     }
 
+    /// A stream failed or was cancelled.
+    ///
+    /// Guarded on the id for the same reason [`Self::finished`] is. One id per
+    /// preview means a cancelled stream reports its cancellation *after* the
+    /// next preview has been armed; closing the gate on that would stop the new
+    /// preview and leave the old one's message on screen.
     pub fn failed(&self, error: &SpeechError) {
+        if !self.is_current(&error.request_id) {
+            return;
+        }
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = Some(error.error.clone());
         }
         self.stop();
+    }
+
+    /// Whether `request_id` is the preview this player is serving: the one
+    /// playing, or, before `TtsStarted` has arrived, the one the gate is armed
+    /// for.
+    pub fn is_current(&self, request_id: &str) -> bool {
+        match self.playback.borrow().as_ref() {
+            Some(playback) => playback.request_id == request_id,
+            None => self.preview.is_listening(request_id),
+        }
     }
 
     /// Stop whatever is playing and stop accepting audio for it.
@@ -370,11 +392,12 @@ mod tests {
         drop(sender);
     }
 
-    /// The whole point of arming the gate before the stream starts is that
-    /// `TtsStarted` must not close it again: the first chunk can overtake the
-    /// main-queue hop, and a gate that closed and reopened would refuse it.
+    /// Arming before the stream starts is what keeps a chunk that overtakes the
+    /// main-queue hop from being refused, so `TtsStarted` must not close and
+    /// reopen the gate. The mirror of that rule is that a start event the gate
+    /// is not holding is stale and must be ignored.
     #[test]
-    fn started_does_not_close_a_gate_already_armed_for_the_same_request() {
+    fn started_serves_only_the_request_the_gate_is_armed_for() {
         let gate = Arc::new(PreviewGate::default());
         let player = TtsPlayer::new(Arc::clone(&gate));
 
@@ -393,18 +416,84 @@ mod tests {
             "the gate must still be open after the event it was armed for"
         );
 
-        // A stream this host never armed still opens the gate for itself,
-        // rather than dropping audio nobody asked it to refuse.
+        // Stop, then the `TtsStarted` that was already crossing the hop behind
+        // it. Reopening the gate here would restart a preview the user has
+        // already dismissed.
+        player.stop();
+        assert!(!gate.is_listening("preview-1"));
         player.started(&SpeechStarted {
-            request_id: "preview-2".to_string(),
+            request_id: "preview-1".to_string(),
             model: "orpheus".to_string(),
             format: "wav".to_string(),
         });
-        assert!(!gate.is_listening("preview-1"));
-        assert!(gate.is_listening("preview-2"));
+        assert!(
+            !gate.is_listening("preview-1"),
+            "a stopped preview must not be resurrected by its own start event"
+        );
+        assert!(
+            !player.is_current("preview-1"),
+            "and no playback may be installed for it"
+        );
+
+        // Same rule for a start that arrives after a newer preview was armed:
+        // it belongs to nobody, so it must not take the new preview's gate.
+        player.arm("preview-2");
+        player.started(&SpeechStarted {
+            request_id: "preview-1".to_string(),
+            model: "orpheus".to_string(),
+            format: "wav".to_string(),
+        });
+        assert!(
+            gate.is_listening("preview-2"),
+            "a superseded start event must not hijack the live preview"
+        );
+        assert!(
+            player.is_current("preview-2"),
+            "the live preview is still the one this player is serving"
+        );
+        assert!(!player.is_current("preview-1"));
 
         player.stop();
         assert!(!gate.is_listening("preview-2"));
+    }
+
+    /// One id per preview means a cancelled stream reports back *after* the
+    /// next preview is armed. An unguarded `failed` closed the gate on that
+    /// second preview and killed it, so Preview pressed twice never played.
+    #[test]
+    fn a_dead_streams_failure_cannot_stop_the_preview_that_replaced_it() {
+        let gate = Arc::new(PreviewGate::default());
+        let player = TtsPlayer::new(Arc::clone(&gate));
+
+        player.arm("preview-b");
+        assert!(gate.is_listening("preview-b"));
+
+        player.failed(&SpeechError {
+            request_id: "preview-a".to_string(),
+            error: "Speech generation cancelled".to_string(),
+            cancelled: true,
+        });
+        assert!(
+            gate.is_listening("preview-b"),
+            "the live preview must survive the previous one's cancellation"
+        );
+        assert_eq!(
+            player.last_error(),
+            None,
+            "and it must not inherit the dead stream's message"
+        );
+
+        // The error that does belong to it still lands.
+        player.failed(&SpeechError {
+            request_id: "preview-b".to_string(),
+            error: "No audio output is available".to_string(),
+            cancelled: false,
+        });
+        assert!(!gate.is_listening("preview-b"));
+        assert_eq!(
+            player.last_error().as_deref(),
+            Some("No audio output is available")
+        );
     }
 
     /// The gate is what tells the engine to stop downloading. Closing it has to

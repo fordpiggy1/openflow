@@ -148,6 +148,11 @@ impl App {
             EngineEvent::HistoryChanged => self.tray.rebuild(&self.engine),
             EngineEvent::TtsStarted(started) => self.tts.started(&started),
             EngineEvent::TtsChunk(chunk) => self.tts.chunk(&chunk),
+            // Both of these are written against the request id, never
+            // unconditionally: with one id per preview, a stream that was
+            // cancelled reports back after the next preview is already on
+            // screen, and an unguarded write would replace the live status with
+            // the dead stream's message.
             EngineEvent::TtsFinished(result) => {
                 self.tts.finished(&result);
                 // A player thread that failed to open the device or decode the
@@ -156,15 +161,15 @@ impl App {
                     .tts
                     .last_error()
                     .unwrap_or_else(|| "Playing the preview.".to_string());
-                if let Some(window) = self.settings.borrow().as_ref() {
-                    window.set_voice_status(&message);
-                }
+                self.with_settings(|window| {
+                    window.set_voice_status_for(&result.request_id, &message)
+                });
             }
             EngineEvent::TtsError(error) => {
                 self.tts.failed(&error);
-                if let Some(window) = self.settings.borrow().as_ref() {
-                    window.set_voice_status(&error.error);
-                }
+                self.with_settings(|window| {
+                    window.set_voice_status_for(&error.request_id, &error.error)
+                });
             }
             EngineEvent::Navigate(target) => match target.as_str() {
                 "quit" => {

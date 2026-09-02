@@ -506,6 +506,16 @@ impl SettingsWindow {
         self.ivars().tabs.selectTabViewItemAtIndex(index);
     }
 
+    /// Force whatever field is being edited to commit, if this window is the
+    /// one the user is typing in. Editing ends when first responder is given
+    /// up, and that is what writes the deferred fields.
+    pub fn commit_pending_edits(&self) {
+        let window = &self.ivars().window;
+        if window.isVisible() && window.isKeyWindow() {
+            window.makeFirstResponder(None);
+        }
+    }
+
     pub fn set_voice_status(&self, message: &str) {
         self.set_text(&self.ivars().controls.voice_status, message);
     }
@@ -979,7 +989,7 @@ impl SettingsWindow {
 
     /// Set the voice status only while `request_id` is still the preview on
     /// screen, so a stale failure cannot overwrite a newer "Generating...".
-    fn set_voice_status_for(&self, request_id: &str, message: &str) {
+    pub fn set_voice_status_for(&self, request_id: &str, message: &str) {
         if self.ivars().preview_request.borrow().as_deref() == Some(request_id) {
             self.set_voice_status(message);
         }

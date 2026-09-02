@@ -139,7 +139,18 @@ impl Hotkeys {
     pub fn dispatch(&self, engine: &Arc<Engine>, event: GlobalHotKeyEvent) {
         if self.record.map(|key| key.id()) == Some(event.id) {
             match event.state {
-                HotKeyState::Pressed => engine.hotkey_pressed(),
+                HotKeyState::Pressed => {
+                    // "Paste the key, then hold the hotkey to try it" is the
+                    // first thing anyone does in Settings, and the overlay pill
+                    // is a non-activating panel, so nothing takes focus off the
+                    // field. Without this the capture would run against the key
+                    // the user typed but never committed, because credentials
+                    // and endpoint URLs only write when editing ends.
+                    crate::app::with_app(|app| {
+                        app.with_settings(|window| window.commit_pending_edits())
+                    });
+                    engine.hotkey_pressed();
+                }
                 HotKeyState::Released => engine.hotkey_released(),
             }
         } else if self.recopy.map(|key| key.id()) == Some(event.id)
