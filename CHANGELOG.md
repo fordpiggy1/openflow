@@ -4,6 +4,12 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Socket-level test for the credential isolation guarantee
+By: Ford
+Impact: `src-tauri/src/lib.rs`
+
+- `selfhosted_request_carries_no_cloud_credential` binds a listener, sends a real speech request at it, and asserts on the bytes that crossed the socket: no `authorization` header, no transcription key, and the right path and body. The existing unit tests cover what `resolve_speech_key` returns, not what the request carries, and a LAN server that accepts any credential answers 200 either way — so a leak would be silent.
+
 ### Groq as the recommended provider, personal dictionary, Orpheus voice
 By: Titan (with Claude)
 Impact: `src/App.tsx`, `src-tauri/src/transcribe.rs`, `src-tauri/src/lib.rs`, `README.md`
