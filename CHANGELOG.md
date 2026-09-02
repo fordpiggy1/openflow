@@ -4,6 +4,14 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Type transcriptions instead of pasting them, and an overlay that stays out of the way
+By: Ford
+Impact: `src-tauri/src/lib.rs`, `src-tauri/Cargo.toml`, `src/App.tsx`, `overlay.html`, `src-tauri/tauri.conf.json`
+
+- New `insert_method` setting. `paste` (the default, unchanged behaviour) sends Cmd+V. `type` synthesizes keystrokes carrying the text, so nothing waits on a paste round-trip. The clipboard is still written under both, as a fallback for a silent insertion failure. macOS only; other platforms fall back to pasting rather than shipping untested synthetic input.
+- Typing sends the whole string in a single event (504 characters measured intact, ~60us) after a warm-up: the first event a process posts costs ~40ms, and without paying that first the opening characters are swallowed silently. Empty text is refused outright, because an empty unicode payload leaves virtual keycode 0 to mean what it usually does and types a stray `a`.
+- New `overlay_only_while_recording` setting, default off. On, the overlay is hidden until recording starts and goes away once the text lands. The window stays configured visible and only the setting hides it, so a failure in the overlay's own startup cannot leave it gone for good.
+
 ### Groq as the recommended provider, personal dictionary, Orpheus voice
 By: Titan (with Claude)
 Impact: `src/App.tsx`, `src-tauri/src/transcribe.rs`, `src-tauri/src/lib.rs`, `README.md`
