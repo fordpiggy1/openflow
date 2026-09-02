@@ -392,6 +392,76 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
     Ok(())
 }
 
+/// Whether a recording should be previewed on the overlay as it is spoken.
+///
+/// Unset means yes for a self-hosted endpoint, where a preview costs a LAN
+/// round trip, and no for a hosted one, where it bills for one every 800 ms.
+fn live_preview_allowed(setting: Option<&str>, provider: &Provider) -> bool {
+    match setting {
+        Some("true") => true,
+        Some("false") => false,
+        _ => provider.is_custom(),
+    }
+}
+
+fn transcription_provider(state: &AppState) -> Provider {
+    Provider::from_str(
+        &state
+            .db
+            .get_setting("provider")
+            .unwrap_or_else(|| "groq".to_string()),
+    )
+}
+
+#[tauri::command]
+fn live_preview_enabled(state: State<AppState>) -> bool {
+    live_preview_allowed(
+        state.db.get_setting("live_preview").as_deref(),
+        &transcription_provider(&state),
+    )
+}
+
+/// Transcribe what has been captured so far, without ending the recording.
+///
+/// Deliberately not the real pipeline: no formatting pass, no plugin hooks, no
+/// history row and nothing typed into the focused app. A partial is a preview
+/// on the overlay that the next one overwrites, so anything with a side effect
+/// would fire several times for one dictation.
+#[tauri::command]
+async fn transcribe_partial(state: State<'_, AppState>) -> Result<String, String> {
+    {
+        let recording = state
+            .recording
+            .lock()
+            .map_err(|_| "Recording state is unavailable".to_string())?;
+        if recording.is_none() {
+            return Err("No recording is active".to_string());
+        }
+    }
+    let provider = transcription_provider(&state);
+    // Checked here too, not just where the timer starts: the webview must not
+    // be the only thing standing between a hotkey and a metered API.
+    if !live_preview_allowed(state.db.get_setting("live_preview").as_deref(), &provider) {
+        return Err("Live preview is off".to_string());
+    }
+    let wav_bytes = state.recorder.snapshot()?;
+
+    let key = state.secrets.get("api_key")?.unwrap_or_default();
+    let language = state.db.get_setting("language");
+    let stt_model = state.db.get_setting("stt_model");
+    let dictionary = state.db.get_setting("dictionary");
+
+    transcribe::transcribe_audio(
+        wav_bytes,
+        &key,
+        language.as_deref(),
+        &provider,
+        stt_model.as_deref(),
+        dictionary.as_deref(),
+    )
+    .await
+}
+
 #[tauri::command]
 async fn stop_recording_and_transcribe(
     app: AppHandle,
@@ -1387,6 +1457,8 @@ pub fn run() {
             list_audio_devices,
             start_recording,
             stop_recording_and_transcribe,
+            transcribe_partial,
+            live_preview_enabled,
             cancel_current_transcription,
             synthesize_speech,
             stream_speech,
@@ -1416,6 +1488,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_preview_defaults_to_the_endpoint_that_is_free_to_ask() {
+        let lan = Provider::from_str("custom:http://192.168.1.2:8882/v1");
+        let hosted = Provider::from_str("groq");
+        assert!(lan.is_custom());
+
+        // Unset: on for the LAN box, off for anything that bills per request.
+        assert!(live_preview_allowed(None, &lan));
+        assert!(!live_preview_allowed(None, &hosted));
+
+        // Set: the user's choice wins for either kind of endpoint.
+        assert!(live_preview_allowed(Some("true"), &hosted));
+        assert!(!live_preview_allowed(Some("false"), &lan));
+
+        // Anything else is not a yes. A half-written setting must not start
+        // billing against a hosted provider every 800 ms.
+        assert!(!live_preview_allowed(Some(""), &hosted));
+        assert!(!live_preview_allowed(Some("yes"), &hosted));
+    }
 
     #[test]
     fn insert_method_defaults_to_paste() {
