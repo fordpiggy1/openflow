@@ -4,13 +4,11 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
-### Type transcriptions instead of pasting them, and an overlay that stays out of the way
+### Socket-level test for the credential isolation guarantee
 By: Ford
-Impact: `src-tauri/src/lib.rs`, `src-tauri/Cargo.toml`, `src/App.tsx`, `overlay.html`, `src-tauri/tauri.conf.json`
+Impact: `src-tauri/src/lib.rs`
 
-- New `insert_method` setting. `paste` (the default, unchanged behaviour) sends Cmd+V. `type` synthesizes keystrokes carrying the text, so nothing waits on a paste round-trip. The clipboard is still written under both, as a fallback for a silent insertion failure. macOS only; other platforms fall back to pasting rather than shipping untested synthetic input.
-- Typing sends the whole string in a single event (504 characters measured intact, ~60us) after a warm-up: the first event a process posts costs ~40ms, and without paying that first the opening characters are swallowed silently. Empty text is refused outright, because an empty unicode payload leaves virtual keycode 0 to mean what it usually does and types a stray `a`.
-- New `overlay_only_while_recording` setting, default off. On, the overlay is hidden until recording starts and goes away once the text lands. The window stays configured visible and only the setting hides it, so a failure in the overlay's own startup cannot leave it gone for good.
+- `selfhosted_request_carries_no_cloud_credential` binds a listener, sends a real speech request at it, and asserts on the bytes that crossed the socket: no `authorization` header, no transcription key, and the right path and body. The existing unit tests cover what `resolve_speech_key` returns, not what the request carries, and a LAN server that accepts any credential answers 200 either way — so a leak would be silent.
 
 ### Groq as the recommended provider, personal dictionary, Orpheus voice
 By: Titan (with Claude)
@@ -32,6 +30,7 @@ Impact: `src-tauri/src/transcribe.rs`, `src-tauri/src/lib.rs`, `src/App.tsx`, `s
 - The voice preview and the Settings voice section are keyed on the selected voice provider, so the Self-hosted / LAN option is reachable from any transcription provider.
 - Blank voice model and voice fields reach the backend blank instead of being replaced with Gemini names.
 - Setup counts as complete once a provider is saved, even with no key.
+- Whole-take silence gate: a recording whose loud part sits under -60 dBFS is refused with an error naming the input device, instead of being uploaded. Whisper hallucinates on silence and, with a dictionary prompt, echoes the prompt back. Found dogfooding with a virtual "Find My" device as the system default input.
 
 ### Audit follow-ups and self-hosted speech endpoints
 By: Ford

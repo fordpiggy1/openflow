@@ -1464,6 +1464,78 @@ mod tests {
         );
     }
 
+    /// The unit tests above prove `resolve_speech_key` *returns* no key for a
+    /// self-hosted endpoint. They do not prove the HTTP request that goes out
+    /// carries no key -- a header could still be added downstream, and a LAN
+    /// server that accepts any credential would answer 200 either way.
+    ///
+    /// So stand up a listener, send a real request at it, and read the bytes
+    /// that actually crossed the socket.
+    #[test]
+    fn selfhosted_request_carries_no_cloud_credential() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a throwaway endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let capture = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the speech request");
+            let mut buf = vec![0u8; 8192];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            // Non-empty: `validate_speech_response` rejects a zero-length body.
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 4\r\n\r\nID3\x04",
+            );
+            String::from_utf8_lossy(&buf[..read]).into_owned()
+        });
+
+        let lan = Provider::from_str(&format!("custom:http://127.0.0.1:{port}/v1"));
+        let cloud_key = "sk-or-this-must-never-reach-the-lan";
+
+        // Exactly what the speech command computes before it sends: a shared
+        // transcription key exists, but the speech endpoint is a different one.
+        let key = resolve_speech_key(&lan, None, Some(cloud_key.to_string()), false)
+            .expect("a custom endpoint proceeds unauthenticated");
+
+        let sent = tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(transcribe::request_speech(
+                "probe", &key, &lan, "tts-1", "alloy", "mp3",
+            ));
+        assert!(
+            sent.is_ok(),
+            "the self-hosted request should go through: {:?}",
+            sent.err()
+        );
+
+        let raw = capture.join().expect("capture thread");
+
+        // reqwest lowercases header names, so match case-insensitively: the
+        // point is that no credential header exists at all, not that one
+        // exists carrying an empty value.
+        let headers = raw.to_ascii_lowercase();
+        assert!(
+            !headers.contains("authorization"),
+            "a self-hosted endpoint must receive no Authorization header, got:\n{raw}"
+        );
+        assert!(
+            !raw.contains(cloud_key),
+            "the transcription key leaked to the LAN, got:\n{raw}"
+        );
+
+        // Pin the positive contract too, so a future failure separates "leaked"
+        // from "never reached the endpoint".
+        assert!(
+            raw.starts_with("POST /v1/audio/speech "),
+            "expected a speech request, got:\n{raw}"
+        );
+        assert!(
+            raw.contains(r#""model":"tts-1""#) && raw.contains(r#""voice":"alloy""#),
+            "expected model and voice in the body, got:\n{raw}"
+        );
+    }
+
     #[test]
     fn same_endpoint_compares_custom_urls_and_hosted_variants() {
         let a = Provider::from_str("custom:http://10.0.0.5:8880/v1");

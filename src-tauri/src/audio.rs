@@ -30,6 +30,7 @@ impl AudioRecorder {
             let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
             let mut native_sample_rate = 44_100;
             let mut active_stream: Option<cpal::Stream> = None;
+            let mut active_device_name = String::from("the default microphone");
 
             for cmd in cmd_rx {
                 match cmd {
@@ -73,6 +74,9 @@ impl AudioRecorder {
                             }
                         };
                         native_sample_rate = default_config.sample_rate().0;
+                        active_device_name = device
+                            .name()
+                            .unwrap_or_else(|_| "the default microphone".to_string());
                         let config = cpal::StreamConfig {
                             channels: default_config.channels(),
                             sample_rate: default_config.sample_rate(),
@@ -142,6 +146,13 @@ impl AudioRecorder {
                         let mono_16k = downsample(&samples_data, native_sample_rate, 16_000);
                         if mono_16k.len() < 800 {
                             let _ = reply.send(Err("Recording too short.".to_string()));
+                            continue;
+                        }
+                        if is_silent(&mono_16k) {
+                            let _ = reply.send(Err(format!(
+                                "No sound reached OpenFlow from \"{}\". Pick a different microphone in Settings.",
+                                active_device_name
+                            )));
                             continue;
                         }
                         let result = encode_wav(&auto_gain(&mono_16k), 16_000);
@@ -292,10 +303,7 @@ fn auto_gain(samples: &[f32]) -> Vec<f32> {
         return Vec::new();
     }
 
-    let mut magnitudes: Vec<f32> = samples.iter().map(|sample| sample.abs()).collect();
-    magnitudes.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let index = ((magnitudes.len() as f32 * 0.95) as usize).min(magnitudes.len() - 1);
-    let level = magnitudes[index];
+    let level = speech_level(samples);
 
     if level < 1e-4 {
         return samples.to_vec();
@@ -306,6 +314,31 @@ fn auto_gain(samples: &[f32]) -> Vec<f32> {
         .iter()
         .map(|sample| (sample * gain).clamp(-1.0, 1.0))
         .collect()
+}
+
+/// 95th percentile of |sample|: the level of the loud part of a take, which
+/// leading silence and a single transient both leave alone.
+fn speech_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut magnitudes: Vec<f32> = samples.iter().map(|sample| sample.abs()).collect();
+    magnitudes.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = ((magnitudes.len() as f32 * 0.95) as usize).min(magnitudes.len() - 1);
+    magnitudes[index]
+}
+
+/// -60 dBFS. A take whose loud part sits under this carried no voice: a muted,
+/// virtual, or permission-blocked input.
+const SILENCE_LEVEL: f32 = 1e-3;
+
+/// Whisper does not return an empty transcript for silence; it hallucinates,
+/// and given a dictionary prompt it echoes the prompt back ("Sop, Lark").
+/// Refuse the upload instead. This is a whole-take gate, not the per-sample
+/// silence stripping removed twice (3a9ebee, 0865284) for cutting speech from
+/// low-gain mics: a quiet real take still measures 10x to 50x above the line.
+fn is_silent(samples: &[f32]) -> bool {
+    speech_level(samples) < SILENCE_LEVEL
 }
 
 /// Anti-alias filter length. 63 taps buys ~60 dB of stopband rejection at
@@ -518,6 +551,31 @@ mod tests {
         assert!(auto_gain(&tone(300.0, 16_000, 0.2))
             .iter()
             .all(|s| s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn silence_gate_rejects_dead_input_but_keeps_quiet_speech() {
+        assert!(is_silent(&vec![0.0_f32; 16_000]));
+        let hiss: Vec<f32> = (0..16_000)
+            .map(|i| if i % 2 == 0 { 2e-4 } else { -2e-4 })
+            .collect();
+        assert!(
+            is_silent(&hiss),
+            "a virtual device's noise floor is not speech"
+        );
+
+        let mut quiet = tone(300.0, 16_000, 1.0);
+        for s in quiet.iter_mut() {
+            *s *= 0.01;
+        }
+        assert!(!is_silent(&quiet), "a quiet real take must pass the gate");
+
+        let mut mostly_silent = vec![0.0_f32; 32_000];
+        mostly_silent.extend(quiet);
+        assert!(
+            !is_silent(&mostly_silent),
+            "two seconds of leading silence must not fail a real take"
+        );
     }
 
     #[test]
