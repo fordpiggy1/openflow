@@ -1,0 +1,141 @@
+# XcodeGen spec for OpenFlow for iPhone.
+#
+#   brew install xcodegen
+#   cd apps/ios && xcodegen generate && open OpenFlow.xcodeproj
+#
+# The generated OpenFlow.xcodeproj is NOT committed: it is a build artefact of
+# this file, and this file is the thing to review. See apps/ios/README.md.
+
+name: OpenFlow
+options:
+  bundleIdPrefix: io.laisy.openflow
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    SWIFT_UPCOMING_FEATURE_CONCISE_MAGIC_FILE: YES
+    # No third-party SDKs, so nothing needs a module cache exception.
+    CLANG_ENABLE_MODULES: YES
+
+packages:
+  # The whole brain of the app. Builds and tests with the Command Line Tools
+  # alone; `swift test` inside it is the gate that runs without Xcode.
+  OpenFlowMobileCore:
+    path: Packages/OpenFlowMobileCore
+  # The two engine packages are declared but NOT attached to any target yet.
+  # They need MLX Swift / WhisperKit and the Metal toolchain, and Milestone M2
+  # decides which one ships (PLAN.md section 3). To bring one in: uncomment its
+  # entry under the OpenFlow target's `dependencies`.
+  OpenFlowQwenEngine:
+    path: Packages/OpenFlowQwenEngine
+  OpenFlowWhisperEngine:
+    path: Packages/OpenFlowWhisperEngine
+
+targets:
+
+  OpenFlow:
+    type: application
+    platform: iOS
+    sources:
+      - path: OpenFlow
+        excludes:
+          - "Info.plist"
+          - "PrivacyInfo.xcprivacy"
+          - "OpenFlow.entitlements"
+      # Compiled into the app as well as the widget extension: the Live Activity
+      # attributes, so both sides agree on the shape.
+      - path: OpenFlowWidgets/DictationActivityAttributes.swift
+      - path: OpenFlow/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    dependencies:
+      - package: OpenFlowMobileCore
+        product: OpenFlowMobileCore
+      - target: OpenFlowKeyboard
+      - target: OpenFlowWidgets
+      # - package: OpenFlowQwenEngine      # M2
+      # - package: OpenFlowWhisperEngine   # M2
+    info:
+      path: OpenFlow/Info.plist
+    entitlements:
+      path: OpenFlow/OpenFlow.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow
+        PRODUCT_NAME: OpenFlow
+        INFOPLIST_FILE: OpenFlow/Info.plist
+        CODE_SIGN_ENTITLEMENTS: OpenFlow/OpenFlow.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+      configs:
+        Debug:
+          # Runs the whole product in the Simulator against FakeEngine, before a
+          # single weight exists (PLAN.md section 6).
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG OPENFLOW_FAKE_ENGINE
+
+  OpenFlowKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: OpenFlowKeyboard
+        excludes:
+          - "Info.plist"
+          - "OpenFlowKeyboard.entitlements"
+    dependencies:
+      - package: OpenFlowMobileCore
+        product: OpenFlowMobileCore
+    info:
+      path: OpenFlowKeyboard/Info.plist
+    entitlements:
+      path: OpenFlowKeyboard/OpenFlowKeyboard.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow.keyboard
+        PRODUCT_NAME: OpenFlowKeyboard
+        INFOPLIST_FILE: OpenFlowKeyboard/Info.plist
+        CODE_SIGN_ENTITLEMENTS: OpenFlowKeyboard/OpenFlowKeyboard.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+
+  OpenFlowWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: OpenFlowWidgets
+        excludes:
+          - "Info.plist"
+          - "OpenFlowWidgets.entitlements"
+      # The control widget launches the same App Intent the Action Button does,
+      # so the intent definition is compiled into this target too.
+      - path: OpenFlow/Intents/StartDictationIntent.swift
+    info:
+      path: OpenFlowWidgets/Info.plist
+    entitlements:
+      path: OpenFlowWidgets/OpenFlowWidgets.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow.widgets
+        PRODUCT_NAME: OpenFlowWidgets
+        INFOPLIST_FILE: OpenFlowWidgets/Info.plist
+        CODE_SIGN_ENTITLEMENTS: OpenFlowWidgets/OpenFlowWidgets.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+
+schemes:
+  OpenFlow:
+    build:
+      targets:
+        OpenFlow: all
+    run:
+      config: Debug
+    archive:
+      config: Release

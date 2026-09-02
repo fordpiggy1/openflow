@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The App Group, and nothing else. It is how the keyboard extension and
+	     the widgets read the last transcript and the settings. No iCloud, no
+	     push, no associated domains, no network extensions. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.io.laisy.openflow</string>
+	</array>
+</dict>
+</plist>
