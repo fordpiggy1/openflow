@@ -453,7 +453,7 @@ fn copy_last_transcription(state: State<AppState>) -> Result<(), String> {
         .lock()
         .map_err(|_| "Clipboard history is unavailable".to_string())?;
     match last.as_ref() {
-        Some(text) => paste_to_clipboard(text),
+        Some(text) => paste_to_clipboard(text, insert_method(&state.db)),
         None => Err("No previous transcription".to_string()),
     }
 }
@@ -482,8 +482,8 @@ fn copy_text(_state: State<AppState>, text: String) -> Result<(), String> {
 
 /// Copy and paste in one step, for callers that want the keystroke.
 #[tauri::command]
-fn paste_text(_state: State<AppState>, text: String) -> Result<(), String> {
-    paste_to_clipboard(&text)
+fn paste_text(state: State<AppState>, text: String) -> Result<(), String> {
+    paste_to_clipboard(&text, insert_method(&state.db))
 }
 
 // ── Hotkey management ─────────────────────────────────────
@@ -715,6 +715,7 @@ async fn run_transcription_pipeline_inner(
             .formatted_text
             .as_deref()
             .unwrap_or(&transcription.raw_text),
+        insert_method(&state.db),
     )
     .err();
 
@@ -729,11 +730,95 @@ fn write_clipboard(text: &str) -> Result<(), String> {
         .map_err(|e| format!("Clipboard set failed: {}", e))
 }
 
-/// Copy *and* fire a paste keystroke at whatever has focus. Correct for the
-/// tray and the re-copy hotkey, where focus is in the user's editor; wrong for
-/// a list inside OpenFlow, which would paste into OpenFlow itself.
-fn paste_to_clipboard(text: &str) -> Result<(), String> {
+/// How text reaches the app the user is working in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InsertMethod {
+    /// Put it on the clipboard, then send Cmd+V. Universal, because the
+    /// keystroke is real and the app does the rest, but it overwrites whatever
+    /// the user had copied.
+    Paste,
+    /// Synthesize keystrokes carrying the text itself. Leaves the clipboard
+    /// alone and skips the paste round-trip, but the receiving app's
+    /// autocorrect gets a say -- Notes rewrites `english` as `English`.
+    Type,
+}
+
+impl InsertMethod {
+    fn from_setting(value: Option<String>) -> Self {
+        match value.as_deref().map(str::trim) {
+            Some("type") => Self::Type,
+            _ => Self::Paste,
+        }
+    }
+}
+
+fn insert_method(db: &Database) -> InsertMethod {
+    InsertMethod::from_setting(db.get_setting("insert_method"))
+}
+
+/// Put `text` where the user is typing. Correct for the tray and the re-copy
+/// hotkey, where focus is in the user's editor; wrong for a list inside
+/// OpenFlow, which would insert into OpenFlow itself.
+///
+/// The clipboard is written either way. Under `Type` it is not the delivery
+/// mechanism but the safety net: if insertion silently fails, the text is one
+/// Cmd+V away instead of gone.
+fn paste_to_clipboard(text: &str, method: InsertMethod) -> Result<(), String> {
     write_clipboard(text)?;
+    match method {
+        InsertMethod::Paste => simulate_paste(),
+        InsertMethod::Type => type_text(text),
+    }
+}
+
+/// Send `text` as a synthesized keystroke, unicode payload and all.
+///
+/// Three things here are load-bearing, each one measured rather than assumed:
+///
+/// - **Empty text returns early.** `set_string("")` does not neutralize the
+///   event, it leaves virtual keycode 0 to mean what it normally means, and
+///   types a stray `a`.
+/// - **One event carries the whole string.** 504 characters arrived intact in
+///   ~60us, so there is nothing to gain by chunking and a dropped chunk to lose.
+/// - **The warm-up is not decoration.** The first post of a process costs ~40ms,
+///   and without paying it first the opening segment is swallowed -- silently,
+///   and always at the start of the text.
+#[cfg(target_os = "macos")]
+fn type_text(text: &str) -> Result<(), String> {
+    use core_graphics::event::{CGEvent, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let source = || {
+        CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| "Could not reach the window server to type the text.".to_string())
+    };
+
+    // Warm up, then let the focused window settle before the real event.
+    let _ = source()?;
+    std::thread::sleep(Duration::from_millis(20));
+
+    let src = source()?;
+    let down = CGEvent::new_keyboard_event(src.clone(), 0, true)
+        .map_err(|_| "Could not create the keystroke.".to_string())?;
+    down.set_string(text);
+    down.post(CGEventTapLocation::HID);
+
+    let up = CGEvent::new_keyboard_event(src, 0, false)
+        .map_err(|_| "Could not create the keystroke.".to_string())?;
+    up.set_string(text);
+    up.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
+/// Only macOS has a verified implementation. Everywhere else `Type` behaves as
+/// `Paste` rather than shipping a guess about how synthesized input behaves on
+/// a platform nobody tested.
+#[cfg(not(target_os = "macos"))]
+fn type_text(_text: &str) -> Result<(), String> {
     simulate_paste()
 }
 
@@ -1014,7 +1099,7 @@ fn handle_recopy(app: &AppHandle) {
         return;
     };
     if let Some(text) = last.as_ref() {
-        let _ = paste_to_clipboard(text);
+        let _ = paste_to_clipboard(text, insert_method(&state.db));
         let _ = app.emit("recopy-success", "Copied last transcription");
     }
 }
@@ -1216,7 +1301,7 @@ pub fn run() {
                             let state = app.state::<AppState>();
                             if let Ok(Some(t)) = state.db.get_transcription(row_id) {
                                 let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
-                                let _ = paste_to_clipboard(text);
+                                let _ = paste_to_clipboard(text, insert_method(&state.db));
                                 let _ = app.emit("recopy-success", "Copied!");
                             }
                         }
@@ -1289,6 +1374,43 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insert_method_defaults_to_paste() {
+        // Anything that is not exactly "type" is Paste, so an unset setting, a
+        // stale value, or a typo degrades to the universal path rather than to
+        // the one whose behaviour depends on the receiving app.
+        assert_eq!(InsertMethod::from_setting(None), InsertMethod::Paste);
+        assert_eq!(
+            InsertMethod::from_setting(Some(String::new())),
+            InsertMethod::Paste
+        );
+        assert_eq!(
+            InsertMethod::from_setting(Some("paste".to_string())),
+            InsertMethod::Paste
+        );
+        assert_eq!(
+            InsertMethod::from_setting(Some("typing".to_string())),
+            InsertMethod::Paste
+        );
+        assert_eq!(
+            InsertMethod::from_setting(Some("type".to_string())),
+            InsertMethod::Type
+        );
+        assert_eq!(
+            InsertMethod::from_setting(Some("  type  ".to_string())),
+            InsertMethod::Type
+        );
+    }
+
+    /// Empty text must not reach CGEvent. `set_string("")` leaves virtual
+    /// keycode 0 holding its normal meaning, so the "empty" keystroke types
+    /// a literal `a`. Observed, not theorised.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn typing_empty_text_posts_nothing() {
+        assert_eq!(type_text(""), Ok(()));
+    }
 
     #[test]
     fn recording_slot_frees_itself_after_the_watchdog_window() {
