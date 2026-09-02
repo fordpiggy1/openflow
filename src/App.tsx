@@ -84,22 +84,22 @@ interface ProviderDefinition {
 }
 
 const PROVIDERS: Record<string, ProviderDefinition> = {
+  groq: {
+    label: "Groq",
+    description: "Fastest Whisper and cleanup. One key, no proxy hop.",
+    keyUrl: "https://console.groq.com/keys",
+    keyPlaceholder: "gsk_…",
+    sttDefault: "whisper-large-v3-turbo",
+    chatDefault: "openai/gpt-oss-20b",
+    recommended: true,
+  },
   openrouter: {
     label: "OpenRouter",
-    description: "One key for transcription, formatting, and Gemini voice.",
+    description: "One key for many models, plus Gemini voice.",
     keyUrl: "https://openrouter.ai/keys",
     keyPlaceholder: "sk-or-v1-…",
     sttDefault: "openai/whisper-1",
     chatDefault: "google/gemini-3.1-flash-lite-preview",
-    recommended: true,
-  },
-  groq: {
-    label: "Groq",
-    description: "Low-latency Whisper and fast text formatting.",
-    keyUrl: "https://console.groq.com/keys",
-    keyPlaceholder: "gsk_…",
-    sttDefault: "whisper-large-v3-turbo",
-    chatDefault: "llama-3.3-70b-versatile",
   },
   openai: {
     label: "OpenAI",
@@ -115,7 +115,7 @@ const PROVIDERS: Record<string, ProviderDefinition> = {
     keyUrl: "https://console.deepgram.com",
     keyPlaceholder: "Paste your Deepgram key",
     sttDefault: "nova-3",
-    chatDefault: "llama-3.3-70b-versatile",
+    chatDefault: "openai/gpt-oss-20b",
   },
   custom: {
     label: "Custom endpoint",
@@ -128,7 +128,12 @@ const PROVIDERS: Record<string, ProviderDefinition> = {
 };
 
 const TTS_DEFAULT_MODEL = "google/gemini-3.1-flash-tts-preview";
-const TTS_VOICES = ["Kore", "Aoede", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Zephyr"];
+const TTS_DEFAULTS: Record<string, { model: string; voice: string; voices: string[] }> = {
+  groq: { model: "canopylabs/orpheus-v1-english", voice: "troy", voices: ["troy", "hannah", "austin"] },
+  openrouter: { model: TTS_DEFAULT_MODEL, voice: "Kore", voices: ["Kore", "Aoede", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Zephyr"] },
+  openai: { model: "tts-1", voice: "alloy", voices: ["alloy", "echo", "fable", "onyx", "nova", "shimmer"] },
+  custom: { model: "kokoro", voice: "af_bella", voices: [] },
+};
 const LANGUAGE_OPTIONS = [
   ["auto", "Auto-detect"], ["en", "English"], ["es", "Spanish"], ["fr", "French"],
   ["de", "German"], ["it", "Italian"], ["pt", "Portuguese"], ["nl", "Dutch"],
@@ -156,9 +161,9 @@ function friendlyError(error: unknown) {
 }
 
 function parseStoredProvider(value: string | null) {
-  if (!value) return { name: "openrouter", customUrl: "" };
+  if (!value) return { name: "groq", customUrl: "" };
   if (value.startsWith("custom:")) return { name: "custom", customUrl: value.slice(7) };
-  return { name: PROVIDERS[value] ? value : "openrouter", customUrl: "" };
+  return { name: PROVIDERS[value] ? value : "groq", customUrl: "" };
 }
 
 function providerValue(name: string, customUrl: string) {
@@ -237,12 +242,12 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
 
-  const [transcriptionProvider, setTranscriptionProvider] = useState("openrouter");
+  const [transcriptionProvider, setTranscriptionProvider] = useState("groq");
   const [transcriptionKey, setTranscriptionKey] = useState("");
-  const [transcriptionModel, setTranscriptionModel] = useState(PROVIDERS.openrouter.sttDefault);
-  const [formattingProvider, setFormattingProvider] = useState("openrouter");
+  const [transcriptionModel, setTranscriptionModel] = useState(PROVIDERS.groq.sttDefault);
+  const [formattingProvider, setFormattingProvider] = useState("groq");
   const [formattingKey, setFormattingKey] = useState("");
-  const [formattingModel, setFormattingModel] = useState(PROVIDERS.openrouter.chatDefault);
+  const [formattingModel, setFormattingModel] = useState(PROVIDERS.groq.chatDefault);
   const [sameProvider, setSameProvider] = useState(true);
   const [language, setLanguage] = useState("auto");
   const [theme, setTheme] = useState<"dark" | "light">(initialTheme);
@@ -269,12 +274,13 @@ function App() {
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [saveHistory, setSaveHistory] = useState(true);
   const [retentionDays, setRetentionDays] = useState("");
+  const [dictionary, setDictionary] = useState("");
   const [confirmingClear, setConfirmingClear] = useState(false);
 
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [ttsModel, setTtsModel] = useState(TTS_DEFAULT_MODEL);
   const [ttsVoice, setTtsVoice] = useState("Kore");
-  const [ttsProvider, setTtsProvider] = useState("openrouter");
+  const [ttsProvider, setTtsProvider] = useState("groq");
   const [customTtsUrl, setCustomTtsUrl] = useState("");
   const [ttsPreviewText, setTtsPreviewText] = useState("OpenFlow is ready. Your ideas can move at the speed of your voice.");
   const [ttsStatus, setTtsStatus] = useState<"idle" | "streaming" | "ready" | "error">("idle");
@@ -355,7 +361,7 @@ function App() {
           invoke<string | null>("get_api_key"),
           invoke<string | null>("get_setting", { key: "formatting_api_key" }),
         ]);
-        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice, storedTtsProvider, storedSaveHistory, storedRetentionDays] = await Promise.all([
+        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice, storedTtsProvider, storedSaveHistory, storedRetentionDays, storedDictionary] = await Promise.all([
           invoke<string | null>("get_setting", { key: "provider" }),
           invoke<string | null>("get_setting", { key: "formatting_provider" }),
           invoke<string | null>("get_setting", { key: "same_provider" }),
@@ -373,6 +379,7 @@ function App() {
           invoke<string | null>("get_setting", { key: "tts_provider" }),
           invoke<string | null>("get_setting", { key: "save_history" }),
           invoke<string | null>("get_setting", { key: "history_retention_days" }),
+          invoke<string | null>("get_setting", { key: "dictionary" }),
         ]);
         const [keyResult, formattingKeyResult] = await secretReads;
         if (!mounted) return;
@@ -389,7 +396,7 @@ function App() {
         const transcription = parseStoredProvider(storedProvider);
         let formatting = parseStoredProvider(storedFormattingProvider || storedProvider);
         if (formatting.name === "deepgram") {
-          formatting = { name: "openrouter", customUrl: "" };
+          formatting = { name: "groq", customUrl: "" };
         }
         setTranscriptionProvider(transcription.name);
         setCustomTranscriptionUrl(transcription.customUrl);
@@ -398,8 +405,10 @@ function App() {
         if (key) {
           setTranscriptionKey(key);
           setFormattingKey(storedFormattingKey || key);
-          setScreen("main");
         }
+        // A self-hosted transcription endpoint may legitimately have no key,
+        // so a saved provider is what marks setup as complete.
+        if (key || storedProvider) setScreen("main");
         setSameProvider(transcription.name === "deepgram" ? false : storedSameProvider !== "false");
         if (storedLanguage) setLanguage(storedLanguage);
         if (storedTheme === "dark" || storedTheme === "light") setTheme(storedTheme);
@@ -417,6 +426,7 @@ function App() {
         setCustomTtsUrl(parsedTts.customUrl);
         if (storedSaveHistory === "false") setSaveHistory(false);
         if (storedRetentionDays) setRetentionDays(storedRetentionDays);
+        if (storedDictionary) setDictionary(storedDictionary);
       } catch (reason) {
         if (mounted) setError(`OpenFlow settings could not be loaded. ${friendlyError(reason)}`);
       } finally {
@@ -535,8 +545,8 @@ function App() {
       setTranscriptionModel(defaults.sttDefault);
       if (nextProvider === "deepgram") {
         setSameProvider(false);
-        setFormattingProvider("openrouter");
-        setFormattingModel(PROVIDERS.openrouter.chatDefault);
+        setFormattingProvider("groq");
+        setFormattingModel(PROVIDERS.groq.chatDefault);
         setFormattingKey("");
       } else if (sameProvider) {
         setFormattingProvider(nextProvider);
@@ -550,7 +560,7 @@ function App() {
   };
 
   const validateProviderConfiguration = (providerName: string, customUrl: string, apiKey: string) => {
-    if (!apiKey.trim()) return "Enter an API key to continue.";
+    if (!apiKey.trim() && providerName !== "custom") return "Enter an API key to continue.";
     if (providerName === "custom" && !/^https?:\/\//i.test(customUrl.trim())) return "Enter a complete endpoint URL beginning with http:// or https://.";
     return "";
   };
@@ -616,11 +626,12 @@ function App() {
       ["microphone", microphone],
       ["tts_enabled", String(ttsEnabled)],
       ["tts_provider", providerValue(ttsProvider, customTtsUrl)],
-      ["tts_model", ttsModel.trim() || TTS_DEFAULT_MODEL],
-      ["tts_voice", ttsVoice.trim() || "Kore"],
+      ["tts_model", ttsModel.trim()],
+      ["tts_voice", ttsVoice.trim()],
       ["tts_response_format", "mp3"],
       ["save_history", String(saveHistory)],
       ["history_retention_days", retentionDays],
+      ["dictionary", dictionary.trim()],
     ];
     if (!sameProvider) {
       settings.push(
@@ -707,7 +718,7 @@ function App() {
 
   const playTtsPreview = async () => {
     if (!ttsPreviewText.trim()) { setTtsError("Enter a short preview sentence first."); return; }
-    if (transcriptionProvider !== "openrouter") { setTtsError("Gemini voice previews require OpenRouter as your transcription provider."); return; }
+    if (ttsProvider !== "custom" && transcriptionProvider !== ttsProvider) { setTtsError(`${PROVIDERS[ttsProvider]?.label ?? ttsProvider} voice previews reuse your transcription key, so choose the same provider for transcription or use a self-hosted endpoint.`); return; }
     if (ttsStatus === "ready" && ttsAudioUrl) {
       try {
         if (audioRef.current) audioRef.current.currentTime = 0;
@@ -758,8 +769,8 @@ function App() {
     try {
       const result = await invoke<TtsStreamResult>("stream_speech", {
         text: ttsPreviewText.trim(),
-        model: ttsModel.trim() || TTS_DEFAULT_MODEL,
-        voice: ttsVoice.trim() || "Kore",
+        model: ttsModel.trim(),
+        voice: ttsVoice.trim(),
         responseFormat: "mp3",
         requestId,
       });
@@ -888,7 +899,7 @@ function App() {
 
           {onboardingStep === "provider" && (
             <div className="panel-content flow-stack">
-              <p className="section-lead">OpenRouter is the easiest path: one key unlocks transcription, cleanup, and Gemini 3.1 Flash voice.</p>
+              <p className="section-lead">Groq is the fastest path: one key covers Whisper transcription, cleanup, and Orpheus voice.</p>
               <fieldset className="provider-grid">
                 <legend className="sr-only">Transcription provider</legend>
                 {Object.entries(PROVIDERS).map(([key, provider]) => (
@@ -979,10 +990,10 @@ function App() {
                   <datalist id="chat-models">{formattingModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
                 </div>
               </div>
-              {transcriptionProvider === "openrouter" && (
+              {(transcriptionProvider === "groq" || transcriptionProvider === "openrouter") && (
                 <div className="field-group voice-model-field">
-                  <div className="label-row"><label htmlFor="onboarding-tts-model">Gemini voice model</label><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div>
-                  <input id="onboarding-tts-model" list="tts-models" value={ttsModel} onChange={(event) => setTtsModel(event.target.value)} placeholder={TTS_DEFAULT_MODEL} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+                  <div className="label-row"><label htmlFor="onboarding-tts-model">Voice model</label><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div>
+                  <input id="onboarding-tts-model" list="tts-models" value={ttsModel} onChange={(event) => setTtsModel(event.target.value)} placeholder={TTS_DEFAULTS[transcriptionProvider]?.model ?? ""} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
                   <datalist id="tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
                 </div>
               )}
@@ -1062,6 +1073,8 @@ function App() {
   }
 
   if (screen === "settings") {
+    const voiceReady = ttsProvider === "custom" || transcriptionProvider === ttsProvider;
+    const voiceLabel = PROVIDERS[ttsProvider]?.label ?? ttsProvider;
     return (
       <main className="app-page">
         {notification && <div className="toast" role="status">{notification}</div>}
@@ -1087,34 +1100,33 @@ function App() {
               <div className="field-group"><label htmlFor="settings-chat-model">Text cleanup</label><input id="settings-chat-model" list="settings-chat-models" value={formattingModel} disabled={!formatEnabled} onChange={(event) => { setFormattingModel(event.target.value); markDirty(); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-chat-models">{formattingModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
               <div className="field-group"><label htmlFor="settings-language">Language</label><select id="settings-language" value={language} onChange={(event) => { setLanguage(event.target.value); markDirty(); }}>{LANGUAGE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>
               <div className="inline-setting"><div><strong>Smart text cleanup</strong><small>Add punctuation and structure.</small></div><Toggle checked={formatEnabled} label="Enable smart text cleanup" onChange={(checked) => { setFormatEnabled(checked); markDirty(); }} /></div>
+              <div className="field-group span-two"><label htmlFor="settings-dictionary">Dictionary</label><textarea id="settings-dictionary" value={dictionary} maxLength={800} rows={2} placeholder="ENTRO.LY, FastPay, TikTok Shop, Lark" onChange={(event) => { setDictionary(event.target.value); markDirty(); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><small className="field-help">Names and terms to spell correctly, comma separated. Sent to Whisper as a spelling hint on Groq, OpenAI, and custom endpoints.</small></div>
             </div>
           </section>
 
           <section className="settings-section voice-section">
-            <div className="section-heading"><div><div className="heading-with-badge"><h2>Voice output</h2><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div><p>Preview Gemini 3.1 Flash TTS through OpenRouter.</p></div><span className="section-number">03</span></div>
-            {ttsProvider !== "custom" && transcriptionProvider !== "openrouter" ? (
-              <div className="capability-empty"><Icon name="volume" size={22} /><div><strong>OpenRouter connection required</strong><p>Choose OpenRouter above to stream Gemini voice previews with the same protected key.</p></div></div>
-            ) : (
-              <>
+            <div className="section-heading"><div><div className="heading-with-badge"><h2>Voice output</h2><span className="capability-badge"><Icon name="volume" size={13} /> Streaming</span></div><p>Preview the voice endpoint before you rely on it.</p></div><span className="section-number">03</span></div>
+            <>
                 <div className="settings-grid">
                   <div className="inline-setting span-two"><div><strong>Voice features</strong><small>Enable speech generation in OpenFlow.</small></div><Toggle checked={ttsEnabled} label="Enable voice features" onChange={(checked) => { setTtsEnabled(checked); markDirty(); }} /></div>
-                  <div className="field-group"><label htmlFor="settings-tts-provider">Speech endpoint</label><select id="settings-tts-provider" value={ttsProvider} disabled={!ttsEnabled} onChange={(event) => { const next = event.target.value; setTtsProvider(next); markDirty(); setTtsStatus("idle"); if (next === "custom") { setTtsModel(""); setTtsVoice(""); } }}><option value="openrouter">OpenRouter (Gemini)</option><option value="openai">OpenAI</option><option value="custom">Self-hosted / LAN</option></select><small>Point this at a machine on your network to keep audio off the internet.</small></div>
+                  <div className="field-group"><label htmlFor="settings-tts-provider">Speech endpoint</label><select id="settings-tts-provider" value={ttsProvider} disabled={!ttsEnabled} onChange={(event) => { const next = event.target.value; setTtsProvider(next); markDirty(); setTtsStatus("idle"); setTtsModel(""); setTtsVoice(""); }}><option value="groq">Groq (Orpheus)</option><option value="openrouter">OpenRouter (Gemini)</option><option value="openai">OpenAI</option><option value="custom">Self-hosted / LAN</option></select><small>Point this at a machine on your network to keep audio off the internet.</small></div>
                   {ttsProvider === "custom" && (
                     <div className="field-group span-two"><label htmlFor="settings-tts-url">Speech endpoint URL</label><input id="settings-tts-url" value={customTtsUrl} disabled={!ttsEnabled} onChange={(event) => { setCustomTtsUrl(event.target.value); markDirty(); setTtsStatus("idle"); }} placeholder="http://192.168.1.10:8880/v1" autoCapitalize="none" autoCorrect="off" spellCheck={false} /><small>OpenAI-compatible base URL. OpenFlow calls <code>/audio/speech</code> under it. Plain http and an empty API key are both fine on a LAN.</small></div>
                   )}
-                  <div className="field-group"><label htmlFor="settings-tts-model">Voice model</label><input id="settings-tts-model" list="settings-tts-models" value={ttsModel} disabled={!ttsEnabled} placeholder={ttsProvider === "custom" ? "kokoro" : TTS_DEFAULT_MODEL} onChange={(event) => { setTtsModel(event.target.value); markDirty(); setTtsStatus("idle"); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
-                  <div className="field-group"><label htmlFor="settings-tts-voice">Voice</label><input id="settings-tts-voice" list="tts-voices" value={ttsVoice} disabled={!ttsEnabled} placeholder={ttsProvider === "custom" ? "af_bella" : "Kore"} onChange={(event) => { setTtsVoice(event.target.value); markDirty(); setTtsStatus("idle"); }} /><datalist id="tts-voices">{TTS_VOICES.map((voice) => <option key={voice} value={voice} />)}</datalist></div>
+                  <div className="field-group"><label htmlFor="settings-tts-model">Voice model</label><input id="settings-tts-model" list="settings-tts-models" value={ttsModel} disabled={!ttsEnabled} placeholder={TTS_DEFAULTS[ttsProvider]?.model ?? ""} onChange={(event) => { setTtsModel(event.target.value); markDirty(); setTtsStatus("idle"); }} autoCapitalize="none" autoCorrect="off" spellCheck={false} /><datalist id="settings-tts-models">{ttsModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist></div>
+                  <div className="field-group"><label htmlFor="settings-tts-voice">Voice</label><input id="settings-tts-voice" list="tts-voices" value={ttsVoice} disabled={!ttsEnabled} placeholder={TTS_DEFAULTS[ttsProvider]?.voice ?? ""} onChange={(event) => { setTtsVoice(event.target.value); markDirty(); setTtsStatus("idle"); }} /><datalist id="tts-voices">{(TTS_DEFAULTS[ttsProvider]?.voices ?? []).map((voice) => <option key={voice} value={voice} />)}</datalist></div>
                 </div>
-                <div className="voice-preview">
+                {voiceReady ? <div className="voice-preview">
                   <label htmlFor="tts-preview">Preview text</label>
                   <textarea id="tts-preview" value={ttsPreviewText} maxLength={500} disabled={!ttsEnabled} onChange={(event) => { setTtsPreviewText(event.target.value); setTtsStatus("idle"); setTtsError(""); }} />
                   <div className="voice-preview-footer"><span>{ttsPreviewText.length}/500</span><div className="voice-actions">{ttsStatus === "streaming" ? <button className="button secondary" onClick={() => void cancelTtsPreview()}><Icon name="stop" size={15} /> Stop</button> : <button className="button secondary" disabled={!ttsEnabled || !ttsPreviewText.trim()} onClick={() => void playTtsPreview()}><Icon name="play" size={15} /> {ttsStatus === "ready" ? "Play again" : "Stream preview"}</button>}</div></div>
-                  {ttsStatus === "streaming" && <div className="streaming-status" role="status"><span className="stream-bars"><i/><i/><i/><i/></span> Gemini is preparing audio…</div>}
+                  {ttsStatus === "streaming" && <div className="streaming-status" role="status"><span className="stream-bars"><i/><i/><i/><i/></span> Preparing audio…</div>}
                   {ttsError && <div className="error-banner" role="alert">{ttsError}</div>}
                   {ttsAudioUrl && <audio ref={audioRef} className="audio-player" controls src={ttsAudioUrl}>Your browser does not support audio playback.</audio>}
-                </div>
-              </>
-            )}
+                </div> : (
+                  <div className="capability-empty"><Icon name="volume" size={22} /><div><strong>{voiceLabel} key required</strong><p>Hosted voice endpoints reuse your transcription key. Choose {voiceLabel} as the transcription provider too, or switch the speech endpoint to Self-hosted / LAN.</p></div></div>
+                )}
+            </>
           </section>
 
           <section className="settings-section">

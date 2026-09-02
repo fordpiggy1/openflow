@@ -92,9 +92,11 @@ async fn fetch_models(
         .or_else(|| state.db.get_setting("provider"))
         .unwrap_or_else(|| "groq".to_string());
     let provider = Provider::from_str(&provider_str);
+    // An empty key is valid for a self-hosted endpoint; transcribe::fetch_models
+    // rejects it for every hosted provider.
     let api_key = api_key_override
         .or_else(|| state.secrets.get("api_key").ok().flatten())
-        .ok_or("No API key available")?;
+        .unwrap_or_default();
     transcribe::fetch_models(&api_key, &provider).await
 }
 
@@ -153,18 +155,20 @@ fn speech_settings(
             .get_setting("tts_provider")
             .unwrap_or_else(|| "openrouter".to_string()),
     );
-    let api_key = state
-        .secrets
-        .get("tts_api_key")?
-        .or_else(|| state.secrets.get("api_key").ok().flatten())
-        .unwrap_or_default();
-    // A self-hosted endpoint on the LAN normally has no auth. Every hosted
-    // provider still needs a key, and saying so early beats a 401 later.
-    if api_key.trim().is_empty() && !provider.is_custom() {
-        return Err("No API key set. Add your key in Settings.".to_string());
-    }
-    // Gemini's model and voice names are meaningless to a self-hosted server,
-    // so custom endpoints fall back to the generic OpenAI names instead.
+    let transcription_provider = Provider::from_str(
+        &state
+            .db
+            .get_setting("provider")
+            .unwrap_or_else(|| "groq".to_string()),
+    );
+    let api_key = resolve_speech_key(
+        &provider,
+        state.secrets.get("tts_api_key")?,
+        state.secrets.get("api_key")?,
+        same_endpoint(&provider, &transcription_provider),
+    )?;
+    // Each provider has its own model and voice names, so blank falls back
+    // per provider rather than to Gemini's.
     let model = model
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
@@ -173,13 +177,7 @@ fn speech_settings(
                 .get_setting("tts_model")
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or_else(|| {
-            if provider.is_custom() {
-                "tts-1".to_string()
-            } else {
-                transcribe::GEMINI_TTS_MODEL.to_string()
-            }
-        });
+        .unwrap_or_else(|| provider.default_tts_model().to_string());
     let voice = voice
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
@@ -188,19 +186,54 @@ fn speech_settings(
                 .get_setting("tts_voice")
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or_else(|| {
-            if provider.is_custom() {
-                "alloy".to_string()
-            } else {
-                "Kore".to_string()
-            }
-        });
+        .unwrap_or_else(|| provider.default_tts_voice().to_string());
     let format = response_format
         .filter(|value| !value.trim().is_empty())
         .or_else(|| state.db.get_setting("tts_response_format"))
         .unwrap_or_else(|| "mp3".to_string())
         .to_ascii_lowercase();
     Ok((provider, api_key, model, voice, format))
+}
+
+/// True when two provider settings name the same service, so one credential
+/// is valid for both. Two custom endpoints are the same only if their URLs are.
+fn same_endpoint(a: &Provider, b: &Provider) -> bool {
+    match (a, b) {
+        (Provider::Custom { base_url: x }, Provider::Custom { base_url: y }) => x == y,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
+/// Which credential a speech request may carry.
+///
+/// The transcription key is shared only with the same endpoint. A different
+/// hosted provider cannot use it (an OpenRouter key is worthless at OpenAI),
+/// and a self-hosted server must not receive it: that would send a cloud
+/// credential in clear text across the LAN. With no usable key, a custom
+/// endpoint proceeds unauthenticated and a hosted one is refused up front.
+fn resolve_speech_key(
+    provider: &Provider,
+    dedicated: Option<String>,
+    shared: Option<String>,
+    same_endpoint_as_transcription: bool,
+) -> Result<String, String> {
+    let present = |key: Option<String>| key.filter(|value| !value.trim().is_empty());
+    if let Some(key) = present(dedicated) {
+        return Ok(key);
+    }
+    if same_endpoint_as_transcription {
+        if let Some(key) = present(shared) {
+            return Ok(key);
+        }
+    }
+    if provider.is_custom() {
+        return Ok(String::new());
+    }
+    Err(if same_endpoint_as_transcription {
+        "No API key set. Add your key in Settings.".to_string()
+    } else {
+        "The voice provider needs its own API key. Use the provider you transcribe with, or point the speech endpoint at a self-hosted server.".to_string()
+    })
 }
 
 #[tauri::command]
@@ -557,10 +590,9 @@ async fn run_transcription_pipeline_inner(
 ) -> Result<(Transcription, Option<String>), String> {
     let duration_ms = wav_duration_ms(&wav_bytes);
 
-    let transcription_key = state
-        .secrets
-        .get("api_key")?
-        .ok_or("No API key set. Add your API key in settings.")?;
+    // Empty is valid for a self-hosted endpoint; transcribe_audio rejects it
+    // for every hosted provider.
+    let transcription_key = state.secrets.get("api_key")?.unwrap_or_default();
     let language = state.db.get_setting("language");
     let provider_str = state
         .db
@@ -579,10 +611,11 @@ async fn run_transcription_pipeline_inner(
         .unwrap_or(true);
     let stt_model = state.db.get_setting("stt_model");
     let chat_model = state.db.get_setting("chat_model");
+    let dictionary = state.db.get_setting("dictionary");
 
     let raw_text = tokio::select! {
         _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
-        result = transcribe::transcribe_audio(wav_bytes, &transcription_key, language.as_deref(), &transcription_provider, stt_model.as_deref()) => result?,
+        result = transcribe::transcribe_audio(wav_bytes, &transcription_key, language.as_deref(), &transcription_provider, stt_model.as_deref(), dictionary.as_deref()) => result?,
     };
     let raw_text = state
         .plugin_manager
@@ -606,11 +639,19 @@ async fn run_transcription_pipeline_inner(
                 .db
                 .get_setting("formatting_provider")
                 .unwrap_or(provider_str.clone());
+            let fmt_provider = Provider::from_str(&fp);
+            // Share the transcription key only with the same endpoint. A
+            // different server, hosted or on the LAN, never receives it.
             let fk = state
                 .secrets
                 .get("formatting_api_key")?
-                .unwrap_or(transcription_key.clone());
-            (Provider::from_str(&fp), fk)
+                .filter(|key| !key.trim().is_empty())
+                .or_else(|| {
+                    same_endpoint(&fmt_provider, &transcription_provider)
+                        .then(|| transcription_key.clone())
+                })
+                .unwrap_or_default();
+            (fmt_provider, fk)
         };
         tokio::select! {
             _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
@@ -1268,6 +1309,49 @@ mod tests {
             recording_slot_free(&stranded),
             "a capture older than the watchdog window must free the slot"
         );
+    }
+
+    #[test]
+    fn speech_key_never_leaks_across_endpoints() {
+        let lan = Provider::from_str("custom:http://192.168.1.10:8880/v1");
+        let shared = Some("sk-or-hosted".to_string());
+
+        // A self-hosted server gets no key unless it has its own.
+        assert_eq!(
+            resolve_speech_key(&lan, None, shared.clone(), false),
+            Ok(String::new())
+        );
+        assert_eq!(
+            resolve_speech_key(&lan, Some("local".to_string()), shared.clone(), false),
+            Ok("local".to_string())
+        );
+        // The same self-hosted server that transcribes may reuse its key.
+        assert_eq!(
+            resolve_speech_key(&lan, None, shared.clone(), true),
+            Ok("sk-or-hosted".to_string())
+        );
+        // A hosted voice provider shares the key only with itself.
+        assert_eq!(
+            resolve_speech_key(&Provider::OpenRouter, None, shared.clone(), true),
+            Ok("sk-or-hosted".to_string())
+        );
+        assert!(resolve_speech_key(&Provider::OpenAI, None, shared.clone(), false).is_err());
+        assert!(resolve_speech_key(&Provider::OpenRouter, None, None, true).is_err());
+        assert!(
+            resolve_speech_key(&Provider::OpenRouter, Some("  ".to_string()), None, true).is_err()
+        );
+    }
+
+    #[test]
+    fn same_endpoint_compares_custom_urls_and_hosted_variants() {
+        let a = Provider::from_str("custom:http://10.0.0.5:8880/v1");
+        let b = Provider::from_str("custom:http://10.0.0.5:8880/v1/");
+        let c = Provider::from_str("custom:http://10.0.0.9:8880/v1");
+        assert!(same_endpoint(&a, &b));
+        assert!(!same_endpoint(&a, &c));
+        assert!(same_endpoint(&Provider::OpenRouter, &Provider::OpenRouter));
+        assert!(!same_endpoint(&Provider::OpenRouter, &Provider::OpenAI));
+        assert!(!same_endpoint(&Provider::OpenRouter, &a));
     }
 
     #[test]

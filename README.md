@@ -6,13 +6,15 @@ The project is currently an early source build. There are no official pre-built 
 
 ## What works
 
-- Guided onboarding for Groq, OpenAI, OpenRouter, Deepgram, and custom OpenAI-compatible endpoints
+- Guided onboarding for Groq (recommended), OpenAI, OpenRouter, Deepgram, and custom OpenAI-compatible endpoints
+- A personal dictionary of names and terms, sent to Whisper as a spelling hint on Groq, OpenAI, and custom endpoints
 - Configurable transcription and cleanup models with provider model discovery
 - Global hold-to-record shortcut (`Option+V` by default) and re-copy shortcut (`Ctrl+Shift+V` by default)
 - Searchable local transcription history
 - Microphone selection, language hints, light/dark themes, a system tray menu, and a movable status overlay
 - Optional LLM cleanup for punctuation, paragraphs, and spoken editing commands
 - OpenRouter Gemini 3.1 Flash TTS Preview with selectable voices and cancellable response streaming
+- Self-hosted speech-to-text and speech synthesis on your own network, with no API key required
 - Local executable hooks after transcription and formatting
 
 ### Streaming scope
@@ -23,18 +25,18 @@ Speech-to-text is not live streaming: OpenFlow records locally, then uploads the
 
 | Provider | Transcription | Text cleanup | TTS preview |
 | --- | --- | --- | --- |
+| Groq | Whisper models | gpt-oss and Qwen models | Orpheus, after a one-time terms acceptance in the Groq console |
 | OpenRouter | Whisper models | Chat models | Gemini 3.1 Flash TTS Preview |
-| Groq | Whisper models | Chat models | No |
-| OpenAI | Whisper-compatible endpoint | Chat models | Not exposed in the current UI |
+| OpenAI | Whisper-compatible endpoint | Chat models | OpenAI-compatible speech endpoint, when OpenAI is also the transcription provider |
 | Deepgram | Nova models | Use a separate cleanup provider or disable cleanup | No |
-| Custom | OpenAI-compatible audio/transcriptions endpoint | OpenAI-compatible chat/completions endpoint | Not exposed in the current UI |
+| Custom | OpenAI-compatible audio/transcriptions endpoint | OpenAI-compatible chat/completions endpoint | Self-hosted OpenAI-compatible audio/speech endpoint |
 
 Model availability and billing are controlled by the provider. OpenFlow does not proxy requests or include hosted inference.
 
 ## Privacy and permissions
 
 - API credentials are stored using macOS Keychain, Windows DPAPI, or Linux Secret Service. Linux requires an unlocked keyring and the `secret-tool` command.
-- Recordings are held in memory for transcription and sent to the provider selected in Settings. Cleanup sends transcript text to the selected cleanup provider. Gemini voice previews send their text to OpenRouter.
+- Recordings are held in memory for transcription and sent to the provider selected in Settings. Cleanup sends transcript text to the selected cleanup provider. Voice previews send their text to the selected speech endpoint. Your transcription key is only ever reused by that same service; a different hosted provider or a self-hosted server never receives it.
 - Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory. You control it from Settings: delete individual entries, clear everything, turn saving off entirely, or set an auto-delete window (1/7/30/90 days) that is applied at launch and after each transcription.
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.
