@@ -48,6 +48,22 @@ public protocol SpeechEngine: Actor {
 
     /// Drop the weights. Must be idempotent and must not throw; the caller is
     /// often reacting to a memory warning and has nowhere to put an error.
+    ///
+    /// **It must not tear down state a `transcribe(samples16k:)` still running
+    /// on this actor is using.** `ModelManager.handleMemoryWarning()` calls this
+    /// while a transcription may be in flight -- deliberately, because PLAN.md
+    /// section 2 says a memory warning gets no grace period -- and it relies on
+    /// actor serialisation to make that safe: the call is queued behind whatever
+    /// is executing and runs when the actor is next free.
+    ///
+    /// That is only a guarantee for an implementation that does its work in one
+    /// unbroken stretch. An engine that suspends *inside* `transcribe` -- which
+    /// M2's MLX engine will, awaiting GPU work between decoder steps -- gives
+    /// this call a window to run in the middle of a recognition. Such an engine
+    /// must either hold the weights alive for the take in progress and free them
+    /// when it finishes, or cancel that take and throw
+    /// `SpeechEngineError.transcriptionFailed`. Freeing memory out from under a
+    /// suspended `transcribe` is a crash, not an optimisation.
     func unload() async
 
     /// Recognise 16 kHz mono Float32 samples in [-1, 1].

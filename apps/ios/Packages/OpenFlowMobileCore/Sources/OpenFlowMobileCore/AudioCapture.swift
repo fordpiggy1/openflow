@@ -249,6 +249,8 @@ public struct CaptureResult: Sendable {
 }
 
 public enum AudioCaptureError: Error, Equatable, Sendable {
+    /// The user has refused the microphone, or has not been asked and declined
+    /// the prompt. Actionable: the sheet points at Settings.
     case permissionDenied
     case engineUnavailable(String)
     case notRecording
@@ -324,9 +326,22 @@ public actor AudioCapture {
     /// True once the ten-minute watchdog has tripped.
     public var watchdogTripped: Bool { buffer?.didOverflow ?? false }
 
-    public func start() throws {
+    /// Ask for the microphone, then open it.
+    ///
+    /// The permission prompt comes first and on its own. Without it a denied or
+    /// not-yet-asked microphone reaches `AVAudioEngine.start()` and comes back as
+    /// an opaque failure -- on the Simulator, often no failure at all, just
+    /// silence that the whole-take gate then rejects as a dead input. Neither
+    /// tells the user the one thing they can act on, which is that the switch in
+    /// Settings is off.
+    public func start() async throws {
         guard engine == nil else { return }
         #if os(iOS)
+        // iOS 17 replaced AVAudioSession.requestRecordPermission with this. The
+        // package targets iOS 18, so there is no older path to keep.
+        guard await AVAudioApplication.requestRecordPermission() else {
+            throw AudioCaptureError.permissionDenied
+        }
         let session = AVAudioSession.sharedInstance()
         do {
             // `.record` and not `.playAndRecord`: OpenFlow never plays anything,

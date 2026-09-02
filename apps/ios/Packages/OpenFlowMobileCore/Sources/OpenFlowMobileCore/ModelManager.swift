@@ -121,6 +121,13 @@ public actor ModelManager {
     /// Identifies the load in flight, so a load that was cancelled underneath us
     /// cannot clear or overwrite the state of the one that replaced it.
     private var loadGeneration = 0
+    /// The same trick for the idle timer. `Task.cancel()` does not un-resume a
+    /// sleeper that has already woken: a timer that fired microseconds before
+    /// `cancelIdleTimer()` is already on its way to the actor, and by the time it
+    /// arrives `idleTask` has been replaced by a fresh one, so an `idleTask !=
+    /// nil` check waves it through and the new take's model is unloaded early.
+    /// The generation is what the stale wake-up fails.
+    private var idleGeneration = 0
     private var idleTask: Task<Void, Never>?
     private var backgroundTask: Task<Void, Never>?
 
@@ -282,8 +289,19 @@ public actor ModelManager {
 
     /// The scene left the foreground. Unload after the grace delay, unless a
     /// transcription is in flight, in which case finish it first.
+    ///
+    /// Arms nothing when there is nothing to drop. A backgrounded app with no
+    /// model resident should hold no timer at all -- PLAN.md section 5 budgets
+    /// zero idle work -- and an unload scheduled against `.unloaded` could only
+    /// ever fire against a model some later prewarm had just loaded.
     public func handleEnterBackground() {
         cancelBackgroundTimer()
+        switch currentState {
+        case .ready, .loading:
+            break
+        case .unloaded, .unloading, .failed:
+            return
+        }
         let grace = policy.backgroundGraceSeconds
         backgroundTask = Task { [weak self, clock] in
             await clock.sleep(seconds: grace)
@@ -370,21 +388,31 @@ public actor ModelManager {
         // Zero means "keep loaded while the app is open" (PLAN.md section 2).
         guard policy.unloadAfterMinutes > 0, currentState == .ready else { return }
         let seconds = Double(policy.unloadAfterMinutes) * 60
+        idleGeneration += 1
+        let generation = idleGeneration
         idleTask = Task { [weak self, clock] in
             await clock.sleep(seconds: seconds)
             if Task.isCancelled { return }
-            await self?.idleElapsed()
+            await self?.idleElapsed(generation: generation)
         }
     }
 
-    private func idleElapsed() async {
-        guard idleTask != nil, inFlight == 0 else { return }
+    /// Internal rather than private so a test can deliver a stale wake-up by
+    /// hand; the race it guards against cannot be scheduled reliably from
+    /// outside the actor.
+    func idleElapsed(generation: Int) async {
+        guard generation == idleGeneration, idleTask != nil, inFlight == 0 else { return }
         await unload(trigger: .idleTimeout)
     }
+
+    /// The generation a wake-up must carry to be acted on.
+    var currentIdleGeneration: Int { idleGeneration }
 
     private func cancelIdleTimer() {
         idleTask?.cancel()
         idleTask = nil
+        // Anything already in flight towards `idleElapsed` is now stale.
+        idleGeneration += 1
     }
 
     private func cancelBackgroundTimer() {

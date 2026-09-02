@@ -49,18 +49,3 @@ struct StartDictationIntent: AppIntent {
         return .result()
     }
 }
-
-/// Makes the intent findable in Shortcuts and by voice with no setup.
-struct OpenFlowShortcuts: AppShortcutsProvider {
-    static var appShortcuts: [AppShortcut] {
-        AppShortcut(
-            intent: StartDictationIntent(),
-            phrases: [
-                "Start dictation with \(.applicationName)",
-                "Dictate with \(.applicationName)",
-            ],
-            shortTitle: "Start dictation",
-            systemImageName: "mic.fill"
-        )
-    }
-}

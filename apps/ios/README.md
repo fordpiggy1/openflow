@@ -59,6 +59,17 @@ open OpenFlow.xcodeproj
 `OpenFlow.xcodeproj` is a build artefact and is not committed. `project.yml` is
 the file to review and to change.
 
+**The plists and entitlements are hand-written, and `project.yml` must never
+grow an `info:` or `entitlements:` block.** Those keys do not point XcodeGen at
+an existing file; they tell it to write one, and it rewrites that path from the
+spec on every `xcodegen generate`. That would silently erase the keyboard's
+`NSExtension` dict and `RequestsOpenAccess`, `NSMicrophoneUsageDescription`,
+`UIBackgroundModes`, `CFBundleURLTypes`, `NSSupportsLiveActivities` and the App
+Group in all three entitlements files. `INFOPLIST_FILE`,
+`CODE_SIGN_ENTITLEMENTS` and `GENERATE_INFOPLIST_FILE: NO` under each target's
+`settings.base` are what point the build at those files, and they are enough on
+their own. If a generate ever wipes them, that is why.
+
 ### Running with no model, in the Simulator
 
 The Debug configuration defines `OPENFLOW_FAKE_ENGINE`, which swaps in

@@ -98,11 +98,26 @@ final class DictationController {
         await refresh()
     }
 
-    func handleScenePhase(active: Bool) async {
-        if active {
+    /// The three scene phases, kept apart on purpose.
+    ///
+    /// `.inactive` is not backgrounding: it is the app switcher, Control Centre
+    /// pulled down, a call banner, Face ID over the top. Treating it as
+    /// backgrounding armed the 20 s unload every time the user glanced at
+    /// Control Centre, so the model was gone by the time they came back.
+    enum LifecyclePhase {
+        case active
+        case inactive
+        case background
+    }
+
+    func handleScenePhase(_ phase: LifecyclePhase) async {
+        switch phase {
+        case .active:
             await manager.handleEnterForeground()
-        } else {
+        case .background:
             await manager.handleEnterBackground()
+        case .inactive:
+            break
         }
         await refresh()
     }
@@ -142,6 +157,7 @@ final class DictationController {
             try await capture.start()
         } catch {
             phase = .failed(describe(error))
+            await endLiveActivity(preview: nil)
             return
         }
         #endif
@@ -169,9 +185,11 @@ final class DictationController {
             result = try await capture.stop()
         } catch AudioCaptureError.tooShort {
             phase = .failed("That was too short to transcribe.")
+            await endLiveActivity(preview: nil)
             return
         } catch {
             phase = .failed(describe(error))
+            await endLiveActivity(preview: nil)
             return
         }
         guard !result.isSilent else {
@@ -314,6 +332,18 @@ final class DictationController {
     }
 
     private func describe(_ error: Error) -> String {
+        if let captureError = error as? AudioCaptureError {
+            switch captureError {
+            case .permissionDenied:
+                return "OpenFlow needs the microphone. Turn it on in Settings, Privacy and Security, Microphone."
+            case .engineUnavailable(let detail):
+                return "The microphone could not start: \(detail)"
+            case .notRecording:
+                return "There was no recording to stop."
+            case .tooShort:
+                return "That was too short to transcribe."
+            }
+        }
         if let engineError = error as? SpeechEngineError {
             switch engineError {
             case .modelUnavailable(let detail): return detail

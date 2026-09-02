@@ -112,6 +112,35 @@ import Testing
         #expect(nil == store.loadLast())
     }
 
+    /// The keyboard extension has to tell "nothing dictated yet" apart from
+    /// "the sandbox will not let me look", because only one of them is the
+    /// user's to fix. `loadLast()` collapses both to nil.
+    @Test func testReadLastSeparatesAnEmptyStoreFromAnUnreadableOne() throws {
+        let directory = temporaryDirectory()
+        let store = TranscriptStore(directory: directory)
+        #expect(store.readLast() == .none)
+
+        let record = TranscriptRecord(text: "hello phone")
+        try store.saveLast(record)
+        #expect(store.readLast() == .record(record))
+
+        // Make the file genuinely unreadable, the way the keyboard sandbox does.
+        let file = directory.appendingPathComponent("last.json")
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+        }
+
+        // Running as root would make the chmod meaningless and the assertion a
+        // lie, so say so rather than passing for the wrong reason.
+        guard getuid() != 0 else {
+            Issue.record("test must not run as root; chmod 000 would still be readable")
+            return
+        }
+        #expect(store.readLast() == .unreadable)
+        #expect(store.loadLast() == nil, "loadLast still collapses it, which is why readLast exists")
+    }
+
     @Test func testHistoryIsReadableFromASecondHandleOnTheSameDirectory() throws {
         // The keyboard extension is a different process reading the same files.
         let directory = temporaryDirectory()

@@ -74,19 +74,33 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     /// Reads only `last.json`. A 30-day history is never parsed here.
+    ///
+    /// Three outcomes, and they need three different sentences. Without Allow
+    /// Full Access the container may fail to resolve at all, or resolve and then
+    /// refuse the read -- both mean the same thing to the user, and neither is
+    /// "you have not dictated anything yet". Telling someone to go and dictate
+    /// when the real problem is a switch in Settings sends them round a loop
+    /// that cannot end.
     private func refresh() {
         guard let store = try? TranscriptStore.shared() else {
-            hintLabel.text = "OpenFlow cannot read its shared storage. Turn on Allow Full Access."
-            insertButton.isEnabled = false
+            showFullAccessHint()
             return
         }
-        guard let record = store.loadLast() else {
+        switch store.readLast() {
+        case .unreadable:
+            showFullAccessHint()
+        case .none:
             hintLabel.text = "Dictate something in OpenFlow and it will appear here."
             insertButton.isEnabled = false
-            return
+        case .record(let record):
+            insertButton.isEnabled = true
+            hintLabel.text = preview(record.text)
         }
-        insertButton.isEnabled = true
-        hintLabel.text = preview(record.text)
+    }
+
+    private func showFullAccessHint() {
+        hintLabel.text = "Turn on Allow Full Access in Settings, General, Keyboard so OpenFlow can read your last dictation."
+        insertButton.isEnabled = false
     }
 
     private func preview(_ text: String) -> String {
@@ -95,7 +109,13 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     @objc private func insertLast() {
-        guard let store = try? TranscriptStore.shared(), let record = store.loadLast() else { return }
+        guard let store = try? TranscriptStore.shared(),
+              case .record(let record) = store.readLast() else {
+            // The button is disabled in both other cases; if we get here the
+            // state changed underneath us, so re-read and say why.
+            refresh()
+            return
+        }
         textDocumentProxy.insertText(record.text)
     }
 

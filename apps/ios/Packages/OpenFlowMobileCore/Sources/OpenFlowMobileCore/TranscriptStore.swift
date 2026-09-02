@@ -84,8 +84,63 @@ public struct TranscriptStore: Sendable {
     }
 
     public func loadLast() -> TranscriptRecord? {
-        guard let data = try? Data(contentsOf: lastURL) else { return nil }
-        return try? Self.decoder.decode(TranscriptRecord.self, from: data)
+        if case .record(let record) = readLast() { return record }
+        return nil
+    }
+
+    /// What the keyboard extension actually needs to know: not just "is there a
+    /// transcript" but "is there one I am allowed to read".
+    public enum LastTranscript: Sendable, Equatable {
+        /// Nothing has been dictated yet, or the user deleted it.
+        case none
+        /// The file is there and this process cannot open it. In the keyboard
+        /// extension that means one thing: Allow Full Access is off, so the
+        /// sandbox is refusing the App Group container. Telling the user to go
+        /// and dictate something would be advice that cannot work.
+        case unreadable
+        case record(TranscriptRecord)
+    }
+
+    /// Distinguishes "nothing saved" from "not allowed to look", which
+    /// `loadLast()` collapses into nil.
+    public func readLast() -> LastTranscript {
+        do {
+            let data = try Data(contentsOf: lastURL)
+            guard let record = try? Self.decoder.decode(TranscriptRecord.self, from: data) else {
+                // Present but unparseable: a truncated write, not a permission
+                // problem. Nothing to insert, and nothing the user can fix.
+                return .none
+            }
+            return .record(record)
+        } catch {
+            return Self.isPermissionError(error) ? .unreadable : .none
+        }
+    }
+
+    /// A read that failed because the sandbox said no, rather than because the
+    /// file is not there. Cocoa reports the first as `fileReadNoPermission` and
+    /// the second as `fileReadNoSuchFile`; the POSIX codes are checked too,
+    /// because a container the process cannot traverse surfaces as `EPERM` or
+    /// `EACCES` rather than as a Cocoa error.
+    static func isPermissionError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain {
+            switch CocoaError.Code(rawValue: nsError.code) {
+            case .fileReadNoPermission, .fileReadInvalidFileName:
+                return true
+            default:
+                break
+            }
+        }
+        if nsError.domain == NSPOSIXErrorDomain {
+            return nsError.code == Int(EPERM) || nsError.code == Int(EACCES)
+        }
+        // A Cocoa error often carries the POSIX one underneath it.
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError,
+           underlying.domain == NSPOSIXErrorDomain {
+            return underlying.code == Int(EPERM) || underlying.code == Int(EACCES)
+        }
+        return false
     }
 
     // MARK: - History

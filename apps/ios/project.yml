@@ -5,6 +5,22 @@
 #
 # The generated OpenFlow.xcodeproj is NOT committed: it is a build artefact of
 # this file, and this file is the thing to review. See apps/ios/README.md.
+#
+# NEVER add `info:` or `entitlements:` blocks to a target here.
+#
+# They do not point XcodeGen at an existing file -- they tell it to WRITE one,
+# and it rewrites that path from this spec on every `xcodegen generate`. The
+# plists and entitlements in this directory are hand-written and carry things
+# this spec has no way to express: the keyboard's NSExtension dict and
+# RequestsOpenAccess, NSMicrophoneUsageDescription, UIBackgroundModes,
+# CFBundleURLTypes, NSSupportsLiveActivities, and the App Group in all three
+# entitlements files. A single `xcodegen generate` with those blocks present
+# silently erases the lot, and the failure shows up as a keyboard that cannot
+# read the App Group or a build that the microphone permission never reaches.
+#
+# INFOPLIST_FILE, CODE_SIGN_ENTITLEMENTS and GENERATE_INFOPLIST_FILE: NO under
+# each target's settings.base are what actually point the build at those files,
+# and they are sufficient on their own.
 
 name: OpenFlow
 options:
@@ -64,10 +80,6 @@ targets:
       - target: OpenFlowWidgets
       # - package: OpenFlowQwenEngine      # M2
       # - package: OpenFlowWhisperEngine   # M2
-    info:
-      path: OpenFlow/Info.plist
-    entitlements:
-      path: OpenFlow/OpenFlow.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow
@@ -93,10 +105,6 @@ targets:
     dependencies:
       - package: OpenFlowMobileCore
         product: OpenFlowMobileCore
-    info:
-      path: OpenFlowKeyboard/Info.plist
-    entitlements:
-      path: OpenFlowKeyboard/OpenFlowKeyboard.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow.keyboard
@@ -115,12 +123,10 @@ targets:
           - "Info.plist"
           - "OpenFlowWidgets.entitlements"
       # The control widget launches the same App Intent the Action Button does,
-      # so the intent definition is compiled into this target too.
+      # so the intent definition is compiled into this target too. Only this one
+      # file: OpenFlowShortcuts.swift stays app-only, because an
+      # AppShortcutsProvider must be declared once and by the app.
       - path: OpenFlow/Intents/StartDictationIntent.swift
-    info:
-      path: OpenFlowWidgets/Info.plist
-    entitlements:
-      path: OpenFlowWidgets/OpenFlowWidgets.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow.widgets

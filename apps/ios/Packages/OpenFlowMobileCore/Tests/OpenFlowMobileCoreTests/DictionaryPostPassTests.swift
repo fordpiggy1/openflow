@@ -74,6 +74,32 @@ import Testing
         #expect(DictionaryPostPass.apply("entro.ly ships", dictionary: "ENTRO.LY") == "ENTRO.LY ships")
     }
 
+    /// Rule 4's exception: an entry that carries its own capital keeps it, even
+    /// at the start of a sentence. Capitalising the first letter of `iPhone`
+    /// gives `IPhone`, which is a worse error than the one the dictionary was
+    /// added to fix.
+    @Test func testMixedCaseEntriesKeepTheirOwnCasingAtASentenceStart() {
+        #expect(
+            DictionaryPostPass.apply("iphone. iphone", dictionary: "iphone -> iPhone")
+                == "iPhone. iPhone"
+        )
+        #expect(
+            DictionaryPostPass.apply("ebay sells it. ebay does", dictionary: "ebay -> eBay")
+                == "eBay sells it. eBay does"
+        )
+        // An all-lower-case entry is still sentence-cased: the exception is
+        // narrow, not a removal of rule 4.
+        #expect(
+            DictionaryPostPass.apply("openflow. openflow", dictionary: "openflow")
+                == "Openflow. Openflow"
+        )
+        // ...and an upper-case entry is untouched either way.
+        #expect(
+            DictionaryPostPass.apply("entro.ly. entro.ly", dictionary: "ENTRO.LY")
+                == "ENTRO.LY. ENTRO.LY"
+        )
+    }
+
     /// Rule 5: no rescanning, so rules cannot chain into something nobody wrote.
     @Test func testReplacementsDoNotChain() {
         let out = DictionaryPostPass.apply(

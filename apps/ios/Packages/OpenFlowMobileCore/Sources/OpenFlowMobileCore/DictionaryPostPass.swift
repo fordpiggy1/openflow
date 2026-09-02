@@ -36,12 +36,18 @@ import Foundation
 ///    on dictionary iteration order.
 /// 3. **Case-insensitive match, dictionary casing wins.** The entry decides how
 ///    the term is spelled; that is the entire point of the feature.
-/// 4. **Sentence-initial capitalisation is preserved.** If the match starts the
-///    text, or follows `.`, `!`, `?`, `:` or a newline plus whitespace, the first
-///    character of the replacement is upper-cased. So `fastpay` at the start of a
-///    sentence becomes `FastPay` (already capitalised, unchanged) but a
-///    dictionary entry of `openflow` becomes `Openflow` there and `openflow`
-///    mid-sentence. An entry that is already upper-case is untouched.
+/// 4. **Sentence-initial capitalisation is preserved, but only for an entry that
+///    is entirely lower-case.** If the match starts the text, or follows `.`,
+///    `!`, `?`, `:` or a newline plus whitespace, the first character of the
+///    replacement is upper-cased -- so a dictionary entry of `openflow` becomes
+///    `Openflow` there and stays `openflow` mid-sentence.
+///
+///    An entry carrying any capital of its own is left exactly as written. That
+///    capital is the reason the entry exists: `iPhone`, `eBay`, `macOS` and
+///    `ENTRO.LY` are spellings the user typed deliberately, and upper-casing
+///    their first letter produces `IPhone` and `EBay`, which is worse than the
+///    mistake the dictionary was added to fix. Rule 3 says the dictionary's
+///    casing wins; this rule only fills in a decision the entry did not make.
 /// 5. **One left-to-right pass, no rescanning.** Replaced spans are never
 ///    matched again, so `a -> b` and `b -> c` cannot chain. The output is a pure
 ///    function of (text, dictionary).
@@ -137,9 +143,10 @@ public enum DictionaryPostPass {
                 let before = index > 0 ? source[index - 1] : nil
                 let after = index + needle.count < source.count ? source[index + needle.count] : nil
                 if isWordCharacter(before) || isWordCharacter(after) { continue }
-                // Rule 4: sentence-initial capitalisation.
+                // Rule 4: sentence-initial capitalisation, for entries that
+                // expressed no capitalisation of their own.
                 let replacement = startsSentence(output)
-                    ? capitalisingFirstCharacter(entry.replacement)
+                    ? sentenceCased(entry.replacement)
                     : entry.replacement
                 output.append(replacement)
                 index += needle.count
@@ -175,8 +182,12 @@ public enum DictionaryPostPass {
         return true
     }
 
-    private static func capitalisingFirstCharacter(_ value: String) -> String {
+    /// Upper-cases the first character, but only for an entry that is entirely
+    /// lower-case. `openflow` becomes `Openflow`; `iPhone`, `eBay` and
+    /// `ENTRO.LY` are returned untouched, because their capitals are the point.
+    private static func sentenceCased(_ value: String) -> String {
         guard let first = value.first, first.isLowercase else { return value }
+        guard !value.contains(where: { $0.isUppercase }) else { return value }
         return String(first).uppercased() + value.dropFirst()
     }
 }

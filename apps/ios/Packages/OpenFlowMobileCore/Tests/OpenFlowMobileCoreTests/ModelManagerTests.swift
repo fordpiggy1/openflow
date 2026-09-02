@@ -143,6 +143,58 @@ import Testing
         #expect(clock.sleeperCount == 0, "no timer should be armed at all")
     }
 
+    /// The race the generation counter exists for: a timer that woke a moment
+    /// before `cancelIdleTimer()` is already on its way to the actor, and lands
+    /// after a fresh timer has replaced `idleTask`. An `idleTask != nil` guard
+    /// waves it through and unloads the model the new take just loaded.
+    ///
+    /// The interleaving cannot be scheduled reliably from outside an actor, so
+    /// the stale wake-up is delivered by hand -- and the same call with the live
+    /// generation is made straight afterwards, so a guard that rejected
+    /// everything could not pass this test.
+    @Test func testAStaleIdleWakeUpCannotUnloadTheModelItDidNotArm() async throws {
+        var policy = ModelPolicy()
+        policy.unloadAfterMinutes = 5
+        let (manager, engine, _, _) = makeManager(policy: policy)
+
+        _ = try await manager.transcribe(samples16k: [0.1])
+        let stale = await manager.currentIdleGeneration
+
+        // A second take cancels the first timer and arms a new one.
+        _ = try await manager.transcribe(samples16k: [0.1])
+        let live = await manager.currentIdleGeneration
+        #expect(stale != live, "re-arming must move the generation on")
+
+        await manager.idleElapsed(generation: stale)
+        let survived = await manager.state
+        #expect(survived == .ready, "a stale wake-up must not unload the new take's model")
+        let unloadsAfterStale = await engine.unloadCount
+        #expect(unloadsAfterStale == 0)
+
+        await manager.idleElapsed(generation: live)
+        let unloaded = await manager.state
+        #expect(unloaded == .unloaded, "the live wake-up must still work, or the guard proves nothing")
+    }
+
+    /// A backgrounded app with nothing resident should hold no timer at all.
+    @Test func testBackgroundingWithNothingLoadedArmsNoTimer() async {
+        var policy = ModelPolicy()
+        policy.backgroundGraceSeconds = 20
+        let (manager, engine, _, clock) = makeManager(policy: policy)
+
+        let idle = await manager.state
+        #expect(idle == .unloaded)
+        await manager.handleEnterBackground()
+        #expect(clock.sleeperCount == 0, "nothing resident, nothing to schedule")
+
+        clock.advance(by: 120)
+        await Task.yield()
+        let after = await manager.state
+        #expect(after == .unloaded)
+        let unloads = await engine.unloadCount
+        #expect(unloads == 0)
+    }
+
     @Test func testMemoryWarningUnloadsImmediately() async throws {
         let (manager, engine, _, _) = makeManager()
         try await manager.ensureLoaded()

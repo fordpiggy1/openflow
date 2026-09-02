@@ -33,7 +33,17 @@ struct OpenFlowApp: App {
                 }
         }
         .onChange(of: scenePhase) { _, phase in
-            Task { await controller.handleScenePhase(active: phase == .active) }
+            // Only `.background` arms the unload and only `.active` cancels it.
+            // `.inactive` -- app switcher, Control Centre, a call banner -- is
+            // neither, and must not start the 20 s clock.
+            let mapped: DictationController.LifecyclePhase
+            switch phase {
+            case .active: mapped = .active
+            case .background: mapped = .background
+            case .inactive: mapped = .inactive
+            @unknown default: mapped = .inactive
+            }
+            Task { await controller.handleScenePhase(mapped) }
         }
     }
 }
