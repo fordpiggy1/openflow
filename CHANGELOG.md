@@ -4,6 +4,12 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Socket-level test for the credential isolation guarantee
+By: Ford
+Impact: `src-tauri/src/lib.rs`
+
+- `selfhosted_request_carries_no_cloud_credential` binds a listener, sends a real speech request at it, and asserts on the bytes that crossed the socket: no `authorization` header, no transcription key, and the right path and body. The existing unit tests cover what `resolve_speech_key` returns, not what the request carries, and a LAN server that accepts any credential answers 200 either way — so a leak would be silent.
+
 ### Groq as the recommended provider, personal dictionary, Orpheus voice
 By: Titan (with Claude)
 Impact: `src/App.tsx`, `src-tauri/src/transcribe.rs`, `src-tauri/src/lib.rs`, `README.md`
@@ -24,6 +30,7 @@ Impact: `src-tauri/src/transcribe.rs`, `src-tauri/src/lib.rs`, `src/App.tsx`, `s
 - The voice preview and the Settings voice section are keyed on the selected voice provider, so the Self-hosted / LAN option is reachable from any transcription provider.
 - Blank voice model and voice fields reach the backend blank instead of being replaced with Gemini names.
 - Setup counts as complete once a provider is saved, even with no key.
+- Whole-take silence gate: a recording whose loud part sits under -60 dBFS is refused with an error naming the input device, instead of being uploaded. Whisper hallucinates on silence and, with a dictionary prompt, echoes the prompt back. Found dogfooding with a virtual "Find My" device as the system default input.
 
 ### Audit follow-ups and self-hosted speech endpoints
 By: Ford
