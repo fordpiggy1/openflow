@@ -11,7 +11,7 @@ Impact: `src/App.tsx`, `src-tauri/src/transcribe.rs`, `src-tauri/src/lib.rs`, `R
 - Groq is first in onboarding with the Recommended badge; fresh installs default to Groq for transcription, cleanup, and voice.
 - Cleanup default on Groq is `openai/gpt-oss-20b` with `reasoning_effort: "low"`. Groq no longer serves Llama to standard accounts, so the old `llama-3.3-70b-versatile` default returned 404.
 - New Dictionary setting: names and terms are sent to Whisper as the `prompt` spelling hint on Groq, OpenAI, and custom endpoints. Capped at 800 characters.
-- Groq's Orpheus text-to-speech is reachable from the voice dropdown. Voice model and voice defaults now resolve per provider in one place.
+- Groq's Orpheus text-to-speech is reachable from the voice dropdown. Orpheus answers only in WAV, so the response format is chosen per provider and WAV providers play back after download rather than mid-stream. Voice model and voice defaults now resolve per provider in one place.
 - OpenRouter's backend and frontend chat defaults now agree on `google/gemini-3.1-flash-lite-preview`.
 
 ### Post-merge sweep fixes

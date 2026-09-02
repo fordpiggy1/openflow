@@ -19,7 +19,7 @@ The project is currently an early source build. There are no official pre-built 
 
 ### Streaming scope
 
-Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download.
+Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download. Groq's Orpheus returns WAV only, which cannot be streamed through Media Source Extensions, so it always plays after the download completes.
 
 ## Providers
 

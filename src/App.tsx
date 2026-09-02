@@ -128,12 +128,19 @@ const PROVIDERS: Record<string, ProviderDefinition> = {
 };
 
 const TTS_DEFAULT_MODEL = "google/gemini-3.1-flash-tts-preview";
-const TTS_DEFAULTS: Record<string, { model: string; voice: string; voices: string[] }> = {
-  groq: { model: "canopylabs/orpheus-v1-english", voice: "troy", voices: ["troy", "hannah", "austin"] },
-  openrouter: { model: TTS_DEFAULT_MODEL, voice: "Kore", voices: ["Kore", "Aoede", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Zephyr"] },
-  openai: { model: "tts-1", voice: "alloy", voices: ["alloy", "echo", "fable", "onyx", "nova", "shimmer"] },
-  custom: { model: "kokoro", voice: "af_bella", voices: [] },
+// Groq's Orpheus answers only in WAV (mp3 is a 400), so the format is a
+// property of the provider. WAV cannot be fed to a MediaSource, so those
+// providers play back after the download completes instead of mid-stream.
+const TTS_DEFAULTS: Record<string, { model: string; voice: string; voices: string[]; format: "mp3" | "wav" }> = {
+  groq: { model: "canopylabs/orpheus-v1-english", voice: "troy", voices: ["troy", "hannah", "austin", "autumn", "daniel", "diana"], format: "wav" },
+  openrouter: { model: TTS_DEFAULT_MODEL, voice: "Kore", voices: ["Kore", "Aoede", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Zephyr"], format: "mp3" },
+  openai: { model: "tts-1", voice: "alloy", voices: ["alloy", "echo", "fable", "onyx", "nova", "shimmer"], format: "mp3" },
+  custom: { model: "kokoro", voice: "af_bella", voices: [], format: "mp3" },
 };
+
+function ttsFormat(provider: string): "mp3" | "wav" {
+  return TTS_DEFAULTS[provider]?.format ?? "mp3";
+}
 const LANGUAGE_OPTIONS = [
   ["auto", "Auto-detect"], ["en", "English"], ["es", "Spanish"], ["fr", "French"],
   ["de", "German"], ["it", "Italian"], ["pt", "Portuguese"], ["nl", "Dutch"],
@@ -628,7 +635,7 @@ function App() {
       ["tts_provider", providerValue(ttsProvider, customTtsUrl)],
       ["tts_model", ttsModel.trim()],
       ["tts_voice", ttsVoice.trim()],
-      ["tts_response_format", "mp3"],
+      ["tts_response_format", ttsFormat(ttsProvider)],
       ["save_history", String(saveHistory)],
       ["history_retention_days", retentionDays],
       ["dictionary", dictionary.trim()],
@@ -729,10 +736,11 @@ function App() {
     setTtsError("");
     setTtsStatus("streaming");
     const requestId = crypto.randomUUID();
+    const format = ttsFormat(ttsProvider);
     ttsRequestRef.current = requestId;
     ttsChunksRef.current.set(requestId, new Map());
-    ttsMimeRef.current = "audio/mpeg";
-    if ("MediaSource" in window && MediaSource.isTypeSupported("audio/mpeg")) {
+    ttsMimeRef.current = format === "wav" ? "audio/wav" : "audio/mpeg";
+    if (format === "mp3" && "MediaSource" in window && MediaSource.isTypeSupported("audio/mpeg")) {
       const mediaSource = new MediaSource();
       const playback: TtsStreamPlayback = {
         mediaSource,
@@ -771,10 +779,10 @@ function App() {
         text: ttsPreviewText.trim(),
         model: ttsModel.trim(),
         voice: ttsVoice.trim(),
-        responseFormat: "mp3",
+        responseFormat: format,
         requestId,
       });
-      ttsMimeRef.current = result.mime_type || "audio/wav";
+      ttsMimeRef.current = result.mime_type || ttsMimeRef.current;
       const chunks = ttsChunksRef.current.get(requestId);
       if (chunks?.size && ttsRequestRef.current === requestId) {
         const ordered = [...chunks.entries()].sort(([a], [b]) => a - b).map(([, value]) => value);
