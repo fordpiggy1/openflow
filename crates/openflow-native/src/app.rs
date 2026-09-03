@@ -364,6 +364,16 @@ impl Delegate {
 fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     let (engine, _preview) = build_engine(app_dir)?;
 
+    // The handlers go on before the things that raise events exist. Both are
+    // process-wide callbacks that hop to the main thread and then ask
+    // `with_app`, which answers `None` until the app is in its slot below, so
+    // an event raised during construction is dropped rather than reaching a
+    // half-built app. Installed the other way round, a menu click or a hotkey
+    // press between `Tray::new` and `install_handler` would have no handler at
+    // all and be lost with no trace of why.
+    crate::hotkeys::install_handler();
+    crate::tray::install_handler();
+
     let overlay = Overlay::new(&engine, mtm);
     let tray = Tray::new(&engine)?;
     let hotkeys = Hotkeys::new(engine.settings())?;
@@ -383,10 +393,6 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
 
-    // The handlers are installed only once the app exists, so a hotkey or menu
-    // click during startup cannot reach a half-built state.
-    crate::hotkeys::install_handler();
-    crate::tray::install_handler();
     // Key equivalents only exist if there is a main menu to route them
     // through, even though an accessory app never draws one.
     crate::menu::install(mtm);

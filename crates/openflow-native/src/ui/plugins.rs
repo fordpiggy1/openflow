@@ -8,6 +8,7 @@
 //! validated inside core, so nothing here has to know what a valid one is.
 
 use std::cell::RefCell;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -116,6 +117,95 @@ pub fn read_manifest(folder: &Path) -> Result<String, String> {
         .map_err(|error| format!("Could not read {}: {}", path.display(), error))
 }
 
+/// Where one entry of the picked folder may be copied, or `None` when it may
+/// not be copied at all.
+///
+/// `install_plugin` writes the manifest and nothing else
+/// (crates/openflow-core/src/plugins.rs:121-141), so the entrypoint the manifest
+/// names has to be carried over separately or the plugin fails the first time a
+/// hook runs it. That copy is the only place in this app that writes a file
+/// whose name came from outside, so the name is checked rather than trusted: a
+/// single plain component, landing as a direct child of the plugin directory.
+/// The plugin directory itself is already safe, because `validate_manifest`
+/// rejects an id that could traverse.
+pub fn copy_destination(plugin_dir: &Path, file_name: &OsStr) -> Option<PathBuf> {
+    let text = file_name.to_str()?;
+    if text.is_empty() || text == "." || text == ".." || text.contains('/') || text.contains('\\') {
+        return None;
+    }
+    let name = Path::new(text);
+    if name.components().count() != 1 || name.is_absolute() {
+        return None;
+    }
+    let destination = plugin_dir.join(name);
+    // Whatever the name was, the result has to be a direct child of the plugin
+    // directory. This is the assertion the rules above are trying to make true.
+    (destination.parent() == Some(plugin_dir)).then_some(destination)
+}
+
+/// Whether two paths name the same directory on disk.
+fn same_directory(one: &Path, other: &Path) -> bool {
+    match (one.canonicalize(), other.canonicalize()) {
+        (Ok(one), Ok(other)) => one == other,
+        // An uncanonicalisable path cannot be proven different, so fall back to
+        // comparing what we were given rather than deciding they differ.
+        _ => one == other,
+    }
+}
+
+/// Copy the picked folder's own files into the installed plugin's directory,
+/// answering how many landed.
+///
+/// Not recursive, on purpose: a plugin is a manifest and an entrypoint beside
+/// it, and a recursive copy of a folder the user picked by hand is a much
+/// larger promise. Symlinks are skipped rather than followed, so a link cannot
+/// pull a file in from outside the folder that was chosen. `fs::copy` carries
+/// the permission bits across on Unix, which is what keeps an executable
+/// entrypoint executable.
+pub fn copy_plugin_files(source: &Path, plugin_dir: &Path) -> Result<usize, String> {
+    if same_directory(source, plugin_dir) {
+        return Err(format!(
+            "{} is already the installed plugin, so there is nothing to copy.",
+            source.display()
+        ));
+    }
+    let entries = std::fs::read_dir(source)
+        .map_err(|error| format!("Could not read {}: {}", source.display(), error))?;
+    let mut copied = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata`, never `metadata`: this must not follow a link.
+        let Ok(metadata) = path.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let Some(destination) = copy_destination(plugin_dir, &entry.file_name()) else {
+            continue;
+        };
+        std::fs::copy(&path, &destination).map_err(|error| {
+            format!(
+                "Could not copy {}: {}",
+                entry.file_name().to_string_lossy(),
+                error
+            )
+        })?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+/// What the status line says after a successful install.
+pub fn installed_line(name: &str, files: usize) -> String {
+    format!(
+        "Installed {} ({} file{}). Enable it to let it run.",
+        name,
+        files,
+        if files == 1 { "" } else { "s" }
+    )
+}
+
 // ── The window ────────────────────────────────────────────
 
 struct Controls {
@@ -216,15 +306,21 @@ define_class!(
             };
             // The same call the Tauri `install_plugin` command makes, with the
             // same string: core validates the manifest and writes it into the
-            // plugins directory, disabled.
-            match self.ivars().engine.plugins().install_plugin(&manifest) {
-                Ok(plugin) => {
-                    self.load();
-                    self.say(&format!(
-                        "Installed {}. Enable it to let it run.",
-                        plugin.manifest.name
-                    ));
+            // plugins directory, disabled. It writes only the manifest, so the
+            // rest of the folder is carried over here; without it the plugin is
+            // listed, enabled, and then fails at hook time with no entrypoint
+            // on disk.
+            let plugin = match self.ivars().engine.plugins().install_plugin(&manifest) {
+                Ok(plugin) => plugin,
+                Err(error) => {
+                    self.say(&error);
+                    return;
                 }
+            };
+            let outcome = copy_plugin_files(&folder, Path::new(&plugin.path));
+            self.load();
+            match outcome {
+                Ok(copied) => self.say(&installed_line(&plugin.manifest.name, copied)),
                 Err(error) => self.say(&error),
             }
         }
@@ -522,6 +618,73 @@ mod tests {
         assert_eq!(columns[3], "Enabled");
         assert_eq!(columns[4], "Counts the words in a dictation.");
         assert_eq!(row_columns(&plugin(false))[3], "Disabled");
+    }
+
+    /// The only file name in this app that comes from outside: it has to land
+    /// as a direct child of the plugin directory or not be copied at all.
+    #[test]
+    fn only_a_plain_file_name_is_copied_into_the_plugin_directory() {
+        let plugin_dir = Path::new("/tmp/plugins/wordcount");
+        assert_eq!(
+            copy_destination(plugin_dir, OsStr::new("run.sh")),
+            Some(plugin_dir.join("run.sh"))
+        );
+        for refused in ["..", ".", "", "../evil", "sub/run.sh", "/etc/passwd"] {
+            assert_eq!(
+                copy_destination(plugin_dir, OsStr::new(refused)),
+                None,
+                "{refused} must be refused"
+            );
+        }
+        // Every accepted name is a direct child, which is the property the
+        // rules exist to guarantee.
+        for accepted in ["run.sh", "manifest.json", ".enabled", "a.b.c"] {
+            let destination = copy_destination(plugin_dir, OsStr::new(accepted)).unwrap();
+            assert_eq!(destination.parent(), Some(plugin_dir));
+        }
+    }
+
+    /// The entrypoint has to arrive beside the manifest, and picking the
+    /// installed plugin's own folder has to be refused rather than copying a
+    /// file over itself.
+    #[test]
+    fn installing_carries_the_folder_beside_the_manifest() {
+        let root =
+            std::env::temp_dir().join(format!("openflow-install-test-{}", std::process::id()));
+        let source = root.join("picked");
+        let plugin_dir = root.join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("manifest.json"), "{}").unwrap();
+        std::fs::write(source.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(source.join("nested/ignored.txt"), "no").unwrap();
+
+        let copied = copy_plugin_files(&source, &plugin_dir).unwrap();
+        assert_eq!(copied, 2, "the two regular files, not the directory");
+        assert!(plugin_dir.join("run.sh").exists());
+        assert!(plugin_dir.join("manifest.json").exists());
+        assert!(!plugin_dir.join("nested").exists());
+
+        let error = copy_plugin_files(&plugin_dir, &plugin_dir).unwrap_err();
+        assert!(
+            error.contains("already the installed plugin"),
+            "a self-copy must be refused: {error}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_installed_line_counts_the_files_it_carried() {
+        assert_eq!(
+            installed_line("Word count", 1),
+            "Installed Word count (1 file). Enable it to let it run."
+        );
+        assert_eq!(
+            installed_line("Word count", 2),
+            "Installed Word count (2 files). Enable it to let it run."
+        );
     }
 
     #[test]

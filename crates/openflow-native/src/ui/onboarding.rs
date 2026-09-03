@@ -25,10 +25,13 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSComboBox, NSControl, NSControlStateValueOff,
-    NSControlStateValueOn, NSPopUpButton, NSSecureTextField, NSSwitch, NSTabView, NSTabViewItem,
-    NSTabViewType, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSPopUpButton, NSSecureTextField,
+    NSSwitch, NSTabView, NSTabViewItem, NSTabViewType, NSTextField, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+};
 
 use openflow_core::engine::Engine;
 use openflow_core::transcribe::ModelInfo;
@@ -155,6 +158,37 @@ pub fn can_advance(
     }
 }
 
+/// Whether the credentials on screen have been proven against the provider.
+///
+/// A plain bool was not enough. The wizard set it on a successful Test
+/// connection and cleared it only when the provider changed, so editing the key
+/// or the endpoint afterwards left the gate open and setup could save a key
+/// nothing had ever called. `App.tsx` resets `connectionState` on every
+/// keystroke in either credential field (src/App.tsx:962 and :979); this is
+/// that rule as one value with two verbs, so the window cannot forget half of
+/// it.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Connection {
+    proven: bool,
+}
+
+impl Connection {
+    pub fn proven(self) -> bool {
+        self.proven
+    }
+
+    /// `fetch_models` answered for these exact credentials.
+    pub fn succeeded(&mut self) {
+        self.proven = true;
+    }
+
+    /// The credentials changed, or the call failed. Either way what was proven
+    /// no longer describes what is on screen.
+    pub fn invalidated(&mut self) {
+        self.proven = false;
+    }
+}
+
 /// One row of the provider list.
 pub struct ProviderOption {
     pub value: &'static str,
@@ -223,7 +257,11 @@ pub fn badge_text(option: &ProviderOption) -> Option<&'static str> {
     option.recommended.then_some("Recommended")
 }
 
-/// The closing panel's summary of what setup is about to save.
+/// The closing panel's summary of what setup saved.
+///
+/// The shortcut is named as already live, because it is: the recorder rebinds
+/// it with the system the moment it is recorded, so by the time this panel is
+/// on screen the chord already works everywhere.
 pub fn summary_line(kind: &str, model: &str, microphone: &str, shortcut: &str) -> String {
     let provider = option_for(kind).label;
     let model = if model.trim().is_empty() {
@@ -232,7 +270,7 @@ pub fn summary_line(kind: &str, model: &str, microphone: &str, shortcut: &str) -
         model.trim()
     };
     format!(
-        "{} · {} · {} · hold {} to dictate",
+        "{} · {} · {} · hold {} to dictate, active now",
         provider, model, microphone, shortcut
     )
 }
@@ -275,7 +313,7 @@ pub struct OnboardingIvars {
     panels: Retained<NSTabView>,
     controls: Controls,
     step: Cell<Step>,
-    connected: Cell<bool>,
+    connection: Cell<Connection>,
     recorder: ChordRecorder,
     recording: Cell<bool>,
 }
@@ -303,6 +341,17 @@ define_class!(
         }
     }
 
+    unsafe impl NSControlTextEditingDelegate for OnboardingWindow {
+        /// The endpoint URL and the API key are the two fields this object is
+        /// the delegate of, and editing either one un-proves the connection.
+        /// Without this a user could pass the Test connection gate and then
+        /// paste a different key over it on the way out.
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            self.invalidate_connection();
+        }
+    }
+
     impl OnboardingWindow {
         #[unsafe(method(stepBack:))]
         fn step_back(&self, _sender: &NSControl) {
@@ -319,8 +368,7 @@ define_class!(
         fn provider_changed(&self, _sender: &NSControl) {
             // A different provider is a different key and a different model
             // list, so the connection has to be proven again.
-            self.ivars().connected.set(false);
-            self.set_text(&self.ivars().controls.connection_status, "");
+            self.invalidate_connection();
             self.apply_provider_defaults();
             self.update_chrome();
         }
@@ -380,7 +428,7 @@ impl OnboardingWindow {
             panels,
             controls,
             step: Cell::new(Step::Welcome),
-            connected: Cell::new(false),
+            connection: Cell::new(Connection::default()),
             recorder: ChordRecorder::default(),
             recording: Cell::new(false),
         });
@@ -409,6 +457,19 @@ impl OnboardingWindow {
         wire(&controls.back, target, sel!(stepBack:));
         wire(&controls.primary, target, sel!(stepNext:));
         wire(&controls.test, target, sel!(testConnection:));
+        // The two credential fields report every keystroke, so the connection
+        // gate can close again the moment one of them changes.
+        for field in [
+            controls.provider_url.as_ref() as &NSControl,
+            &controls.api_key,
+        ] {
+            unsafe {
+                msg_send![
+                    field,
+                    setDelegate: Some(ProtocolObject::<dyn NSControlTextEditingDelegate>::from_ref(self))
+                ]
+            }
+        }
         wire(&controls.refresh, target, sel!(refreshMicrophones:));
         wire(&controls.hotkey, target, sel!(recordHotkey:));
     }
@@ -449,7 +510,7 @@ impl OnboardingWindow {
         self.reload_hotkey();
         self.set_text(&controls.connection_status, "");
         self.set_text(&controls.error, "");
-        ivars.connected.set(false);
+        ivars.connection.set(Connection::default());
         self.apply_provider_defaults();
         self.show_step(Step::Welcome);
     }
@@ -516,9 +577,27 @@ impl OnboardingWindow {
             .primary
             .setTitle(&NSString::from_str(step.primary_title()));
         controls.back.setHidden(step == Step::Welcome);
+
+        // Deepgram transcribes only, so one provider cannot serve both. The web
+        // wizard disables the toggle for it (src/App.tsx:934); here it is
+        // switched off as well, or "same" would mean "clean up with a provider
+        // that cannot".
+        let kind = self.selected_provider();
+        let deepgram = kind == "deepgram";
+        if deepgram && is_on(&controls.same_provider) {
+            set_switch(&controls.same_provider, false);
+        }
+        controls.same_provider.setEnabled(!deepgram);
+
         // The web wizard hides the cleanup provider behind the same-provider
         // toggle; here it is present and inert, so the panel does not reflow.
+        // While it is inert it shows the provider that will actually be used,
+        // which is the transcription provider, because that is what `save`
+        // stores.
         let same = is_on(&controls.same_provider);
+        if same {
+            select_provider_popup(&controls.formatting_provider, &kind);
+        }
         controls.formatting_provider.setEnabled(!same);
     }
 
@@ -530,7 +609,8 @@ impl OnboardingWindow {
             return;
         }
         let (kind, url, key) = self.provider_fields();
-        if let Err(error) = can_advance(step, &kind, &url, &key, ivars.connected.get()) {
+        let proven = ivars.connection.get().proven();
+        if let Err(error) = can_advance(step, &kind, &url, &key, proven) {
             self.set_text(&ivars.controls.error, &error);
             return;
         }
@@ -630,17 +710,25 @@ impl OnboardingWindow {
             "same_provider",
             bool_setting(is_on(&controls.same_provider)),
         )?;
-        if !is_on(&controls.same_provider) {
-            let index = controls.formatting_provider.indexOfSelectedItem().max(0) as usize;
-            let formatting = formatting_options()
+        // Written every time, never conditionally.
+        // `Settings::formatting_provider` (crates/openflow-core/src/settings.rs:136)
+        // reads this row whenever it exists and never consults `same_provider`,
+        // so a stale row left behind would clean text up with a provider the
+        // wizard no longer shows. With "same for cleanup" on, the row carries
+        // the transcription provider, which is what the disabled popup shows.
+        let index = controls.formatting_provider.indexOfSelectedItem().max(0) as usize;
+        let formatting = if is_on(&controls.same_provider) {
+            kind.as_str()
+        } else {
+            formatting_options()
                 .get(index)
                 .copied()
-                .unwrap_or(PROVIDER_OPTIONS[0].value);
-            // A custom cleanup endpoint reuses the transcription URL: the
-            // wizard asks for one endpoint, and Settings is where a second one
-            // is configured.
-            settings.set("formatting_provider", &join_provider(formatting, &url))?;
-        }
+                .unwrap_or(PROVIDER_OPTIONS[0].value)
+        };
+        // A custom cleanup endpoint reuses the transcription URL: the wizard
+        // asks for one endpoint, and Settings is where a second one is
+        // configured.
+        settings.set("formatting_provider", &join_provider(formatting, &url))?;
         settings.set("stt_model", string_value(&controls.stt_model).trim())?;
         settings.set("chat_model", string_value(&controls.chat_model).trim())?;
         let index = controls.microphone.indexOfSelectedItem().max(0) as usize;
@@ -694,7 +782,9 @@ impl OnboardingWindow {
                 fill_combo(&controls.stt_model, models, "stt");
                 fill_combo(&controls.chat_model, models, "chat");
                 self.apply_provider_defaults();
-                ivars.connected.set(true);
+                let mut connection = ivars.connection.get();
+                connection.succeeded();
+                ivars.connection.set(connection);
                 let provider = option_for(&self.selected_provider()).label;
                 self.set_text(
                     &controls.connection_status,
@@ -707,7 +797,9 @@ impl OnboardingWindow {
                 self.set_text(&controls.error, "");
             }
             Err(error) => {
-                ivars.connected.set(false);
+                let mut connection = ivars.connection.get();
+                connection.invalidated();
+                ivars.connection.set(connection);
                 self.set_text(
                     &controls.connection_status,
                     &format!("Connection failed. {}", error),
@@ -763,6 +855,15 @@ impl OnboardingWindow {
         if ivars.recording.replace(false) {
             self.reload_hotkey();
         }
+    }
+
+    /// Forget whatever the last Test connection proved, and stop saying it.
+    fn invalidate_connection(&self) {
+        let ivars = self.ivars();
+        let mut connection = ivars.connection.get();
+        connection.invalidated();
+        ivars.connection.set(connection);
+        self.set_text(&ivars.controls.connection_status, "");
     }
 
     fn set_text(&self, field: &NSTextField, text: &str) {
@@ -1253,6 +1354,45 @@ mod tests {
         );
     }
 
+    /// Editing a credential after a successful test has to close the gate
+    /// again. This is what the first round missed: the window proved one key,
+    /// the user pasted a different one over it, and setup saved a key nothing
+    /// had ever called.
+    #[test]
+    fn editing_a_credential_after_a_successful_test_re_closes_the_gate() {
+        let gate = |connection: Connection| {
+            can_advance(
+                Step::Credentials,
+                "groq",
+                "",
+                "gsk-test",
+                connection.proven(),
+            )
+        };
+
+        let mut connection = Connection::default();
+        assert!(!connection.proven(), "nothing is proven before a test");
+        assert!(gate(connection).is_err());
+
+        connection.succeeded();
+        assert!(gate(connection).is_ok(), "a proven key opens the gate");
+
+        // What `controlTextDidChange:` does on either credential field.
+        connection.invalidated();
+        assert_eq!(
+            gate(connection).unwrap_err(),
+            "Test the connection before continuing.",
+            "an edited credential must be tested again"
+        );
+
+        // Proving it again reopens the gate, and editing closes it again: the
+        // state is a latch, not a one-way flag.
+        connection.succeeded();
+        assert!(gate(connection).is_ok());
+        connection.invalidated();
+        assert!(gate(connection).is_err());
+    }
+
     /// Groq leads the list and is the only badged option, as in the web grid,
     /// and the cleanup list drops Deepgram.
     #[test]
@@ -1301,11 +1441,11 @@ mod tests {
                 "MacBook Pro Microphone",
                 "Option+V"
             ),
-            "Groq · whisper-large-v3 · MacBook Pro Microphone · hold Option+V to dictate"
+            "Groq · whisper-large-v3 · MacBook Pro Microphone · hold Option+V to dictate, active now"
         );
         assert_eq!(
             summary_line("groq", "  ", "System default", "Option+V"),
-            "Groq · whisper-large-v3-turbo · System default · hold Option+V to dictate"
+            "Groq · whisper-large-v3-turbo · System default · hold Option+V to dictate, active now"
         );
     }
 }

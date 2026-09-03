@@ -7,6 +7,9 @@
 //! no Cmd+C, Cmd+V or Cmd+A inside the text fields of Settings and Onboarding,
 //! which is exactly where a user pastes an API key.
 //!
+//! The same is true of Cmd+Q: an accessory app with no application menu has no
+//! Quit shortcut at all, and the only way out is the tray.
+//!
 //! Every item here is a first-responder action AppKit implements itself, so
 //! there is nothing to wire and nothing that can go stale.
 
@@ -18,6 +21,13 @@ use objc2_foundation::NSString;
 /// Build and install the menu. Called once, before any window exists.
 pub fn install(mtm: MainThreadMarker) {
     let main = NSMenu::new(mtm);
+
+    // The application menu, which is where AppKit looks for Cmd+Q. The tray's
+    // Quit item routes to `NSApplication::terminate` through
+    // `EngineEvent::Navigate("quit")`; `terminate:` down the responder chain is
+    // the same call, so the two agree.
+    let application = submenu(mtm, &main, "OpenFlow");
+    add(mtm, &application, "Quit OpenFlow", sel!(terminate:), "q");
 
     let edit = submenu(mtm, &main, "Edit");
     add(mtm, &edit, "Undo", sel!(undo:), "z");
