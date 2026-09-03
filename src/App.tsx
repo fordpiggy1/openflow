@@ -281,6 +281,7 @@ function App() {
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [saveHistory, setSaveHistory] = useState(true);
   const [insertMethod, setInsertMethod] = useState("paste");
+  const [preserveClipboard, setPreserveClipboard] = useState(true);
   const [overlayOnlyWhileRecording, setOverlayOnlyWhileRecording] = useState(false);
   const [retentionDays, setRetentionDays] = useState("");
   const [dictionary, setDictionary] = useState("");
@@ -370,7 +371,7 @@ function App() {
           invoke<string | null>("get_api_key"),
           invoke<string | null>("get_setting", { key: "formatting_api_key" }),
         ]);
-        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice, storedTtsProvider, storedSaveHistory, storedRetentionDays, storedDictionary, storedInsertMethod, storedOverlayOnly] = await Promise.all([
+        const [storedProvider, storedFormattingProvider, storedSameProvider, storedLanguage, storedTheme, storedFormatEnabled, storedSttModel, storedChatModel, storedMicrophone, storedRecordHotkey, storedRecopyHotkey, storedTtsEnabled, storedTtsModel, storedTtsVoice, storedTtsProvider, storedSaveHistory, storedRetentionDays, storedDictionary, storedInsertMethod, storedOverlayOnly, storedPreserveClipboard] = await Promise.all([
           invoke<string | null>("get_setting", { key: "provider" }),
           invoke<string | null>("get_setting", { key: "formatting_provider" }),
           invoke<string | null>("get_setting", { key: "same_provider" }),
@@ -391,6 +392,7 @@ function App() {
           invoke<string | null>("get_setting", { key: "dictionary" }),
           invoke<string | null>("get_setting", { key: "insert_method" }),
           invoke<string | null>("get_setting", { key: "overlay_only_while_recording" }),
+          invoke<string | null>("get_setting", { key: "preserve_clipboard" }),
         ]);
         const [keyResult, formattingKeyResult] = await secretReads;
         if (!mounted) return;
@@ -440,6 +442,7 @@ function App() {
         if (storedDictionary) setDictionary(storedDictionary);
         if (storedInsertMethod === "type" || storedInsertMethod === "paste") setInsertMethod(storedInsertMethod);
         setOverlayOnlyWhileRecording(storedOverlayOnly === "true");
+        setPreserveClipboard(storedPreserveClipboard !== "false");
       } catch (reason) {
         if (mounted) setError(`OpenFlow settings could not be loaded. ${friendlyError(reason)}`);
       } finally {
@@ -647,6 +650,7 @@ function App() {
       ["dictionary", dictionary.trim()],
       ["insert_method", insertMethod],
       ["overlay_only_while_recording", String(overlayOnlyWhileRecording)],
+      ["preserve_clipboard", String(preserveClipboard)],
     ];
     if (!sameProvider) {
       settings.push(
@@ -1151,7 +1155,8 @@ function App() {
               <div className="settings-row"><div><label htmlFor="settings-microphone">Microphone</label><small>{microphones.length ? `${microphones.length} available` : "Permission may be required"}</small></div><select id="settings-microphone" value={microphone} onChange={(event) => { setMicrophone(event.target.value); markDirty(); }}><option value="">System default</option>{microphones.map((device) => <option key={device.id} value={device.id}>{device.name}{device.is_default ? " · default" : ""}</option>)}</select></div>
               <div className="settings-row"><div><label htmlFor="record-hotkey">Record shortcut</label><small>Hold to record, release to transcribe.</small></div>{editingHotkey === "record" ? <input id="record-hotkey" className="hotkey-input" aria-label="Record shortcut" autoFocus value={hotkeyDraft} onChange={(event) => setHotkeyDraft(event.target.value)} onBlur={() => { if (cancelHotkeyEditRef.current) { cancelHotkeyEditRef.current = false; return; } void updateHotkey("record", hotkeyDraft); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { event.preventDefault(); cancelHotkeyEditRef.current = true; setEditingHotkey(null); } }} /> : <button id="record-hotkey" className="key-button" aria-label={`Change record shortcut, currently ${recordHotkey}`} onClick={() => { cancelHotkeyEditRef.current = false; setHotkeyDraft(recordHotkey); setEditingHotkey("record"); }}>{recordHotkey}</button>}</div>
               <div className="settings-row"><div><label htmlFor="recopy-hotkey">Re-copy shortcut</label><small>Paste your most recent result again.</small></div>{editingHotkey === "recopy" ? <input id="recopy-hotkey" className="hotkey-input" aria-label="Re-copy shortcut" autoFocus value={hotkeyDraft} onChange={(event) => setHotkeyDraft(event.target.value)} onBlur={() => { if (cancelHotkeyEditRef.current) { cancelHotkeyEditRef.current = false; return; } void updateHotkey("recopy", hotkeyDraft); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { event.preventDefault(); cancelHotkeyEditRef.current = true; setEditingHotkey(null); } }} /> : <button id="recopy-hotkey" className="key-button" aria-label={`Change re-copy shortcut, currently ${recopyHotkey}`} onClick={() => { cancelHotkeyEditRef.current = false; setHotkeyDraft(recopyHotkey); setEditingHotkey("recopy"); }}>{recopyHotkey}</button>}</div>
-              <div className="settings-row"><div><label>Insert transcriptions by</label><small>Pasting sends Cmd+V and works in every app. Typing sends the characters themselves, so nothing waits on a paste, but the receiving app may autocorrect them. Either way the text is copied too, so you can paste it again. Typing is macOS only; elsewhere this pastes.</small></div><div className="segmented"><button className={insertMethod === "paste" ? "active" : ""} onClick={() => { setInsertMethod("paste"); markDirty(); }}>Paste</button><button className={insertMethod === "type" ? "active" : ""} onClick={() => { setInsertMethod("type"); markDirty(); }}>Type</button></div></div>
+              <div className="settings-row"><div><label>Insert transcriptions by</label><small>Pasting sends Cmd+V and works in every app. Typing sends the characters themselves, so nothing waits on a paste, but the receiving app may autocorrect them. Typing is macOS only; elsewhere this pastes.</small></div><div className="segmented"><button className={insertMethod === "paste" ? "active" : ""} onClick={() => { setInsertMethod("paste"); markDirty(); }}>Paste</button><button className={insertMethod === "type" ? "active" : ""} onClick={() => { setInsertMethod("type"); markDirty(); }}>Type</button></div></div>
+              <div className="settings-row"><div><label>Keep my clipboard</label><small>Puts back whatever you had copied once a dictation has been inserted, so dictating never costs you a copy. With Type, the clipboard is not touched at all. Text and images are restored; copied files are not. The re-copy shortcut and tray recents still copy on purpose.</small></div><Toggle checked={preserveClipboard} label="Keep clipboard contents across dictations" onChange={(checked) => { setPreserveClipboard(checked); markDirty(); }} /></div>
               <div className="settings-row"><div><label>Hide the overlay until recording</label><small>The overlay normally rests against the edge of the screen. Hidden, it appears when you start recording and goes away once the text lands. You can only reposition it while it is showing.</small></div><button className="button secondary compact-button" onClick={() => { setOverlayOnlyWhileRecording((on) => !on); markDirty(); }} aria-pressed={overlayOnlyWhileRecording}>{overlayOnlyWhileRecording ? "On" : "Off"}</button></div>
               <div className="settings-row"><div><label>Appearance</label><small>Use the theme that feels easiest on your eyes.</small></div><div className="segmented"><button className={theme === "light" ? "active" : ""} onClick={() => { setTheme("light"); markDirty(); }}>Light</button><button className={theme === "dark" ? "active" : ""} onClick={() => { setTheme("dark"); markDirty(); }}>Dark</button></div></div>
               <div className="settings-row"><div><label>Save transcription history</label><small>Dictation captures whatever you say out loud. Turn this off to keep nothing.</small></div><button className="button secondary compact-button" onClick={() => { setSaveHistory((on) => !on); setSettingsDirty(true); }} aria-pressed={saveHistory}>{saveHistory ? "On" : "Off"}</button></div>
