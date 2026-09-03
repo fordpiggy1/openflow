@@ -43,6 +43,9 @@ rodio = { version = "0.22", default-features = false, features = [
     "wav",
     "mp3",
 ] }
+# Rendering a transcription's UTC timestamp in the viewer's own zone, in the
+# History window. Already in the tree: core stamps rows with it.
+chrono = { workspace = true }
 # Decoding the embedded tray icon into the RGBA buffer tray-icon wants.
 png = "0.17"
 base64 = { workspace = true }

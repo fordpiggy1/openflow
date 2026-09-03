@@ -21,6 +21,7 @@ pub const PREVIEW_CHARS: usize = 40;
 
 const ID_SETTINGS: &str = "settings";
 const ID_HISTORY: &str = "history";
+const ID_PLUGINS: &str = "plugins";
 const ID_QUIT: &str = "quit";
 const RECENT_PREFIX: &str = "recent:";
 
@@ -135,12 +136,16 @@ fn build_menu(engine: &Arc<Engine>, state: RecordingState) -> Result<(Menu, Menu
         true,
         None,
     ))?;
-    // Milestone B builds the History window. Until then the item is present but
-    // inert, so the menu does not change shape when it arrives.
     append(&MenuItem::with_id(
         MenuId::new(ID_HISTORY),
-        "History (coming in the next milestone)",
-        false,
+        "History...",
+        true,
+        None,
+    ))?;
+    append(&MenuItem::with_id(
+        MenuId::new(ID_PLUGINS),
+        "Plugins...",
+        true,
         None,
     ))?;
     append(&PredefinedMenuItem::separator())?;
@@ -176,10 +181,10 @@ pub fn install_handler() {
         crate::trace!("tray click id={}", id);
         crate::events::on_main(move || {
             crate::app::with_app(|app| match id.as_str() {
-                // No tab: the window reopens where the user left it. The
-                // History item is disabled until Milestone B builds that
-                // window, and deliberately routes nowhere in the meantime.
+                // No tab: the window reopens where the user left it.
                 ID_SETTINGS => app.handle_event(EngineEvent::Navigate("settings".to_string())),
+                ID_HISTORY => app.handle_event(EngineEvent::Navigate("history".to_string())),
+                ID_PLUGINS => app.handle_event(EngineEvent::Navigate("plugins".to_string())),
                 ID_QUIT => app.handle_event(EngineEvent::Navigate("quit".to_string())),
                 other => {
                     if let Some(row) = other.strip_prefix(RECENT_PREFIX) {

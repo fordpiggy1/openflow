@@ -4,7 +4,9 @@
 //! frames are shorter to read than constraints and there is nothing to solve at
 //! run time.
 
+pub mod history;
 pub mod onboarding;
+pub mod plugins;
 pub mod recorder;
 pub mod settings;
 

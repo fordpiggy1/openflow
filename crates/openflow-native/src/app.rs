@@ -37,7 +37,9 @@ use crate::instance::InstanceLock;
 use crate::overlay::Overlay;
 use crate::tray::Tray;
 use crate::tts_player::TtsPlayer;
+use crate::ui::history::HistoryWindow;
 use crate::ui::onboarding::OnboardingWindow;
+use crate::ui::plugins::PluginsWindow;
 use crate::ui::settings::SettingsWindow;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
@@ -73,6 +75,8 @@ pub struct App {
     // so reopening from the menu bar is instant and no state is rebuilt.
     settings: RefCell<Option<Retained<SettingsWindow>>>,
     onboarding: RefCell<Option<Retained<OnboardingWindow>>>,
+    history: RefCell<Option<Retained<HistoryWindow>>>,
+    plugins: RefCell<Option<Retained<PluginsWindow>>>,
     mtm: MainThreadMarker,
 }
 
@@ -117,6 +121,34 @@ impl App {
                 .clone()
         };
         window.reload();
+        window.present();
+    }
+
+    /// Run `body` against the history window if it has been built.
+    pub fn with_history<R>(&self, body: impl FnOnce(&HistoryWindow) -> R) -> Option<R> {
+        let window = self.history.borrow().clone();
+        window.as_deref().map(body)
+    }
+
+    /// Show the history window, building it on first use.
+    pub fn show_history(self: &Rc<Self>) {
+        let window = {
+            let mut slot = self.history.borrow_mut();
+            slot.get_or_insert_with(|| HistoryWindow::new(self, self.mtm))
+                .clone()
+        };
+        window.load();
+        window.present();
+    }
+
+    /// Show the plugins window, building it on first use.
+    pub fn show_plugins(self: &Rc<Self>) {
+        let window = {
+            let mut slot = self.plugins.borrow_mut();
+            slot.get_or_insert_with(|| PluginsWindow::new(self, self.mtm))
+                .clone()
+        };
+        window.load();
         window.present();
     }
 
@@ -168,7 +200,13 @@ impl App {
                 self.notify("OpenFlow could not finish", &error)
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
-            EngineEvent::HistoryChanged => self.tray.rebuild(&self.engine),
+            // The recents menu and the History window are the two surfaces
+            // holding a copy of the list, and both re-read it here. The window
+            // re-runs its own search, so a filtered list stays filtered.
+            EngineEvent::HistoryChanged => {
+                self.tray.rebuild(&self.engine);
+                self.with_history(|window| window.load());
+            }
             EngineEvent::TtsStarted(started) => self.tts.started(&started),
             EngineEvent::TtsChunk(chunk) => self.tts.chunk(&chunk),
             // Both of these are written against the request id, never
@@ -203,6 +241,8 @@ impl App {
                 // reopens where the user left it.
                 "settings" => self.show_settings(None),
                 "onboarding" => self.show_onboarding(),
+                "history" => self.show_history(),
+                "plugins" => self.show_plugins(),
                 tab => self.show_settings(Some(tab)),
             },
         }
@@ -337,6 +377,8 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         tts,
         settings: RefCell::new(None),
         onboarding: RefCell::new(None),
+        history: RefCell::new(None),
+        plugins: RefCell::new(None),
         mtm,
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
