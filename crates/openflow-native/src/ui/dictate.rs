@@ -25,7 +25,7 @@
 //! the Dictate page takes first responder when it comes forward so the key
 //! reaches the button without a Tab first.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -33,12 +33,10 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSColor, NSControl, NSEvent, NSFont,
-    NSImage, NSImageSymbolConfiguration, NSImageView, NSLevelIndicator, NSLevelIndicatorStyle,
-    NSTextAlignment, NSTextField, NSView,
+    NSImage, NSImageSymbolConfiguration, NSImageView, NSTextAlignment, NSTextField, NSView,
 };
-use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 
-use openflow_core::audio::{meter_decay, meter_fraction};
 use openflow_core::engine::{Engine, RecordingState};
 
 use crate::hotkeys;
@@ -49,30 +47,8 @@ use crate::ui::{allow_wrapping, note};
 /// the cancel button and the hint, with the gaps between them. Kept as one
 /// number so the block can be centred in a card of any height; the layout below
 /// walks down from the top of it and has to add up to this.
-const BLOCK_HEIGHT: f64 = 56.0
-    + 18.0
-    + 14.0
-    + 6.0
-    + 30.0
-    + 8.0
-    + 34.0
-    + 20.0
-    + 40.0
-    + 10.0
-    + METER_HEIGHT
-    + 12.0
-    + 24.0
-    + 14.0
-    + 14.0;
-
-/// The level meter under the record button: the width of the button it belongs
-/// to, and thin enough to read as a readout rather than a second control.
-const METER_WIDTH: f64 = 220.0;
-const METER_HEIGHT: f64 = 8.0;
-/// How often the meter re-reads the microphone. Thirty a second is the rate a
-/// moving bar needs to look continuous; the read behind it is one atomic load,
-/// so the cost is the redraw and nothing else.
-const METER_INTERVAL: f64 = 1.0 / 30.0;
+const BLOCK_HEIGHT: f64 =
+    56.0 + 18.0 + 14.0 + 6.0 + 30.0 + 8.0 + 34.0 + 20.0 + 40.0 + 10.0 + 24.0 + 14.0 + 14.0;
 
 /// The transcript's own height inside the result card: three lines at the
 /// system font. The preview is cut at `RESULT_CHARS`, which is about that.
@@ -184,8 +160,6 @@ struct Controls {
     eyebrow: Retained<NSTextField>,
     title: Retained<NSTextField>,
     body: Retained<NSTextField>,
-    /// Shown only while recording; see `set_state`.
-    meter: Retained<NSLevelIndicator>,
     record: Retained<HoldButton>,
     cancel: Retained<NSButton>,
     hint: Retained<NSTextField>,
@@ -200,13 +174,6 @@ pub struct DictateIvars {
     /// The full text behind the truncated card, so clicking it copies all of
     /// what was said rather than what fits.
     last: RefCell<Option<String>>,
-    /// Runs only while recording. Held so it can be invalidated: a repeating
-    /// timer retains its target, so one left running would keep this page alive
-    /// and keep redrawing a meter nobody is looking at.
-    meter_timer: RefCell<Option<Retained<NSTimer>>>,
-    /// What the meter is currently showing, which is not what the microphone
-    /// last reported: the bar eases downwards. See `audio::meter_decay`.
-    meter_shown: Cell<f32>,
 }
 
 define_class!(
@@ -219,21 +186,6 @@ define_class!(
     pub struct DictatePage;
 
     impl DictatePage {
-        /// One frame of the meter: read the microphone, ease the bar towards it,
-        /// draw. Called by `meter_timer` and by nothing else.
-        ///
-        /// The reading is an atomic load, so the capture is never waiting on
-        /// this. What it costs is a redraw of an eight-point bar, thirty times a
-        /// second, and only while the button is held.
-        #[unsafe(method(tickMeter:))]
-        fn tick_meter(&self, _timer: &NSTimer) {
-            let ivars = self.ivars();
-            let target = meter_fraction(ivars.engine.input_level());
-            let shown = meter_decay(ivars.meter_shown.get(), target);
-            ivars.meter_shown.set(shown);
-            ivars.controls.meter.setDoubleValue(shown as f64);
-        }
-
         /// The same entry point the global shortcut uses, so the button and the
         /// hotkey cannot drift apart: silence gate, live preview and insert
         /// method are all decided downstream of here.
@@ -289,8 +241,6 @@ impl DictatePage {
             view,
             controls,
             last: RefCell::new(None),
-            meter_timer: RefCell::new(None),
-            meter_shown: Cell::new(0.0),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -417,49 +367,6 @@ impl DictatePage {
         controls.record.setTitle(&NSString::from_str(action));
         controls.record.setEnabled(enabled);
         controls.cancel.setHidden(!cancel);
-        self.set_metering(matches!(state, RecordingState::Recording));
-    }
-
-    /// Start or stop the meter with the recording it belongs to.
-    ///
-    /// Idempotent in both directions: `set_state` is called on every transition
-    /// and more than once for some of them, and a second timer for the same bar
-    /// would double its refresh rate and leak the first.
-    fn set_metering(&self, on: bool) {
-        let ivars = self.ivars();
-        let mut slot = ivars.meter_timer.borrow_mut();
-        if on == slot.is_some() {
-            return;
-        }
-        match slot.take() {
-            Some(timer) => {
-                // Invalidate, not just drop: the run loop holds the timer, and
-                // a repeating timer holds its target, so dropping our handle
-                // stops nothing and keeps this page alive.
-                timer.invalidate();
-                ivars.meter_shown.set(0.0);
-                ivars.controls.meter.setDoubleValue(0.0);
-                ivars.controls.meter.setHidden(true);
-            }
-            None => {
-                ivars.meter_shown.set(0.0);
-                ivars.controls.meter.setDoubleValue(0.0);
-                ivars.controls.meter.setHidden(false);
-                // SAFETY: the selector is defined on this class above, takes
-                // the timer as its only argument, and the timer is invalidated
-                // before this page could go away.
-                let timer = unsafe {
-                    NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                        METER_INTERVAL,
-                        self,
-                        sel!(tickMeter:),
-                        None,
-                        true,
-                    )
-                };
-                *slot = Some(timer);
-            }
-        }
     }
 }
 
@@ -670,32 +577,6 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     record.setAutoresizingMask(CENTRED);
     y -= 40.0 + 10.0;
 
-    // Directly under the button that starts it, the width of that button. A
-    // level indicator rather than a view drawing its own bar: this crate lays
-    // out stock controls, and the capacity style already draws the rounded
-    // capsule and clips the fill to it.
-    let meter = NSLevelIndicator::initWithFrame(
-        NSLevelIndicator::alloc(mtm),
-        NSRect::new(
-            NSPoint::new(centre(METER_WIDTH), y - METER_HEIGHT),
-            NSSize::new(METER_WIDTH, METER_HEIGHT),
-        ),
-    );
-    meter.setLevelIndicatorStyle(NSLevelIndicatorStyle::ContinuousCapacity);
-    meter.setMinValue(0.0);
-    meter.setMaxValue(1.0);
-    meter.setDoubleValue(0.0);
-    // A capacity indicator is editable by default -- clicking one sets it --
-    // and this one is a readout, not an input.
-    meter.setEditable(false);
-    meter.setFillColor(Some(&NSColor::controlAccentColor()));
-    // Hidden until there is something to show. It still occupies its row in
-    // `BLOCK_HEIGHT`, the way the cancel button does, so the block does not
-    // jump when recording starts.
-    meter.setHidden(true);
-    meter.setAutoresizingMask(CENTRED);
-    y -= METER_HEIGHT + 12.0;
-
     let cancel = crate::ui::button(
         mtm,
         NSRect::new(
@@ -729,7 +610,6 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     recorder.addSubview(&title);
     recorder.addSubview(&body);
     recorder.addSubview(&record);
-    recorder.addSubview(&meter);
     recorder.addSubview(&cancel);
     recorder.addSubview(&hint);
 
@@ -742,7 +622,6 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
             eyebrow,
             title,
             body,
-            meter,
             record,
             cancel,
             hint,
@@ -783,8 +662,7 @@ mod tests {
 
     /// The centring constant has to be the sum of the steps `build_content`
     /// walks down, or the block sits off-centre by whatever the two disagree
-    /// by. Listed here in the same order the layout uses them, as literals: a
-    /// row written as the constant it came from would agree with itself.
+    /// by. Listed here in the same order the layout uses them.
     #[test]
     fn the_block_height_is_the_sum_of_the_rows() {
         let rows = [
@@ -793,7 +671,6 @@ mod tests {
             30.0, 8.0, // title, gap
             34.0, 20.0, // body, gap
             40.0, 10.0, // record button, gap
-            8.0, 12.0, // level meter, gap
             24.0, 14.0, // cancel button, gap
             14.0, // hint
         ];
