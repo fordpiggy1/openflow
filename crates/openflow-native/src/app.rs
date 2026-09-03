@@ -39,7 +39,7 @@ use crate::tray::Tray;
 use crate::tts_player::TtsPlayer;
 use crate::ui::main_window::MainWindow;
 use crate::ui::onboarding::OnboardingWindow;
-use crate::ui::settings::SettingsWindow;
+use crate::ui::settings::SettingsPage;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
 /// one set of keychain items.
@@ -103,11 +103,11 @@ pub struct App {
     // One slot per window, each built on first use and kept: closing hides,
     // so reopening from the menu bar is instant and no state is rebuilt.
     //
-    // Three slots, not five. Dictate, History and Plugins are pages of `main`
-    // now rather than windows of their own; Settings is still separate, and
-    // moving it in is the next change rather than this one.
+    // Two slots, not five. Dictate, History, Plugins and Settings are pages
+    // of `main` now rather than windows of their own. The wizard keeps its own
+    // window because it is presented as a sheet on `main`, and a sheet is a
+    // window.
     main: RefCell<Option<Retained<MainWindow>>>,
-    settings: RefCell<Option<Retained<SettingsWindow>>>,
     onboarding: RefCell<Option<Retained<OnboardingWindow>>>,
     mtm: MainThreadMarker,
 }
@@ -129,12 +129,11 @@ impl App {
         &self.hotkeys
     }
 
-    /// Run `body` against the settings window if it has been built. Nothing to
-    /// do when it has not: whatever the result was, `reload` will read it back
-    /// the next time the window opens.
-    pub fn with_settings<R>(&self, body: impl FnOnce(&SettingsWindow) -> R) -> Option<R> {
-        let window = self.settings.borrow().clone();
-        window.as_deref().map(body)
+    /// Run `body` against the settings page if the main window has been built.
+    /// Nothing to do when it has not: whatever the result was, `reload` will
+    /// read it back the next time the page is shown.
+    pub fn with_settings<R>(&self, body: impl FnOnce(&SettingsPage) -> R) -> Option<R> {
+        self.with_main(|window| body(&window.settings()))
     }
 
     /// Run `body` against the onboarding window if it has been built.
@@ -143,7 +142,7 @@ impl App {
         window.as_deref().map(body)
     }
 
-    /// True while any of the three windows is on screen.
+    /// True while either window is on screen.
     ///
     /// Asks the windows rather than counting opens and closes: they are hidden
     /// rather than closed and can be ordered out by AppKit itself, and a
@@ -155,9 +154,7 @@ impl App {
         ) -> bool {
             slot.borrow().as_deref().is_some_and(is_visible)
         }
-        visible(&self.main, |w| w.is_visible())
-            || visible(&self.settings, |w| w.is_visible())
-            || visible(&self.onboarding, |w| w.is_visible())
+        visible(&self.main, |w| w.is_visible()) || visible(&self.onboarding, |w| w.is_visible())
     }
 
     /// Run `body` against the main window if it has been built.
@@ -184,36 +181,25 @@ impl App {
         window.present();
     }
 
-    /// Show the setup wizard, building it on first use, from the front.
+    /// Show the setup wizard as a sheet on the main window.
+    ///
+    /// The main window is built and presented first, because a sheet needs
+    /// something to hang from -- including on a first launch, where the wizard
+    /// is the whole reason the app opened. That is not a workaround: setup now
+    /// happens over the workspace it is setting up.
     pub fn show_onboarding(self: &Rc<Self>) {
-        // Same narrowed borrow as `show_settings`: building, reloading and
+        self.show_main(None);
+        // Same narrowed borrow as `show_main`: building, reloading and
         // presenting all run AppKit code that can call back in here.
-        let window = {
+        let sheet = {
             let mut slot = self.onboarding.borrow_mut();
             slot.get_or_insert_with(|| OnboardingWindow::new(self, self.mtm))
                 .clone()
         };
-        window.reload();
-        window.present();
-    }
-
-    /// Show the settings window, building it on first use, and select `tab`.
-    /// `None` leaves the window on whichever tab the user left it.
-    pub fn show_settings(self: &Rc<Self>, tab: Option<&str>) {
-        // The borrow ends before the window is touched. Building, reloading and
-        // presenting all run AppKit code that can call back in here, and a
-        // `borrow_mut` held across any of it is a panic waiting for the first
-        // callback that wants the window.
-        let window = {
-            let mut slot = self.settings.borrow_mut();
-            slot.get_or_insert_with(|| SettingsWindow::new(self, self.mtm))
-                .clone()
-        };
-        if let Some(tab) = tab {
-            window.select_tab(tab);
+        sheet.reload();
+        if let Some(parent) = self.with_main(|window| window.window()) {
+            sheet.present_on(&parent);
         }
-        window.reload();
-        window.present();
     }
 
     /// Apply one engine event. Always called on the main thread, after the
@@ -305,14 +291,12 @@ impl App {
                     let app = NSApplication::sharedApplication(self.mtm);
                     app.terminate(None);
                 }
-                // The menu bar's Settings item names no tab, so the window
-                // reopens where the user left it.
-                "settings" => self.show_settings(None),
                 "onboarding" => self.show_onboarding(),
                 "main" => self.show_main(None),
-                "history" => self.show_main(Some("history")),
-                "plugins" => self.show_main(Some("plugins")),
-                tab => self.show_settings(Some(tab)),
+                // Everything else is a page or a group inside one, and the
+                // window knows which: "history" and "plugins" are pages,
+                // "voice" and "privacy" are groups of the Settings page.
+                target => self.show_main(Some(target)),
             },
         }
     }
@@ -483,7 +467,6 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         hotkeys: RefCell::new(hotkeys),
         tts,
         main: RefCell::new(None),
-        settings: RefCell::new(None),
         onboarding: RefCell::new(None),
         mtm,
     });
@@ -608,6 +591,14 @@ fn transcribe_file(path: &str) -> i32 {
 }
 
 pub fn main() {
+    // Before anything AppKit, and before the instance lock: `--version` is what
+    // a bug report and the bundle script both ask, and neither wants a second
+    // copy of the app refusing to start or a keychain prompt on the way to one
+    // line of text.
+    if std::env::args().any(|argument| argument == "--version") {
+        println!("{}", crate::version::long());
+        std::process::exit(0);
+    }
     if std::env::args().any(|argument| argument == "--self-check") {
         std::process::exit(self_check());
     }

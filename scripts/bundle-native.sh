@@ -2,9 +2,27 @@
 # Assemble target/OpenFlow.app around the native binary, sign it ad hoc, and
 # optionally wrap it in a DMG.
 #
-#   bash scripts/bundle-native.sh            build + bundle + sign
-#   bash scripts/bundle-native.sh --dmg      also produce target/OpenFlow.dmg
+#   bash scripts/bundle-native.sh                   build + bundle + sign
+#   bash scripts/bundle-native.sh --dmg             also produce the disk image
 #   bash scripts/bundle-native.sh --skip-build
+#   bash scripts/bundle-native.sh --print-artifacts version and DMG name, then stop
+#
+# The DMG is target/OpenFlow_<version>_<arch>.dmg, and --print-artifacts says
+# what that name will be without building anything, so a release workflow can
+# name the asset it is about to upload without keeping a second copy of the
+# rule. There is exactly one source for each half of a build's identity: the
+# version comes from crates/openflow-native/Cargo.toml, and the commit is asked
+# of the binary itself (`--version`), never recomputed here -- a bundle can then
+# never claim a commit its executable was not built from, however stale the tree
+# it was assembled in.
+#
+# "Deterministic" here means the same inputs give the same *name*, layout and
+# contents: a fixed volume name, an Applications symlink, no background image,
+# no window geometry, and a re-run that overwrites rather than accumulating.
+# It does not mean a bit-identical image: hdiutil stamps HFS+ creation times
+# into the filesystem it builds, so two runs a second apart differ in bytes.
+# Reproducing byte-for-byte would need a different container format than the
+# one macOS users expect to double-click.
 #
 # The signature matters more than it looks: macOS binds microphone and
 # accessibility grants to the signature's designated requirement, and an ad hoc
@@ -21,7 +39,34 @@ cd "$ROOT"
 APP="$ROOT/target/OpenFlow.app"
 BINARY="$ROOT/target/release/openflow-native"
 IDENTIFIER="io.laisy.openflow"
-VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/openflow-native/Cargo.toml | head -1)"
+
+# The manifest and the machine are overridable so the test that guards this
+# extraction can point it at a temporary Cargo.toml and ask for a named
+# architecture, instead of asserting against whatever version the tree happens
+# to carry today. Neither override is meant for a real build.
+CARGO_TOML="${OPENFLOW_CARGO_TOML:-$ROOT/crates/openflow-native/Cargo.toml}"
+# The first `version = "..."` under [package], which is the crate's own; a
+# dependency's version line is always indented or inside a table further down,
+# and `head -1` would take it if [package] ever lost its version, so the match
+# is anchored to the start of the line and the file is read from the top.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CARGO_TOML" | head -1)"
+if [ -z "$VERSION" ]; then
+  echo "No version = \"...\" line in $CARGO_TOML" >&2
+  exit 1
+fi
+
+# The rust triple's word for the machine, not uname's: the DMG name should
+# match what `--target` would have been asked for.
+if [ -n "${OPENFLOW_DMG_ARCH-}" ]; then
+  ARCH="$OPENFLOW_DMG_ARCH"
+else
+  case "$(uname -m)" in
+    arm64 | aarch64) ARCH=aarch64 ;;
+    *) ARCH="$(uname -m)" ;;
+  esac
+fi
+DMG_NAME="OpenFlow_${VERSION}_${ARCH}.dmg"
+DMG_PATH="$ROOT/target/$DMG_NAME"
 
 BUILD=1
 DMG=0
@@ -29,6 +74,12 @@ for argument in "$@"; do
   case "$argument" in
     --dmg) DMG=1 ;;
     --skip-build) BUILD=0 ;;
+    --print-artifacts)
+      echo "version=$VERSION"
+      echo "arch=$ARCH"
+      echo "dmg=$DMG_NAME"
+      exit 0
+      ;;
     *) echo "Unknown option: $argument" >&2; exit 2 ;;
   esac
 done
@@ -40,6 +91,14 @@ if [ ! -x "$BINARY" ]; then
   echo "No binary at $BINARY. Run without --skip-build." >&2
   exit 1
 fi
+
+# Ask the binary what it was built from rather than asking git, which would
+# answer for the tree as it is now: under --skip-build those are two different
+# commits, and the plist has to describe the executable it is shipping beside.
+# `--version` prints "OpenFlow <version> (<commit>)" and exits before AppKit,
+# the instance lock and the keychain, so this starts nothing.
+COMMIT="$("$BINARY" --version | sed -n 's/^OpenFlow .* (\(.*\))$/\1/p')"
+COMMIT="${COMMIT:-unknown}"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -87,6 +146,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>${VERSION}</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <!-- Not a CFBundle key, and deliberately so: CFBundleVersion is the build
+         number macOS compares between installs, so hiding a commit hash in it
+         would make every build look like a downgrade. This one is only ever
+         read by a human asking which tree an installed app came from. -->
+    <key>OpenFlowCommit</key>
+    <string>${COMMIT}</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
@@ -127,14 +192,31 @@ codesign --display --requirements - "$APP" 2>/dev/null \
   | sed -n 's/^#\{0,1\} *designated => /signed: /p' >&2
 
 if [ "$DMG" = "1" ]; then
+  # A staged folder, not -srcfolder on the .app: the image has to hold the
+  # Applications symlink next to the app, which is the whole of the install
+  # instruction a Mac user needs and the reason not to add a background image
+  # explaining it.
   STAGE="$(mktemp -d)"
+  trap 'rm -rf "$STAGE"' EXIT
   cp -R "$APP" "$STAGE/"
   ln -s /Applications "$STAGE/Applications"
-  rm -f "$ROOT/target/OpenFlow.dmg"
+  # Both the current name and the one a previous version of this script wrote,
+  # so a re-run leaves one image in target/ rather than a museum of them.
+  rm -f "$DMG_PATH" "$ROOT/target/OpenFlow.dmg"
+  # UDZO: zlib-compressed and read-only, which is what every other Mac download
+  # is and what Gatekeeper checks in one pass. -ov because the interesting
+  # failure is a half-written image from an interrupted run, not a name clash.
   hdiutil create -volname OpenFlow -srcfolder "$STAGE" -ov -format UDZO \
-    "$ROOT/target/OpenFlow.dmg" > /dev/null
+    "$DMG_PATH" > /dev/null
   rm -rf "$STAGE"
-  echo "$ROOT/target/OpenFlow.dmg"
+  trap - EXIT
+
+  # Path then checksum, so a local build can be compared against the one the
+  # release page publishes without a second command. The workflow writes the
+  # same number into a .sha256 asset in shasum's own `hash  name` format,
+  # because that is the form `shasum -c` reads back.
+  echo "$DMG_PATH"
+  shasum -a 256 "$DMG_PATH" | awk '{print $1}'
 fi
 
 echo "$APP"

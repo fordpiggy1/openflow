@@ -34,8 +34,8 @@ crates/openflow-native/          AppKit binary, macOS only
   src/tray.rs                    tray-icon + muda menu, recents, open windows, quit
   src/overlay.rs                 NSPanel pill with a custom NSView (section 5)
   src/tts_player.rs              rodio playback for the voice preview
-  src/ui/settings.rs             native Settings window (section 6)
-  src/ui/onboarding.rs           Milestone B
+  src/ui/settings.rs             a page of the main window (section 6)
+  src/ui/onboarding.rs           a sheet on the main window
   src/ui/main_window.rs          sidebar + one page at a time
   src/ui/dictate.rs              the main screen, hold to record
   src/ui/card.rs                 the rounded card the pages group into
@@ -112,7 +112,7 @@ Behaviors: hold-to-talk on `hotkey_record` (press starts, release stops), recopy
 
 ## 6. Settings window (Milestone A scope)
 
-One `NSWindow` (titled, closable, 420x560, hidden on close, not released) with an `NSTabView`: General, Providers, Voice, Privacy. Controls are stock AppKit: `NSPopUpButton` for provider/model/microphone/insert method/theme, `NSSecureTextField` for keys, `NSTextField` for base URL and models, `NSTextView` for dictionary with a live counter, `NSSwitch` for toggles, a hotkey recorder field that captures the next key chord and stores the same string format `parse_shortcut` accepts. A "Fetch models" button calls `Engine::fetch_models` and fills the popup. Every control writes through `settings.rs` on change (no Save button, matching the current autosave). Voice tab has a Preview button that plays through `tts_player`. Onboarding, History, and Plugins windows are Milestone B; in Milestone A the tray shows Settings only, and first launch with no provider saved opens Settings on the Providers tab.
+A page of the main window: one scrolling column with General, Providers, Voice and Privacy as headed cards. (It was a 420x560 `NSWindow` with an `NSTabView` through Milestone B; the tab strip rides on the edge of a rectangle, which is the framed look the main window was rebuilt to stop drawing.) Controls are stock AppKit: `NSPopUpButton` for provider/model/microphone/insert method/theme, `NSSecureTextField` for keys, `NSTextField` for base URL and models, `NSTextView` for dictionary with a live counter, `NSSwitch` for toggles, a hotkey recorder field that captures the next key chord and stores the same string format `parse_shortcut` accepts. A "Fetch models" button calls `Engine::fetch_models` and fills the popup. Every control writes through `settings.rs` on change (no Save button, matching the current autosave). Voice tab has a Preview button that plays through `tts_player`. Onboarding, History, and Plugins windows are Milestone B; in Milestone A the tray shows Settings only, and first launch with no provider saved opens Settings on the Providers tab.
 
 ## 7. Local runner (design now, build in Milestone B)
 
@@ -163,3 +163,20 @@ Pieces:
 - Dev flag on the native binary: `--transcribe <wav>` runs the current settings' transcription path headless and prints text and timing, so the runner can be measured without the GUI.
 
 Gates as in section 8, plus: a supervisor test against a fake runner script (stdlib Python returning canned JSON) covering readiness, crash restart with backoff, and kill on drop; the post-pass vectors; the loopback guard; and, when `OPENFLOW_RUNNER_E2E=1` and a Python 3.10+ with the models already cached is present, an end-to-end test that installs, starts, prewarms and transcribes the reference clip and asserts a non-empty text.
+
+## 11. Milestone C spec: ship the native app, retire the webview (decided 2026-09-03)
+
+Two PRs, because the second deletes code other contributors are still touching and Titan decides its timing.
+
+**C1, ship the native app (no deletions):**
+- Stable local signing identity. `scripts/signing-identity.sh` creates a self-signed code-signing certificate in the login keychain once ("OpenFlow Local Dev"), and `scripts/bundle-native.sh` signs with it when present, falling back to ad hoc with a printed warning. Same identity across rebuilds means macOS keeps the Accessibility, Automation, microphone and keychain grants, which is the single biggest friction in dogfooding today (TCC binds ad hoc grants to the CDHash, so every rebuild orphans them). README documents it and the one-time `tccutil reset` after switching identities.
+- DMG: `scripts/bundle-native.sh --dmg` already exists; make it deterministic (volume name, background-free, `hdiutil` with a fixed layout) and produce `OpenFlow_<version>_aarch64.dmg` with the version read from `crates/openflow-native/Cargo.toml`.
+- CI: a `native` job on `macos-latest` running fmt, clippy, tests for the workspace, `--self-check`, and the bundle script, uploading the `.app` zip as an artifact; a release workflow that builds the DMG on a tag. Linux and Windows jobs keep compiling core (the native crate is cfg-gated to an empty main there).
+- Login item: an "Open at login" toggle in Settings General using `SMAppService` (macOS 13+), off by default; the launch-time Settings window stays as is (a quieter launch is a later setting).
+- Version and about: `--version`, and an About item in the app menu showing version and commit.
+
+**C2, retire the webview (Titan's call on timing, coordinate with Ford):**
+- Delete `src-tauri/`, `src/`, `overlay.html`, `index.html`, `vite.config.ts`, `tsconfig*.json`, `package.json` scripts that only served Vite/Tauri, and the Tauri jobs in CI. Move anything still referenced (icons, Info.plist, entitlements) under `crates/openflow-native/`.
+- Rename the binary back to `openflow` (the `openflow-native` name only existed to avoid the cargo output collision with the Tauri bin).
+- README rewritten around the native app; CHANGELOG entry lists what was removed and the last commit where the Tauri build existed, so it can be resurrected from history.
+- `Engine` keeps the `EngineEvents` sink; the Tauri sink implementation goes with the Tauri crate. Any test that lived only in `src-tauri` (there should be none after A1) is moved first.

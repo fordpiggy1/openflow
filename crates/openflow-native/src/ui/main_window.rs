@@ -35,6 +35,13 @@
 //! container and its own subviews spring off that. Nothing here mixes the two
 //! models in one view.
 //!
+//! All four pages are built together, when the window is. That keeps the
+//! swapping trivial, and it puts one rule on the pages: anything that costs the
+//! user something -- a keychain read, a device enumeration, a network call --
+//! belongs in the page's show path, not its constructor, because a page that is
+//! built is not a page that was asked for. Settings is where that bites; see
+//! the note in its `new`.
+//!
 //! Pages are built against the content pane's measured size rather than an
 //! assumed one. The window is laid out once, before any page exists, and each
 //! page is then handed the rect it actually got -- the same lesson the settings
@@ -47,11 +54,12 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSControlTextEditingDelegate, NSFocusRingType,
-    NSFont, NSImage, NSImageSymbolConfiguration, NSImageView, NSScrollView, NSSplitViewController,
-    NSSplitViewItem, NSTableCellView, NSTableColumn, NSTableColumnResizingOptions, NSTableView,
-    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextField, NSTitlebarSeparatorStyle, NSView, NSViewController, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSFont, NSImage, NSImageSymbolConfiguration, NSImageView, NSResponder, NSScrollView,
+    NSSplitViewController, NSSplitViewItem, NSTableCellView, NSTableColumn,
+    NSTableColumnResizingOptions, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTextField,
+    NSTitlebarSeparatorStyle, NSView, NSViewController, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSIndexSet, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -63,6 +71,7 @@ use crate::ui::dictate::DictatePage;
 use crate::ui::history::HistoryPage;
 use crate::ui::note;
 use crate::ui::plugins::PluginsPage;
+use crate::ui::settings::SettingsPage;
 
 /// The window's content size on first launch. Wide enough that the sidebar
 /// leaves the History table its five columns.
@@ -80,13 +89,16 @@ const MIN_HEIGHT: f64 = 440.0;
 const SIDEBAR_COLUMN: &str = "page";
 
 /// The pages, in sidebar order: title, window title, and the SF Symbol the
-/// sidebar row carries. Settings is not here yet: it is still its own window,
-/// and moving it is the next change rather than this one.
+/// sidebar row carries.
 const PAGES: &[(&str, &str, &str)] = &[
     ("Dictate", "OpenFlow", "mic.fill"),
     ("History", "OpenFlow History", "clock.arrow.circlepath"),
     ("Plugins", "OpenFlow Plugins", "puzzlepiece.extension.fill"),
+    ("Settings", "OpenFlow Settings", "gearshape.fill"),
 ];
+/// Settings is the only page a caller can name a place *inside*, so its index
+/// is needed by name rather than by position.
+const SETTINGS: usize = 3;
 
 /// Row metrics. The icon column is the width of the largest symbol plus the
 /// gap after it, so the titles line up whatever glyph sits beside them -- a
@@ -112,6 +124,7 @@ pub struct MainIvars {
     dictate: Retained<DictatePage>,
     history: Retained<HistoryPage>,
     plugins: Retained<PluginsPage>,
+    settings: Retained<SettingsPage>,
     /// Kept alive for as long as the window is: the window holds the controller
     /// as its `contentViewController`, but the items are ours.
     _split: Retained<NSSplitViewController>,
@@ -137,6 +150,28 @@ define_class!(
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             crate::ui::dismiss_window(&self.ivars().window, "main");
             false
+        }
+
+        /// Give the keyboard back to the record button, but only if nothing
+        /// else has it.
+        ///
+        /// A system alert over the window -- the microphone prompt is the one
+        /// that happens here -- leaves the window with no first responder at
+        /// all when it goes away, and Space then does nothing until the user
+        /// tabs somewhere. Restoring it unconditionally would be worse than
+        /// the problem: it would yank focus off whatever the user had
+        /// deliberately tabbed to every time they switched back to the app. A
+        /// window reports *itself* as first responder when nothing else is,
+        /// which is exactly the case worth repairing and no other.
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            let window = &self.ivars().window;
+            let vacant = window
+                .firstResponder()
+                .is_none_or(|responder| std::ptr::eq(&*responder, &**window as &NSResponder));
+            if vacant {
+                self.focus_current();
+            }
         }
     }
 
@@ -314,6 +349,7 @@ impl MainWindow {
         let dictate = DictatePage::new(app, mtm, page_size);
         let history = HistoryPage::new(app, mtm, page_size);
         let plugins = PluginsPage::new(app, mtm, page_size);
+        let settings = SettingsPage::new(app, mtm, page_size);
 
         let this = Self::alloc(mtm).set_ivars(MainIvars {
             window,
@@ -324,6 +360,7 @@ impl MainWindow {
             dictate,
             history,
             plugins,
+            settings,
             _split: split,
             current: Cell::new(usize::MAX),
         });
@@ -357,10 +394,18 @@ impl MainWindow {
         let Some((_, title, _)) = PAGES.get(index) else {
             return;
         };
+        // Leaving Settings is what closing its window used to be: it commits
+        // a key or a URL the user typed and never tabbed out of, and it takes
+        // down a hotkey recorder that would otherwise go on swallowing every
+        // keystroke in the app.
+        if ivars.current.get() == SETTINGS {
+            ivars.settings.on_hidden();
+        }
         let view = match index {
             0 => ivars.dictate.view(),
             1 => ivars.history.view(),
-            _ => ivars.plugins.view(),
+            2 => ivars.plugins.view(),
+            _ => ivars.settings.view(),
         };
         // Whatever is showing comes out first: a view can only have one
         // superview, and adding it a second time is a silent no-op that leaves
@@ -397,20 +442,40 @@ impl MainWindow {
                 ivars.dictate.focus_record();
             }
             1 => ivars.history.load(),
-            _ => ivars.plugins.load(),
+            2 => ivars.plugins.load(),
+            // Every time, not just on first build: another surface can change
+            // a value while this page is hidden -- the pill's own drag writes
+            // the overlay position, and the wizard rewrites the lot.
+            _ => ivars.settings.reload(),
         }
     }
 
     /// Select a page by the name the tray and `Navigate` use.
+    ///
+    /// A name that is not a page may still be a group inside Settings: the
+    /// tray, the wizard and `Navigate` have always been able to ask for
+    /// "voice" or "privacy", and those used to be tabs. They open Settings on
+    /// that group now.
     pub fn show_named(&self, name: &str) {
         if let Some(index) = page_index(name) {
             self.show_page(index);
+            return;
+        }
+        if crate::ui::settings::section_index(name).is_some() {
+            self.show_page(SETTINGS);
+            self.ivars().settings.select_section(name);
         }
     }
 
     /// On screen, as the Dock-icon rule reads it.
     pub fn is_visible(&self) -> bool {
         self.ivars().window.isVisible()
+    }
+
+    /// The window itself, for the one thing that needs it: hanging the setup
+    /// wizard off it as a sheet.
+    pub fn window(&self) -> Retained<NSWindow> {
+        self.ivars().window.clone()
     }
 
     pub fn present(&self) {
@@ -454,6 +519,10 @@ impl MainWindow {
         self.ivars().dictate.clone()
     }
 
+    pub fn settings(&self) -> Retained<SettingsPage> {
+        self.ivars().settings.clone()
+    }
+
     /// Re-read everything a page shows. Called when the window is presented,
     /// because Settings may have changed a binding while it was hidden.
     pub fn reload(&self) {
@@ -462,6 +531,7 @@ impl MainWindow {
         match ivars.current.get() {
             1 => ivars.history.load(),
             2 => ivars.plugins.load(),
+            SETTINGS => ivars.settings.reload(),
             _ => {}
         }
     }
@@ -666,7 +736,28 @@ mod tests {
     /// falling through to page zero.
     #[test]
     fn an_unknown_name_selects_nothing() {
-        assert_eq!(page_index("settings"), None);
+        assert_eq!(page_index("nowhere"), None);
         assert_eq!(page_index(""), None);
+    }
+
+    /// `SETTINGS` has to keep pointing at the Settings row, because leaving
+    /// that page is what commits a half-typed key.
+    #[test]
+    fn the_settings_index_names_the_settings_page() {
+        assert_eq!(PAGES[SETTINGS].0, "Settings");
+        assert_eq!(page_index("settings"), Some(SETTINGS));
+    }
+
+    /// The group names inside Settings must not collide with page names, or
+    /// `show_named` would answer a group with a page.
+    #[test]
+    fn a_settings_group_is_not_also_a_page() {
+        for group in ["general", "providers", "voice", "privacy"] {
+            assert!(
+                crate::ui::settings::section_index(group).is_some(),
+                "{group}"
+            );
+            assert_eq!(page_index(group), None, "{group}");
+        }
     }
 }

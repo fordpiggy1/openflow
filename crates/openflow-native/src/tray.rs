@@ -154,7 +154,7 @@ fn build_menu(engine: &Arc<Engine>, state: RecordingState) -> Result<(Menu, Menu
     ))?;
     append(&MenuItem::with_id(
         MenuId::new(ID_SETTINGS),
-        "Settings...",
+        "Settings",
         true,
         None,
     ))?;

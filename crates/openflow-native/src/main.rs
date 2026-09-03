@@ -33,6 +33,12 @@ mod ui;
 #[cfg(target_os = "macos")]
 mod app;
 
+// Not gated: pure string handling, and the stub `main` below answers
+// `--version` too, so the one line three surfaces agree on is compiled and
+// tested on every platform in the matrix rather than only on the one that can
+// run the app.
+mod version;
+
 #[cfg(target_os = "macos")]
 fn main() {
     app::main();
@@ -40,6 +46,10 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if std::env::args().any(|argument| argument == "--version") {
+        println!("{}", version::long());
+        return;
+    }
     eprintln!(
         "openflow-native is the macOS AppKit build of OpenFlow. \
          On this platform, build the Tauri app in src-tauri instead."
