@@ -224,7 +224,22 @@ launchctl setenv OPENFLOW_TRACE 1     # then open the app
 launchctl unsetenv OPENFLOW_TRACE     # back to silent, the default
 ```
 
-Launch it with `open -a target/OpenFlow.app`, not from a shell. macOS binds microphone and accessibility grants to the *code signature* of whatever asked, and a binary started from a terminal inherits the terminal's identity, so the grant lands on the terminal and the app appears to have been refused. The ad hoc signature the bundle script applies also changes on every rebuild, so expect to grant microphone access again after each one until a stable signing identity lands in Milestone C.
+Launch it with `open -a target/OpenFlow.app`, not from a shell. macOS binds microphone and accessibility grants to the *code signature* of whatever asked, and a binary started from a terminal inherits the terminal's identity, so the grant lands on the terminal and the app appears to have been refused.
+
+Grant those permissions once, not once per build:
+
+```bash
+bash scripts/local-signing-identity.sh     # once per machine
+```
+
+That installs a self-signed code signing certificate in a keychain of its own and `scripts/bundle-native.sh` picks it up from then on. It matters because macOS matches a TCC grant against the signature's *designated requirement*, and an ad hoc signature has nothing durable to name itself by, so its requirement is the code hash -- which changes with the code. Signed with a certificate the requirement names the certificate, and every later build still satisfies it. The bundle script prints which of the two it produced:
+
+```
+signed: identifier "io.laisy.openflow" and certificate root = H"..."   # survives rebuilds
+signed: cdhash H"..."                                                  # does not
+```
+
+The certificate is self-signed and never leaves this machine; it proves nothing to anyone else and is not a step towards distribution, which still wants a Developer ID. Set `OPENFLOW_SIGN_IDENTITY` to sign with something else, and expect to answer the microphone and accessibility prompts one last time on the first build after switching identities. `scripts/local-signing-identity.sh --remove` puts things back.
 
 ## How dictation works
 

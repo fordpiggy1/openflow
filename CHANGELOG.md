@@ -4,6 +4,17 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### A signing identity that outlives the build that made it
+By: Ford (with Claude)
+Impact: `scripts/local-signing-identity.sh` (new), `scripts/bundle-native.sh`, `.github/workflows/ci.yml`, `README.md`, `docs/native-port/PLAN.md`
+
+- **Every rebuild silently revoked the app's microphone and accessibility grants**, and that was the largest single source of friction in testing the native host: the symptom is a button that does nothing, or a permission prompt that reappears and reads like a launch-time regression, and neither points at the signature.
+- The cause is what a TCC grant is recorded against. macOS stores the *designated requirement* of whoever asked, and an ad hoc signature has no certificate to name itself by, so its requirement is the code hash -- `designated => cdhash H"..."`. Change a line of Rust and nothing matches it any more. Signing with a certificate moves the requirement onto the certificate -- `designated => identifier "io.laisy.openflow" and certificate root = H"..."` -- which every later build satisfies. This was confirmed by reading the `csreq` column out of the TCC databases and comparing it against the bundle: the microphone row held the current code hash, the accessibility row held one from a build that no longer existed on disk.
+- `scripts/local-signing-identity.sh` installs such a certificate. It is self-signed, ten years long, and lives in a keychain of its own with a random password under `~/.config/openflow`, so it never touches the login keychain and nothing about it is in this repository. It asserts nothing to anyone else; distribution still wants a Developer ID. `--check` reports and unlocks without ever creating, `--remove` puts things back.
+- **It deliberately does not write trust settings.** Under the code signing policy an untrusted self-signed certificate is already a usable signing identity, and writing trust settings is the one step in the whole sequence that raises a GUI authorisation panel. So setup is a single non-interactive command. The cost is that `security find-identity -v` reports zero identities, because its validity filter runs a trust evaluation that a self-signed certificate fails by definition; the script matches on the unfiltered list, which is what codesign itself goes by.
+- `scripts/bundle-native.sh` takes `OPENFLOW_SIGN_IDENTITY`, then the local identity, then ad hoc -- and never creates one, because a build quietly minting a signing certificate is worse than a build that says why it could not. It prints the requirement it produced, so which of the two happened is visible rather than inferred, and the ad hoc path says in as many words that the permissions will need granting again.
+- CI bundles and verifies the native app on macOS. The runner has no keychain, so what it exercises is the ad hoc fallback -- the branch a contributor hits before running the setup script once, and the one most likely to rot unnoticed.
+
 ### Local transcription on this Mac (Milestone B2)
 By: Titan (with Claude)
 Impact: `crates/openflow-core/src/{runner.rs,postpass.rs,transcribe.rs,engine.rs,settings.rs}`, `crates/openflow-native/runner/runner.py`, `crates/openflow-native/src/{app.rs,ui/settings.rs,ui/onboarding.rs}`, `scripts/bundle-native.sh`, `src-tauri/src/lib.rs`, `README.md`, `docs/native-port/PLAN.md`
