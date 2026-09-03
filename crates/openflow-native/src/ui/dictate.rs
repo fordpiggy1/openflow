@@ -15,6 +15,15 @@
 //! ordinary target/action path. [`HoldButton`] overrides both halves and does
 //! not call super, which is what makes the down edge and the up edge separate
 //! events.
+//!
+//! It answers the keyboard for the same reason the web screen does. A control
+//! whose only gesture is "hold the mouse down on it" cannot be operated from
+//! the keyboard at all, and `AXPress` -- which is what assistive technology and
+//! every scripted click send -- fires an action this button does not have, so
+//! it would do nothing. Space and Return press and release it, `isARepeat`
+//! drops the auto-repeat of a held key so the press is not delivered twice, and
+//! the Dictate page takes first responder when it comes forward so the key
+//! reaches the button without a Tab first.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -78,8 +87,55 @@ define_class!(
             self.setHighlighted(false);
             self.send(sel!(holdEnded:));
         }
+
+        /// Focusable, so Space and Return can reach it. A disabled button is
+        /// skipped, which is what keeps the focus ring off it while a
+        /// transcription is running.
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            self.isEnabled()
+        }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            if !is_activation_key(event) {
+                // Everything else is somebody else's: Tab out, arrow keys to
+                // the sidebar, Cmd-anything to the menu.
+                let _: () = unsafe { msg_send![super(self), keyDown: event] };
+                return;
+            }
+            // The auto-repeat of a held key. The press already happened, and
+            // delivering it again would start a second capture.
+            if event.isARepeat() || !self.isEnabled() {
+                return;
+            }
+            self.setHighlighted(true);
+            self.send(sel!(holdBegan:));
+        }
+
+        #[unsafe(method(keyUp:))]
+        fn key_up(&self, event: &NSEvent) {
+            if !is_activation_key(event) {
+                let _: () = unsafe { msg_send![super(self), keyUp: event] };
+                return;
+            }
+            self.setHighlighted(false);
+            self.send(sel!(holdEnded:));
+        }
     }
 );
+
+/// Space or Return, the two keys the web screen's `record-button` listens for.
+/// Read from the key code rather than the characters so a non-Latin keyboard
+/// layout answers the same.
+fn is_activation_key(event: &NSEvent) -> bool {
+    matches!(event.keyCode(), KEY_SPACE | KEY_RETURN | KEY_ENTER)
+}
+
+const KEY_RETURN: u16 = 36;
+const KEY_SPACE: u16 = 49;
+/// The numeric keypad's Enter, which macOS reports separately.
+const KEY_ENTER: u16 = 76;
 
 impl HoldButton {
     /// Send `selector` to whatever this button's target is. The target is
@@ -201,6 +257,16 @@ impl DictatePage {
     /// The view the main window installs in its content pane.
     pub fn view(&self) -> Retained<NSView> {
         self.ivars().view.clone()
+    }
+
+    /// Put the keyboard on the record button. Called when the page comes
+    /// forward, so Space works without tabbing to it first -- the web screen's
+    /// button is focusable for the same reason.
+    pub fn focus_record(&self) {
+        let ivars = self.ivars();
+        if let Some(window) = ivars.view.window() {
+            window.makeFirstResponder(Some(&ivars.controls.record));
+        }
     }
 
     /// Re-read what the page shows when it is not being driven by an event: the

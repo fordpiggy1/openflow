@@ -311,7 +311,12 @@ impl MainWindow {
         // Pages that read the world when they come forward do it here rather
         // than on a timer.
         match index {
-            0 => ivars.dictate.load(),
+            0 => {
+                ivars.dictate.load();
+                // After the view is in the hierarchy: a view with no window
+                // has no first responder to become.
+                ivars.dictate.focus_record();
+            }
             1 => ivars.history.load(),
             _ => ivars.plugins.load(),
         }
@@ -331,6 +336,21 @@ impl MainWindow {
 
     pub fn present(&self) {
         crate::ui::present_window(&self.ivars().window, "main");
+        // After presenting, not before. A window assigns its first responder
+        // when it first becomes key, from its own key view loop, and that
+        // assignment lands on top of anything set while the window was still
+        // off screen -- which is where the focus set during `show_page` went
+        // on the very first open.
+        self.focus_current();
+    }
+
+    /// Give the keyboard to whatever the current page wants it on. Only
+    /// Dictate wants it: the other two are lists, and a table that steals
+    /// first responder from itself scrolls to the top.
+    fn focus_current(&self) {
+        if self.ivars().current.get() == 0 {
+            self.ivars().dictate.focus_record();
+        }
     }
 
     /// Run `body` against the History page, whether or not it is showing: the
