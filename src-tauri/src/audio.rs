@@ -131,8 +131,12 @@ impl AudioRecorder {
                         };
                         let _ = stream.pause();
                         drop(stream);
+                        // Move the capture out and let it drop at the end of this arm.
+                        // `clear()` would keep the capacity, so one long take would pin
+                        // up to 230 MB (MAX_CAPTURE_SAMPLES of f32) for the life of the
+                        // app; taking it returns the memory to the allocator now.
                         let samples_data = match samples.lock() {
-                            Ok(buffer) => buffer,
+                            Ok(mut buffer) => std::mem::take(&mut *buffer),
                             Err(_) => {
                                 let _ = reply.send(Err("Audio buffer is unavailable".to_string()));
                                 continue;
@@ -361,10 +365,15 @@ fn speech_level(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
+    // A selection, not a sort: O(n) instead of O(n log n) over a copy that is
+    // 77 MB for the longest take, and this runs on the stop path where the
+    // user is waiting.
     let mut magnitudes: Vec<f32> = samples.iter().map(|sample| sample.abs()).collect();
-    magnitudes.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let index = ((magnitudes.len() as f32 * 0.95) as usize).min(magnitudes.len() - 1);
-    magnitudes[index]
+    let (_, level, _) = magnitudes.select_nth_unstable_by(index, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    *level
 }
 
 /// -60 dBFS. A take whose loud part sits under this carried no voice: a muted,

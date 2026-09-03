@@ -11,6 +11,7 @@ The project is currently an early source build. There are no official pre-built 
 - Configurable transcription and cleanup models with provider model discovery
 - Global hold-to-record shortcut (`Option+V` by default) and re-copy shortcut (`Ctrl+Shift+V` by default)
 - Searchable local transcription history
+- Clipboard preservation: dictating does not cost you the text or image you had copied (on by default)
 - Microphone selection, language hints, light/dark themes, a system tray menu, and a movable status overlay
 - Optional LLM cleanup for punctuation, paragraphs, and spoken editing commands
 - OpenRouter Gemini 3.1 Flash TTS Preview with selectable voices and cancellable response streaming
@@ -137,7 +138,7 @@ CI runs these checks from a clean install and compiles the desktop app on macOS,
 4. The selected provider transcribes the completed recording.
 5. If enabled, the selected chat model cleans up the text.
 6. Enabled `after_transcribe` and `after_format` hooks can transform the result.
-7. OpenFlow saves the result to local history and copies it to the clipboard.
+7. OpenFlow saves the result to local history. It also copies the result to the clipboard, unless "Keep my clipboard" is on, in which case whatever you had copied is put back after the paste is delivered.
 8. The platform paste helper attempts to paste into the app focused at completion time.
 
 Because network and cleanup latency vary, keep the intended destination focused until processing finishes. Review generated text before using it in commands, code, or other sensitive contexts.

@@ -526,7 +526,7 @@ fn copy_last_transcription(state: State<AppState>) -> Result<(), String> {
         .lock()
         .map_err(|_| "Clipboard history is unavailable".to_string())?;
     match last.as_ref() {
-        Some(text) => paste_to_clipboard(text, insert_method(&state.db)),
+        Some(text) => paste_to_clipboard(text, insert_method(&state.db), ClipboardPolicy::Keep),
         None => Err("No previous transcription".to_string()),
     }
 }
@@ -556,7 +556,7 @@ fn copy_text(_state: State<AppState>, text: String) -> Result<(), String> {
 /// Copy and paste in one step, for callers that want the keystroke.
 #[tauri::command]
 fn paste_text(state: State<AppState>, text: String) -> Result<(), String> {
-    paste_to_clipboard(&text, insert_method(&state.db))
+    paste_to_clipboard(&text, insert_method(&state.db), clipboard_policy(&state.db))
 }
 
 // ── Hotkey management ─────────────────────────────────────
@@ -789,6 +789,7 @@ async fn run_transcription_pipeline_inner(
             .as_deref()
             .unwrap_or(&transcription.raw_text),
         insert_method(&state.db),
+        clipboard_policy(&state.db),
     )
     .err();
 
@@ -833,14 +834,34 @@ fn insert_method(db: &Database) -> InsertMethod {
 /// hotkey, where focus is in the user's editor; wrong for a list inside
 /// OpenFlow, which would insert into OpenFlow itself.
 ///
-/// The clipboard is written either way. Under `Type` it is not the delivery
-/// mechanism but the safety net: if insertion silently fails, the text is one
-/// Cmd+V away instead of gone.
-fn paste_to_clipboard(text: &str, method: InsertMethod) -> Result<(), String> {
-    write_clipboard(text)?;
-    match method {
-        InsertMethod::Paste => simulate_paste(),
-        InsertMethod::Type => type_text(text),
+/// Under `Keep` the clipboard is written either way; for `Type` it is then a
+/// safety net rather than the delivery mechanism. Under `Restore`, `Type`
+/// never touches the clipboard at all, and `Paste` puts the previous contents
+/// back once the target app has had time to read the transcript. A paste that
+/// macOS blocks leaves the transcript on the clipboard, since the error text
+/// tells the user it is there.
+fn paste_to_clipboard(
+    text: &str,
+    method: InsertMethod,
+    policy: ClipboardPolicy,
+) -> Result<(), String> {
+    match (method, policy) {
+        (InsertMethod::Type, ClipboardPolicy::Restore) => type_text(text),
+        (InsertMethod::Type, ClipboardPolicy::Keep) => {
+            write_clipboard(text)?;
+            type_text(text)
+        }
+        (InsertMethod::Paste, ClipboardPolicy::Keep) => {
+            write_clipboard(text)?;
+            simulate_paste()
+        }
+        (InsertMethod::Paste, ClipboardPolicy::Restore) => {
+            let previous = snapshot_clipboard();
+            write_clipboard(text)?;
+            simulate_paste()?;
+            schedule_clipboard_restore(previous, text.to_string());
+            Ok(())
+        }
     }
 }
 
@@ -879,6 +900,84 @@ fn prewarm_typing() {
 
 #[cfg(not(target_os = "macos"))]
 fn prewarm_typing() {}
+/// What happens to whatever the user had copied before an insertion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ClipboardPolicy {
+    /// Put the previous contents back once the insertion has consumed them.
+    Restore,
+    /// Leave the transcript on the clipboard: the user asked for it there.
+    Keep,
+}
+
+impl ClipboardPolicy {
+    /// The `preserve_clipboard` setting. On unless the user turned it off.
+    fn from_setting(value: Option<String>) -> Self {
+        match value.as_deref().map(str::trim) {
+            Some("false") => Self::Keep,
+            _ => Self::Restore,
+        }
+    }
+}
+
+fn clipboard_policy(db: &Database) -> ClipboardPolicy {
+    ClipboardPolicy::from_setting(db.get_setting("preserve_clipboard"))
+}
+
+/// What the clipboard held before we replaced it. Text and images round-trip
+/// through the clipboard crate; files and rich content do not, so they are
+/// reported as `Other` and cannot be put back.
+enum ClipboardSnapshot {
+    Text(String),
+    Image(arboard::ImageData<'static>),
+    Other,
+}
+
+fn snapshot_clipboard() -> ClipboardSnapshot {
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return ClipboardSnapshot::Other;
+    };
+    if let Ok(text) = clipboard.get_text() {
+        return ClipboardSnapshot::Text(text);
+    }
+    if let Ok(image) = clipboard.get_image() {
+        return ClipboardSnapshot::Image(image.to_owned_img());
+    }
+    ClipboardSnapshot::Other
+}
+
+/// How long the target app gets to read the clipboard after Cmd+V lands.
+/// The keystroke is delivered before `simulate_paste` returns, but the app
+/// reads the pasteboard when it handles the event, and heavy apps take a
+/// few hundred milliseconds to get there.
+const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(500);
+
+/// Put `previous` back after the grace period, unless the clipboard no longer
+/// holds our transcript, which means the user copied something newer.
+fn schedule_clipboard_restore(previous: ClipboardSnapshot, ours: String) {
+    if matches!(previous, ClipboardSnapshot::Other) {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return;
+        };
+        let current = clipboard.get_text().ok();
+        if !clipboard_still_ours(current.as_deref(), &ours) {
+            return;
+        }
+        let _ = match previous {
+            ClipboardSnapshot::Text(text) => clipboard.set_text(text),
+            ClipboardSnapshot::Image(image) => clipboard.set_image(image),
+            ClipboardSnapshot::Other => Ok(()),
+        };
+    });
+}
+
+/// The restore must never clobber something the user copied in the meantime.
+fn clipboard_still_ours(current: Option<&str>, ours: &str) -> bool {
+    current == Some(ours)
+}
 
 /// Send `text` as a synthesized keystroke, unicode payload and all.
 ///
@@ -1211,7 +1310,7 @@ fn handle_recopy(app: &AppHandle) {
         return;
     };
     if let Some(text) = last.as_ref() {
-        let _ = paste_to_clipboard(text, insert_method(&state.db));
+        let _ = paste_to_clipboard(text, insert_method(&state.db), ClipboardPolicy::Keep);
         let _ = app.emit("recopy-success", "Copied last transcription");
     }
 }
@@ -1413,7 +1512,11 @@ pub fn run() {
                             let state = app.state::<AppState>();
                             if let Ok(Some(t)) = state.db.get_transcription(row_id) {
                                 let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
-                                let _ = paste_to_clipboard(text, insert_method(&state.db));
+                                let _ = paste_to_clipboard(
+                                    text,
+                                    insert_method(&state.db),
+                                    ClipboardPolicy::Keep,
+                                );
                                 let _ = app.emit("recopy-success", "Copied!");
                             }
                         }
@@ -1507,6 +1610,35 @@ mod tests {
         // billing against a hosted provider every 800 ms.
         assert!(!live_preview_allowed(Some(""), &hosted));
         assert!(!live_preview_allowed(Some("yes"), &hosted));
+    }
+
+    #[test]
+    fn clipboard_is_preserved_unless_the_user_opted_out() {
+        assert_eq!(
+            ClipboardPolicy::from_setting(None),
+            ClipboardPolicy::Restore
+        );
+        assert_eq!(
+            ClipboardPolicy::from_setting(Some("true".to_string())),
+            ClipboardPolicy::Restore
+        );
+        assert_eq!(
+            ClipboardPolicy::from_setting(Some(" false ".to_string())),
+            ClipboardPolicy::Keep
+        );
+    }
+
+    #[test]
+    fn restore_yields_to_anything_the_user_copied_meanwhile() {
+        assert!(clipboard_still_ours(
+            Some("the transcript"),
+            "the transcript"
+        ));
+        assert!(!clipboard_still_ours(
+            Some("a newer copy"),
+            "the transcript"
+        ));
+        assert!(!clipboard_still_ours(None, "the transcript"));
     }
 
     #[test]
