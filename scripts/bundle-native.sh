@@ -45,6 +45,15 @@ cp "$BINARY" "$APP/Contents/MacOS/openflow"
 cp "$ROOT/src-tauri/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# The local transcription sidecar. `LocalRunner::script_path` looks here first,
+# relative to the executable, and falls back to the source tree for a `cargo
+# run`. The virtualenv it runs under is *not* here: a venv hard-codes its own
+# absolute path, so one inside the bundle would break the first time the app
+# moved and be thrown away by every update. It lives beside the database in the
+# app's data directory instead.
+mkdir -p "$APP/Contents/Resources/runner"
+cp "$ROOT/crates/openflow-native/runner/runner.py" "$APP/Contents/Resources/runner/runner.py"
+
 # Info.plist: the usage strings and LSUIElement come from src-tauri/Info.plist,
 # which Tauri merges into its own bundle, so the two builds ask for the same
 # permissions with the same words. The bundle keys Tauri generates are added
