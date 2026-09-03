@@ -51,6 +51,13 @@ impl PluginManager {
         Self { plugins_dir }
     }
 
+    /// Where plugins live. A host needs this to reveal the folder and to read a
+    /// manifest out of a directory the user picked; the field itself stays
+    /// private so the path is still owned here.
+    pub fn plugins_dir(&self) -> &Path {
+        &self.plugins_dir
+    }
+
     pub fn list_plugins(&self) -> Vec<PluginInfo> {
         let mut plugins = Vec::new();
 
