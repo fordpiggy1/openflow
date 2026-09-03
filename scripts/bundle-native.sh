@@ -10,9 +10,11 @@
 # The DMG is target/OpenFlow_<version>_<arch>.dmg, and --print-artifacts says
 # what that name will be without building anything, so a release workflow can
 # name the asset it is about to upload without keeping a second copy of the
-# rule. The version has exactly one source, crates/openflow-native/Cargo.toml,
-# which is also where CFBundleShortVersionString and CFBundleVersion come from,
-# so a bundle cannot disagree with itself about what it is.
+# rule. There is exactly one source for each half of a build's identity: the
+# version comes from crates/openflow-native/Cargo.toml, and the commit is asked
+# of the binary itself (`--version`), never recomputed here -- a bundle can then
+# never claim a commit its executable was not built from, however stale the tree
+# it was assembled in.
 #
 # "Deterministic" here means the same inputs give the same *name*, layout and
 # contents: a fixed volume name, an Applications symlink, no background image,
@@ -90,6 +92,14 @@ if [ ! -x "$BINARY" ]; then
   exit 1
 fi
 
+# Ask the binary what it was built from rather than asking git, which would
+# answer for the tree as it is now: under --skip-build those are two different
+# commits, and the plist has to describe the executable it is shipping beside.
+# `--version` prints "OpenFlow <version> (<commit>)" and exits before AppKit,
+# the instance lock and the keychain, so this starts nothing.
+COMMIT="$("$BINARY" --version | sed -n 's/^OpenFlow .* (\(.*\))$/\1/p')"
+COMMIT="${COMMIT:-unknown}"
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # The bundle executable keeps the plain name; only the cargo target is suffixed.
@@ -136,6 +146,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>${VERSION}</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <!-- Not a CFBundle key, and deliberately so: CFBundleVersion is the build
+         number macOS compares between installs, so hiding a commit hash in it
+         would make every build look like a downgrade. This one is only ever
+         read by a human asking which tree an installed app came from. -->
+    <key>OpenFlowCommit</key>
+    <string>${COMMIT}</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
