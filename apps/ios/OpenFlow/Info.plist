@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>OpenFlow</string>
+
+	<!-- The one permission the app asks for, and the sentence the user reads
+	     before granting it. It has to be true. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>OpenFlow listens so it can turn your speech into text. Recognition runs entirely on this iPhone and no audio is ever sent anywhere.</string>
+
+	<!-- `audio` only, and only while a take is running: a capture must survive
+	     the screen locking mid-sentence. No fetch, no processing, no location,
+	     no VoIP. PLAN.md section 5 budgets zero idle work. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+
+	<!-- Opened only by our own keyboard extension, which has no other way to
+	     reach the app. Nothing else is registered on it. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>io.laisy.openflow</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>openflow</string>
+			</array>
+		</dict>
+	</array>
+
+	<key>UILaunchScreen</key>
+	<dict/>
+
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<!-- Live Activities for the Dynamic Island pill during a take. -->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+</dict>
+</plist>
