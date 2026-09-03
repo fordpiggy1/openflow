@@ -400,6 +400,13 @@ impl Engine {
         self.recorder.list_devices()
     }
 
+    /// How loud the microphone is right now, 0.0 to 1.0, or zero when nothing
+    /// is recording. A plain atomic read: a meter asks about thirty times a
+    /// second and must not be able to hold the capture up.
+    pub fn input_level(&self) -> f32 {
+        self.recorder.input_level()
+    }
+
     pub async fn fetch_models(
         &self,
         provider_name: Option<String>,
