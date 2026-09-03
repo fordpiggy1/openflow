@@ -64,6 +64,36 @@ pub fn with_app<R>(body: impl FnOnce(&Rc<App>) -> R) -> Option<R> {
     app.as_ref().map(body)
 }
 
+/// Put the app in the Dock while a window is open and take it out once they are
+/// all closed, leaving the status item as the way back in either way.
+///
+/// The pill and the status item are not windows for this purpose. An app that
+/// jumped into the Dock every time someone spoke would be worse than one that
+/// never appeared there at all.
+///
+/// `presenting` is set by the caller that is about to show a window: the window
+/// is not visible yet at that moment, so counting alone would say no.
+///
+/// `LSUIElement` in the bundle still decides how the app *launches* -- as an
+/// accessory, with no Dock icon and no menu bar until something asks for one.
+pub fn refresh_dock_presence(presenting: bool) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let visible = presenting || with_app(|app| app.has_visible_window()).unwrap_or(false);
+    let policy = if visible {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    };
+    let ns_app = NSApplication::sharedApplication(mtm);
+    if ns_app.activationPolicy() == policy {
+        return;
+    }
+    crate::trace!("dock presence={}", visible);
+    ns_app.setActivationPolicy(policy);
+}
+
 /// Everything the main thread owns.
 pub struct App {
     engine: Arc<Engine>,
@@ -109,6 +139,24 @@ impl App {
     pub fn with_onboarding<R>(&self, body: impl FnOnce(&OnboardingWindow) -> R) -> Option<R> {
         let window = self.onboarding.borrow().clone();
         window.as_deref().map(body)
+    }
+
+    /// True while any of the four windows is on screen.
+    ///
+    /// Asks the windows rather than counting opens and closes: they are hidden
+    /// rather than closed and can be ordered out by AppKit itself, and a
+    /// counter that drifted would strand the Dock icon with nothing behind it.
+    pub fn has_visible_window(&self) -> bool {
+        fn visible<W>(
+            slot: &RefCell<Option<Retained<W>>>,
+            is_visible: impl Fn(&W) -> bool,
+        ) -> bool {
+            slot.borrow().as_deref().is_some_and(is_visible)
+        }
+        visible(&self.settings, |w| w.is_visible())
+            || visible(&self.onboarding, |w| w.is_visible())
+            || visible(&self.history, |w| w.is_visible())
+            || visible(&self.plugins, |w| w.is_visible())
     }
 
     /// Show the setup wizard, building it on first use, from the front.
@@ -407,8 +455,16 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     apply_theme(app.engine.settings().theme().as_deref(), mtm);
     app.overlay.apply_visibility_setting();
     // A fresh install has no provider saved, and setup is what it needs first.
+    // Otherwise open Settings, because the Tauri build's main window is
+    // `"visible": true` in `tauri.conf.json` and so puts a window up on every
+    // launch. An accessory app that draws nothing but a menu bar item looks
+    // like a launch that failed, which is what a smoke run reported. The tray
+    // stays the way in and out afterwards; this is the launch presentation
+    // only.
     if !app.engine.settings().onboarding_complete() {
         app.show_onboarding();
+    } else {
+        app.show_settings(None);
     }
     Ok(())
 }

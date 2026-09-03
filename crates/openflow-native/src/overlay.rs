@@ -103,6 +103,30 @@ pub fn pill_width(state: RecordingState, outcome: Option<Outcome>, previewing: b
     width_for(state)
 }
 
+/// Whether an outcome badge may take the pill over in this state.
+///
+/// A `TranscriptionResult` or `TranscriptionError` for the *previous* take can
+/// arrive while the next capture is already recording -- hold the key down
+/// again while a take is still in flight and it always does. Painting the badge
+/// then stops the waveform and snaps the pill to its resting width for the
+/// whole hold, and the badge's own timer restores the width without restarting
+/// the animation, so the recording pill sits there frozen. The notification
+/// still fires; the pill just keeps showing the capture that is live.
+pub fn badge_may_show(state: RecordingState) -> bool {
+    !matches!(state, RecordingState::Recording)
+}
+
+/// Whether the pill has something moving in it, and so needs its 30 Hz timer.
+///
+/// Read by both the state change and the badge's settle, so a badge that came
+/// and went during a capture cannot leave the waveform stopped.
+pub fn animates_in(state: RecordingState) -> bool {
+    matches!(
+        state,
+        RecordingState::Recording | RecordingState::Transcribing
+    )
+}
+
 pub fn width_for(state: RecordingState) -> f64 {
     match state {
         RecordingState::Recording => WIDTH_RECORDING,
@@ -611,6 +635,8 @@ fn draw_microphone(frame: NSRect) {
     {
         ring.setLineWidth(2.0 * unit);
         ring.moveToPoint(NSPoint::new(x(4.0), y(10.0)));
+        // Increasing angles, so the four-argument append's counter-clockwise
+        // default is the short way round here; this one is right as it stands.
         ring.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
             NSPoint::new(x(12.0), y(12.0)),
             8.0 * unit,
@@ -632,6 +658,17 @@ fn draw_microphone(frame: NSRect) {
 /// top-right, bottom-right, bottom-left). `NSBezierPath`'s own rounded-rect
 /// helper only takes one radius, and every position in `overlay.html` rounds a
 /// different pair of corners.
+///
+/// The walk is clockwise -- along the top left to right, down the right side,
+/// back along the bottom, up the left -- which is what puts the four radii in
+/// the visual order `corner_radii` writes them in, and matches the CSS
+/// shorthand this is ported from. So every arc has to say `clockwise: true`.
+/// The four-argument `appendBezierPathWithArcWithCenter:...:endAngle:` defaults
+/// to counter-clockwise, and in an unflipped view (this one) that turned the
+/// top-right arc from 90 degrees to 0 into the 270-degree way round: each
+/// corner came out as a concave scoop instead of a round-off. Reversing the
+/// walk instead would fix the arcs and leave the radii array indexed
+/// backwards, so the direction is stated here rather than in the caller.
 fn rounded_path(rect: NSRect, radii: [f64; 4]) -> Retained<NSBezierPath> {
     let [tl, tr, br, bl] = radii;
     let left = rect.origin.x;
@@ -643,38 +680,42 @@ fn rounded_path(rect: NSRect, radii: [f64; 4]) -> Retained<NSBezierPath> {
         path.moveToPoint(NSPoint::new(left + tl, top));
         path.lineToPoint(NSPoint::new(right - tr, top));
         if tr > 0.0 {
-            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
+            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
                 NSPoint::new(right - tr, top - tr),
                 tr,
                 90.0,
                 0.0,
+                true,
             );
         }
         path.lineToPoint(NSPoint::new(right, bottom + br));
         if br > 0.0 {
-            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
+            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
                 NSPoint::new(right - br, bottom + br),
                 br,
                 0.0,
                 -90.0,
+                true,
             );
         }
         path.lineToPoint(NSPoint::new(left + bl, bottom));
         if bl > 0.0 {
-            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
+            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
                 NSPoint::new(left + bl, bottom + bl),
                 bl,
                 270.0,
                 180.0,
+                true,
             );
         }
         path.lineToPoint(NSPoint::new(left, top - tl));
         if tl > 0.0 {
-            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
+            path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
                 NSPoint::new(left + tl, top - tl),
                 tl,
                 180.0,
                 90.0,
+                true,
             );
         }
         path.closePath();
@@ -806,9 +847,10 @@ impl Overlay {
         self.snap(pill_width(state, None, previewing), previous != state);
         self.view.setNeedsDisplay(true);
 
-        match state {
-            RecordingState::Recording | RecordingState::Transcribing => self.start_animating(),
-            _ => self.stop_animating(),
+        if animates_in(state) {
+            self.start_animating();
+        } else {
+            self.stop_animating();
         }
         self.apply_visibility_setting();
     }
@@ -817,7 +859,13 @@ impl Overlay {
     ///
     /// Always visible, even under hide-when-idle: the badge exists precisely to
     /// be seen without switching to the app the text was meant for.
+    ///
+    /// Skipped entirely while a capture is running; see [`badge_may_show`]. The
+    /// caller has already notified either way, so nothing is lost but the dot.
     pub fn show_outcome(&self, outcome: Outcome) {
+        if !badge_may_show(self.state.get()) {
+            return;
+        }
         self.clear_partial();
         self.view.ivars().outcome.set(Some(outcome));
         self.stop_animating();
@@ -845,6 +893,12 @@ impl Overlay {
         let previewing = !self.view.ivars().partial.borrow().is_empty();
         self.snap(pill_width(state, None, previewing), true);
         self.view.setNeedsDisplay(true);
+        // The width comes back on its own; the animation does not. A capture
+        // that started while the badge was up would otherwise get its width
+        // restored and its waveform left stopped.
+        if animates_in(state) {
+            self.start_animating();
+        }
         self.apply_visibility_setting();
     }
 
@@ -982,6 +1036,99 @@ mod tests {
             WIDTH_TRANSCRIBING
         );
         assert_eq!(pill_width(RecordingState::Idle, None, true), WIDTH_IDLE);
+    }
+
+    /// A result for the previous take routinely lands while the next capture is
+    /// already running -- hold the key again before a take comes back and it
+    /// always does. The badge must not take that pill over: it would stop the
+    /// waveform, and the settle that follows only restores the width.
+    #[test]
+    fn a_badge_never_interrupts_a_live_recording() {
+        assert!(!badge_may_show(RecordingState::Recording));
+        assert!(badge_may_show(RecordingState::Idle));
+        assert!(badge_may_show(RecordingState::Transcribing));
+
+        // And whatever the badge did to the timer, settling reads the same rule
+        // the state change does, so the pill it hands back is still animating.
+        assert!(animates_in(RecordingState::Recording));
+        assert!(animates_in(RecordingState::Transcribing));
+        assert!(!animates_in(RecordingState::Idle));
+        assert!(!animates_in(RecordingState::Formatting));
+    }
+
+    /// The pill's rounded corners must round *away* material, not scoop it out.
+    ///
+    /// The walk is clockwise but the four-argument arc append is
+    /// counter-clockwise by default, so 90 degrees to 0 was drawn the
+    /// 270-degree way and every rounded corner came out concave. Nothing in a
+    /// width or an anchor catches that; only the geometry does.
+    #[test]
+    fn rounded_corners_cut_material_away_rather_than_scooping_it_out() {
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 28.0));
+        // left-center's radii: square down the screen edge, round on the two
+        // corners that face into the desktop.
+        let path = rounded_path(rect, [0.0, CORNER_RADIUS, CORNER_RADIUS, 0.0]);
+
+        let (left, bottom) = (rect.origin.x, rect.origin.y);
+        let (right, top) = (left + rect.size.width, bottom + rect.size.height);
+
+        // A pixel inside each rounded corner is outside the shape.
+        for point in [
+            NSPoint::new(right - 1.0, top - 1.0),
+            NSPoint::new(right - 1.0, bottom + 1.0),
+        ] {
+            assert!(
+                !path.containsPoint(point),
+                "({}, {}) is in a rounded corner and must be outside the pill",
+                point.x,
+                point.y
+            );
+        }
+        // The same pixel in each square corner is inside it.
+        for point in [
+            NSPoint::new(left + 1.0, top - 1.0),
+            NSPoint::new(left + 1.0, bottom + 1.0),
+        ] {
+            assert!(
+                path.containsPoint(point),
+                "({}, {}) is in a square corner and must be inside the pill",
+                point.x,
+                point.y
+            );
+        }
+
+        // The pill's whole right-hand end must still be solid. This is what an
+        // arc drawn the long way round actually costs: the 270-degree sweep
+        // loops back through the body, and the winding it leaves behind hollows
+        // out the 20 px between the two corners it was meant to round. The
+        // corner pixels above read as outside either way, which is why they are
+        // not enough on their own.
+        // Inboard of where each arc begins, so these sit under the straight
+        // top and bottom edges and are body by construction, not corner.
+        let inboard = right - (CORNER_RADIUS + 2.0);
+        for point in [
+            NSPoint::new(inboard, top - 2.0),
+            NSPoint::new(inboard, bottom + 2.0),
+        ] {
+            assert!(
+                path.containsPoint(point),
+                "({}, {}) is body, not corner, and must be inside the pill",
+                point.x,
+                point.y
+            );
+        }
+
+        // And the shape stays inside the frame it was asked for: an arc drawn
+        // the wrong way round can also bulge past the edge it was rounding.
+        let bounds = path.bounds();
+        assert!(
+            (bounds.origin.x - left).abs() < 0.01
+                && (bounds.origin.y - bottom).abs() < 0.01
+                && (bounds.size.width - rect.size.width).abs() < 0.01
+                && (bounds.size.height - rect.size.height).abs() < 0.01,
+            "path bounds {:?} are not the rect it was built from",
+            bounds
+        );
     }
 
     /// Failure holds longer than success, and both hold long enough to read.

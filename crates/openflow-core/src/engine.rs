@@ -122,6 +122,12 @@ pub type Spawner = Box<dyn Fn(BoxedFuture) + Send + Sync + 'static>;
 /// that takes longer than this simply reads less often. That is the whole of
 /// the back-pressure: a reading is never issued while one is outstanding, so
 /// the take the user is waiting on at key-up can queue behind at most one.
+///
+/// It is also the budget. A reading that takes longer than the interval spends
+/// more of its life outstanding than idle, so the take at key-up queues behind
+/// one more often than not, and the wait grows with the reading. [`should_hold`]
+/// retires the preview the first time a reading runs over, rather than letting
+/// the cost model be set by whatever endpoint happens to be configured.
 pub const PARTIAL_INTERVAL: Duration = Duration::from_millis(800);
 
 /// How long into a recording to keep previewing it.
@@ -132,7 +138,25 @@ pub const PARTIAL_INTERVAL: Duration = Duration::from_millis(800);
 /// 0.6B that is about 40 ms of expected delay at key-up for a 10 s recording
 /// and 220 ms for a 38 s one. Past this point the line has long since scrolled
 /// out of the pill, so the preview is buying less and less at a rising price.
+///
+/// Two bounds, then, and the loop stops at whichever comes first: this one caps
+/// how long a *cheap* endpoint is asked, and [`should_hold`] caps how expensive
+/// any one reading is allowed to be. The window alone is not enough -- against a
+/// LAN 1.7B a 20 s take makes ~2 s readings, so key-up waits behind one for most
+/// of a window that has not expired yet -- and `live_preview` defaults on for
+/// every custom endpoint, which is where those models live.
 pub const PARTIAL_WINDOW: Duration = Duration::from_secs(20);
+
+/// Whether a reading that took `elapsed` has priced the preview out.
+///
+/// The loop sleeps `interval` between readings, so a reading slower than that
+/// is outstanding more than half the time: the take the user is actually
+/// waiting on at key-up queues behind it more often than not. One reading that
+/// slow says the next will be slower still, since each re-reads more audio, so
+/// the preview retires for this capture instead of being sampled again.
+pub fn should_hold(elapsed: Duration, interval: Duration) -> bool {
+    elapsed > interval
+}
 
 /// A capture that has run this long is a stuck flag, not a real recording.
 pub const MAX_RECORDING: Duration = Duration::from_secs(300);
@@ -144,6 +168,19 @@ pub fn recording_slot_free(slot: &Option<Instant>) -> bool {
         None => true,
         Some(started) => started.elapsed() > MAX_RECORDING,
     }
+}
+
+/// Everything a reading of a recording in progress needs from settings.
+///
+/// Resolved once when the capture starts and moved into the preview task, so a
+/// 20 s window costs one keychain read rather than one per reading. See
+/// [`Engine::start_partials`] for what that fixes and what it trades away.
+struct PartialConfig {
+    key: String,
+    language: Option<String>,
+    provider: Provider,
+    stt_model: Option<String>,
+    dictionary: Option<String>,
 }
 
 pub struct Engine {
@@ -314,11 +351,29 @@ impl Engine {
     /// Read the recording every [`PARTIAL_INTERVAL`] and report what it says.
     ///
     /// The loop sleeps *between* readings rather than on a fixed schedule, so a
-    /// slow transcriber reads less often instead of queueing up behind itself.
+    /// slow transcriber reads less often instead of queueing up behind itself,
+    /// and retires the preview entirely once one reading runs over the interval
+    /// (see [`should_hold`]).
     fn start_partials(self: &Arc<Self>) {
         if !self.settings.live_preview() {
             return;
         }
+        // Resolved once, here, rather than per reading: `api_key` is a keychain
+        // read, and a 20 s window is 25 of them for one dictation. The cost of
+        // reading it once is that a settings change made *during* a capture does
+        // not reach that capture's previews -- they keep the provider, model,
+        // key, language and dictionary the recording started with. The take at
+        // key-up re-reads settings for itself and is unaffected.
+        let config = PartialConfig {
+            // An empty key is valid for a self-hosted endpoint, and a keychain
+            // that will not answer is a preview not worth making noise about;
+            // the real take reports it.
+            key: self.settings.api_key().ok().flatten().unwrap_or_default(),
+            language: self.settings.language(),
+            provider: self.settings.provider(),
+            stt_model: self.settings.stt_model(),
+            dictionary: self.settings.dictionary(),
+        };
         let generation = self.partial_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let engine = Arc::clone(self);
         (self.spawn)(Box::pin(async move {
@@ -330,36 +385,54 @@ impl Engine {
                     return;
                 }
                 if Instant::now() >= until {
-                    if !last.is_empty() {
-                        engine.emit(EngineEvent::TranscriptionPartial(PartialTranscript {
-                            text: last,
-                            held: true,
-                        }));
-                    }
+                    engine.retire_preview(&last);
                     return;
                 }
+                let started = Instant::now();
+                let reading = engine.read_recording_so_far(&config).await;
+                let over_budget = should_hold(started.elapsed(), PARTIAL_INTERVAL);
                 // A reading that fails is a reading skipped, never an error the
-                // user sees: too little audio yet, a capture that just ended, an
-                // endpoint that did not answer. The take at key-up is unaffected
-                // by any of them.
-                let Ok(text) = engine.read_recording_so_far().await else {
-                    continue;
-                };
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    continue;
-                }
+                // user sees: too little audio yet, a window that carried no
+                // voice, a capture that just ended, an endpoint that did not
+                // answer. The take at key-up is unaffected by any of them.
+                let text = reading
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty());
                 // Checked again on the way out: the key may have come up while
                 // this reading was in the air.
                 if engine.partial_generation.load(Ordering::SeqCst) != generation {
                     return;
                 }
-                last.clone_from(&text);
+                if let Some(text) = &text {
+                    last.clone_from(text);
+                }
+                if over_budget {
+                    // Whatever this reading cost, the next one costs more. Hold
+                    // what is on screen and stop asking: the final take is the
+                    // one the user is waiting for.
+                    engine.retire_preview(&last);
+                    return;
+                }
+                let Some(text) = text else {
+                    continue;
+                };
                 engine.emit(EngineEvent::TranscriptionPartial(PartialTranscript {
                     text,
                     held: false,
                 }));
             }
+        }));
+    }
+
+    /// Leave the last reading on screen, marked as no longer tracking.
+    fn retire_preview(&self, last: &str) {
+        if last.is_empty() {
+            return;
+        }
+        self.emit(EngineEvent::TranscriptionPartial(PartialTranscript {
+            text: last.to_string(),
+            held: true,
         }));
     }
 
@@ -369,7 +442,7 @@ impl Engine {
     /// history row and nothing typed into the focused app. One dictation reads
     /// itself many times, and anything with a side effect would fire that many
     /// times with it.
-    async fn read_recording_so_far(&self) -> Result<String, String> {
+    async fn read_recording_so_far(&self, config: &PartialConfig) -> Result<String, String> {
         {
             let recording = self
                 .recording
@@ -380,18 +453,13 @@ impl Engine {
             }
         }
         let wav_bytes = self.recorder.snapshot()?;
-        let key = self.settings.api_key()?.unwrap_or_default();
-        let language = self.settings.language();
-        let provider = self.settings.provider();
-        let stt_model = self.settings.stt_model();
-        let dictionary = self.settings.dictionary();
         transcribe::transcribe_audio(
             wav_bytes,
-            &key,
-            language.as_deref(),
-            &provider,
-            stt_model.as_deref(),
-            dictionary.as_deref(),
+            &config.key,
+            config.language.as_deref(),
+            &config.provider,
+            config.stt_model.as_deref(),
+            config.dictionary.as_deref(),
         )
         .await
     }
@@ -789,6 +857,22 @@ mod tests {
             recording_slot_free(&stranded),
             "a capture older than the watchdog window must free the slot"
         );
+    }
+
+    /// The preview is only worth having while a reading is cheaper than the
+    /// gap between readings. Past that the take at key-up is queueing behind
+    /// one more often than not, and the next reading is slower still.
+    #[test]
+    fn a_reading_slower_than_the_interval_retires_the_preview() {
+        let interval = PARTIAL_INTERVAL;
+        // A LAN 0.6B at 10 s of audio: nowhere near the budget.
+        assert!(!should_hold(Duration::from_millis(250), interval));
+        // Right at the edge is still inside it -- the bound is strict, so a
+        // reading that exactly fills the interval is not yet a reason to stop.
+        assert!(!should_hold(interval, interval));
+        assert!(should_hold(interval + Duration::from_millis(1), interval));
+        // A LAN 1.7B at 20 s of audio, the case this exists for.
+        assert!(should_hold(Duration::from_secs(2), interval));
     }
 
     #[test]
