@@ -1,6 +1,7 @@
 use base64::Engine;
-use reqwest::{multipart, Response};
+use reqwest::{multipart, redirect, Method, Response};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -144,9 +145,12 @@ pub async fn fetch_models(api_key: &str, provider: &Provider) -> Result<Vec<Mode
             },
         ]);
     }
-    let client = client()?;
     let response = with_openrouter_headers(
-        with_auth(client.get(provider.endpoint("models")?), provider, api_key),
+        with_auth(
+            request(Method::GET, &provider.endpoint("models")?)?,
+            provider,
+            api_key,
+        ),
         provider,
     )
     .timeout(Duration::from_secs(15))
@@ -280,9 +284,11 @@ async fn transcribe_openrouter(
         body["language"] = language.into();
     }
     let response = with_openrouter_headers(
-        client()?
-            .post(format!("{OPENROUTER_URL}/audio/transcriptions"))
-            .bearer_auth(api_key),
+        request(
+            Method::POST,
+            &format!("{OPENROUTER_URL}/audio/transcriptions"),
+        )?
+        .bearer_auth(api_key),
         &Provider::OpenRouter,
     )
     .json(&body)
@@ -322,7 +328,7 @@ async fn transcribe_whisper(
     }
     let response = with_openrouter_headers(
         with_auth(
-            client()?.post(provider.endpoint("audio/transcriptions")?),
+            request(Method::POST, &provider.endpoint("audio/transcriptions")?)?,
             provider,
             api_key,
         ),
@@ -369,8 +375,7 @@ async fn transcribe_deepgram(
     if let Some(language) = normalize_language(language) {
         url.query_pairs_mut().append_pair("language", language);
     }
-    let response = client()?
-        .post(url)
+    let response = request(Method::POST, url.as_str())?
         .header("Authorization", format!("Token {}", api_key))
         .header("Content-Type", "audio/wav")
         .body(wav_bytes)
@@ -425,7 +430,7 @@ pub async fn format_text(
     }
     let endpoint = provider.endpoint("chat/completions")?;
     let response = with_openrouter_headers(
-        with_auth(client()?.post(endpoint), provider, api_key),
+        with_auth(request(Method::POST, &endpoint)?, provider, api_key),
         provider,
     )
     .json(&body)
@@ -484,7 +489,7 @@ pub async fn request_speech(
     let body = serde_json::json!({ "model": model, "input": text, "voice": voice, "response_format": response_format });
     let response = with_openrouter_headers(
         with_auth(
-            client()?.post(provider.endpoint("audio/speech")?),
+            request(Method::POST, &provider.endpoint("audio/speech")?)?,
             provider,
             api_key,
         ),
@@ -538,6 +543,77 @@ pub fn speech_mime(format: &str) -> &'static str {
     }
 }
 
+// ── Local only ────────────────────────────────────────────
+
+/// Whether every request this process makes has to stay on this machine.
+///
+/// Mirrors the `local_only` setting. It is a process-wide flag rather than a
+/// parameter because it is an invariant about the *client*, not about one call:
+/// the toggle promises "no requests leave this machine", and a promise that
+/// each call site has to remember to pass along is one an added call site can
+/// quietly break. [`Settings::set`](crate::settings::Settings::set) keeps it in
+/// step with the stored value, and the pipeline re-reads it before every take.
+static LOCAL_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Point the guard at the stored setting.
+pub fn set_local_only(on: bool) {
+    LOCAL_ONLY.store(on, Ordering::SeqCst);
+}
+
+pub fn local_only() -> bool {
+    LOCAL_ONLY.load(Ordering::SeqCst)
+}
+
+/// Whether a URL names this machine.
+///
+/// Deliberately the three literal hosts and nothing else: `127.0.0.1`,
+/// `::1` (in either spelling) and `localhost`. The rest of `127.0.0.0/8` is
+/// equally local, and a hostname can resolve to a loopback address, but neither
+/// is worth widening the rule for -- the runner binds `127.0.0.1` and a
+/// privacy switch is the wrong place to be generous. A URL that does not parse
+/// is not loopback either.
+pub fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
+}
+
+/// Refuse a request that would leave this machine while `local_only` is on.
+///
+/// Called before the request is built, so nothing is connected, no DNS is
+/// resolved and no credential is attached: the refusal happens with the URL and
+/// the setting alone.
+fn guard_local_only(url: &str) -> Result<(), String> {
+    if !local_only() || is_loopback_url(url) {
+        return Ok(());
+    }
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| "another machine".to_string());
+    Err(format!(
+        "\"Local only\" is on, so OpenFlow did not send this to {}. Turn Local only off in Settings, or point this at a service on this Mac.",
+        host
+    ))
+}
+
+/// The one way to start a request in this module.
+///
+/// Every call goes through here, which is what makes the `local_only` guard an
+/// invariant rather than a habit: a new endpoint cannot be added without being
+/// checked, because there is no other way to reach the client.
+fn request(method: Method, url: &str) -> Result<reqwest::RequestBuilder, String> {
+    guard_local_only(url)?;
+    Ok(client()?.request(method, url))
+}
+
 /// One client for the life of the process. Building a `reqwest::Client`
 /// constructs a TLS configuration and a connection pool each time; doing that
 /// per request cost a fresh TCP and TLS handshake on every call and threw the
@@ -550,10 +626,43 @@ fn client() -> Result<reqwest::Client, String> {
                 .connect_timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .user_agent("OpenFlow/0.1")
+                .redirect(redirect::Policy::custom(guard_redirect))
                 .build()
                 .map_err(|error| format!("Could not initialize network client: {}", error))
         })
         .clone()
+}
+
+/// The `local_only` rule again, one hop later.
+///
+/// Checking the URL the caller asked for is not enough: a loopback endpoint
+/// that answers 307 or 308 with a `Location` off this machine would have the
+/// client re-send the whole recording there, and the check at
+/// [`guard_local_only`] has already passed. That is the same audio leaving the
+/// Mac, by consent the user never gave. So every hop is checked, not just the
+/// first.
+///
+/// The default policy is `limited(10)`, and setting a custom one replaces it,
+/// so the hop limit is re-stated here rather than lost.
+fn guard_redirect(attempt: redirect::Attempt) -> redirect::Action {
+    if local_only() && !is_loopback_url(attempt.url().as_str()) {
+        let host = attempt
+            .url()
+            .host_str()
+            .unwrap_or("another machine")
+            .to_string();
+        // `error` rather than `stop`: stopping hands the 307 back as if it were
+        // the answer, and the caller reports a parse failure instead of the
+        // reason. `request_error` unwraps this message.
+        return attempt.error(format!(
+            "\"Local only\" is on, so OpenFlow did not follow a redirect to {}. Turn Local only off in Settings, or point this at a service on this Mac.",
+            host
+        ));
+    }
+    if attempt.previous().len() >= 10 {
+        return attempt.error("too many redirects");
+    }
+    attempt.follow()
 }
 
 /// Attaches the Authorization header only when there is a key to attach.
@@ -647,9 +756,26 @@ fn request_error(action: &str, error: reqwest::Error) -> String {
         format!("Timed out while trying to {}", action)
     } else if error.is_connect() {
         format!("Could not connect to the provider to {}", action)
+    } else if error.is_redirect() {
+        // reqwest's own Display for a redirect failure names the URL and not
+        // the reason, and the reason is the whole message here: the redirect
+        // policy refused a hop off this machine. Dig it out of the chain.
+        format!("Could not {}: {}", action, deepest_cause(&error))
     } else {
         format!("Could not {}: {}", action, error)
     }
+}
+
+/// The message furthest down an error's `source` chain, which is where a
+/// policy's own words end up once reqwest has wrapped them.
+fn deepest_cause(error: &dyn std::error::Error) -> String {
+    let mut deepest = error.to_string();
+    let mut current = error.source();
+    while let Some(cause) = current {
+        deepest = cause.to_string();
+        current = cause.source();
+    }
+    deepest
 }
 
 fn validate_custom_url(value: &str) -> String {
@@ -665,7 +791,7 @@ fn validate_custom_url(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -785,6 +911,329 @@ mod tests {
             None
         );
     }
+
+    /// The rule the Local only toggle promises, on its own.
+    #[test]
+    fn only_this_machine_counts_as_loopback() {
+        for url in [
+            "http://127.0.0.1:8123/v1",
+            "http://localhost:8123/v1",
+            "http://LocalHost:8123/v1",
+            "http://[::1]:8123/v1",
+            "https://127.0.0.1/v1/audio/transcriptions",
+        ] {
+            assert!(is_loopback_url(url), "{url} names this machine");
+        }
+        for url in [
+            "https://api.groq.com/openai/v1",
+            "http://192.168.1.10:8880/v1",
+            "http://127.0.0.2:8123/v1",
+            "http://localhost.evil.example/v1",
+            "http://127.0.0.1.evil.example/v1",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url} does not name this machine");
+        }
+    }
+
+    /// The guard itself: a hosted URL is refused, with the setting named, and a
+    /// loopback URL passes. Refused *before* the request is built, so nothing
+    /// resolves, connects or attaches a credential.
+    #[test]
+    fn local_only_refuses_a_hosted_url_and_passes_a_loopback_one() {
+        let _guard = LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        set_local_only(false);
+        assert!(guard_local_only("https://api.groq.com/openai/v1").is_ok());
+
+        set_local_only(true);
+        let refused = guard_local_only("https://api.groq.com/openai/v1/audio/transcriptions")
+            .expect_err("a hosted URL must be refused while Local only is on");
+        assert!(
+            refused.contains("Local only"),
+            "the error must name the setting: {refused}"
+        );
+        assert!(
+            refused.contains("api.groq.com"),
+            "the error must name the host it refused: {refused}"
+        );
+        assert!(guard_local_only("http://127.0.0.1:8123/v1").is_ok());
+        assert!(guard_local_only("http://localhost:8123/v1").is_ok());
+        set_local_only(false);
+    }
+
+    /// ...and the guard is actually on the path every request takes, for
+    /// transcription, cleanup and voice alike. A unit test of the predicate
+    /// would pass even if nothing called it.
+    #[test]
+    fn local_only_stops_transcription_cleanup_and_voice_before_they_connect() {
+        let _guard = LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let hosted = Provider::Groq;
+        let wav = vec![0u8; 64];
+
+        set_local_only(true);
+        for error in [
+            runtime
+                .block_on(transcribe_audio(
+                    wav.clone(),
+                    "gsk-test",
+                    None,
+                    &hosted,
+                    None,
+                    None,
+                ))
+                .expect_err("transcription must be refused"),
+            runtime
+                .block_on(format_text("hi", "gsk-test", None, &hosted, None))
+                .expect_err("cleanup must be refused"),
+            runtime
+                .block_on(request_speech(
+                    "hi", "gsk-test", &hosted, "tts-1", "alloy", "mp3",
+                ))
+                .expect_err("voice must be refused"),
+            runtime
+                .block_on(fetch_models("gsk-test", &hosted))
+                .expect_err("listing models must be refused"),
+        ] {
+            assert!(
+                error.contains("Local only"),
+                "every leg must name the setting: {error}"
+            );
+        }
+
+        // Deepgram builds its URL by hand rather than through `Provider::endpoint`,
+        // so it is checked separately or it would be the one way out.
+        let deepgram_error = runtime
+            .block_on(transcribe_audio(
+                wav,
+                "token",
+                None,
+                &Provider::Deepgram,
+                None,
+                None,
+            ))
+            .expect_err("Deepgram must be refused too");
+        assert!(deepgram_error.contains("Local only"), "{deepgram_error}");
+
+        // The positive control, and it has to be a real request: a guard that
+        // refused everything would pass every assertion above. With Local only
+        // still on, a loopback endpoint is contacted and answers.
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a throwaway endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+        let capture = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the cleanup request");
+            let mut buffer = vec![0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let body = br#"{"choices":[{"message":{"content":"hi"}}]}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(body);
+            String::from_utf8_lossy(&buffer[..read]).into_owned()
+        });
+        let loopback = Provider::from_str(&format!("custom:http://127.0.0.1:{port}/v1"));
+        assert_eq!(
+            runtime.block_on(format_text("hi", "", None, &loopback, None)),
+            Ok("hi".to_string()),
+            "a loopback endpoint must still be reachable while Local only is on"
+        );
+        assert!(
+            capture
+                .join()
+                .expect("capture thread")
+                .starts_with("POST /v1/chat/completions "),
+            "the request has to have crossed the socket"
+        );
+        set_local_only(false);
+    }
+
+    /// A loopback endpoint that answers 307 must not be able to send the audio
+    /// off the machine.
+    ///
+    /// The URL check passes -- the endpoint the user configured really is
+    /// loopback -- and then the client re-sends the request wherever the
+    /// `Location` header says. That is the same leak the toggle exists to
+    /// prevent, one hop later, so every hop is checked and not just the first.
+    ///
+    /// The hops here are cleanup calls, because those carry a JSON body reqwest
+    /// can replay and therefore actually follows. The audio upload is a
+    /// streaming multipart body, which this version of reqwest declines to
+    /// replay across a redirect at all -- the last assertion pins that, since
+    /// it is a second line of defence for the recording specifically and worth
+    /// knowing if it ever changes.
+    #[test]
+    fn local_only_refuses_a_redirect_off_this_machine() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let _guard = LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+
+        // Counts every connection, so a followed redirect shows up as a second
+        // request rather than having to be inferred from an error string.
+        fn serve(
+            body: String,
+            expected: usize,
+            hits: Arc<AtomicUsize>,
+        ) -> (u16, std::thread::JoinHandle<()>) {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind a throwaway endpoint");
+            let port = listener.local_addr().expect("local addr").port();
+            listener
+                .set_nonblocking(true)
+                .expect("poll rather than block forever");
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                // Keep listening for a beat after the expected requests have
+                // arrived, so an unwanted extra one is still counted rather
+                // than refused by a socket that closed the moment it was
+                // satisfied.
+                let mut grace: Option<std::time::Instant> = None;
+                loop {
+                    if std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    if let Some(since) = grace {
+                        if since.elapsed() >= Duration::from_millis(250) {
+                            return;
+                        }
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let seen = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(500)))
+                                .ok();
+                            let mut buffer = vec![0u8; 8192];
+                            let _ = stream.read(&mut buffer);
+                            let _ = stream.write_all(body.as_bytes());
+                            if seen >= expected {
+                                grace = Some(std::time::Instant::now());
+                            }
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            });
+            (port, handle)
+        }
+
+        // 1. A loopback endpoint that redirects off the box, Local only on.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (port, server) = serve(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://example.com/v1/audio/transcriptions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            1,
+            Arc::clone(&hits),
+        );
+        set_local_only(true);
+        let refused = runtime
+            .block_on(format_text(
+                "a transcript",
+                "",
+                None,
+                &Provider::from_str(&format!("custom:http://127.0.0.1:{port}/v1")),
+                None,
+            ))
+            .expect_err("a redirect off this machine must not be followed");
+        assert!(
+            refused.contains("Local only"),
+            "the refusal has to name the setting: {refused}"
+        );
+        assert!(
+            refused.contains("example.com"),
+            "and the host it refused to follow: {refused}"
+        );
+        let _ = server.join();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "exactly one request: the redirect was refused, not followed"
+        );
+
+        // 2. The control. The same 307 with Local only off is followed to a
+        // second listener -- without this, a policy that refused every redirect
+        // would pass everything above.
+        set_local_only(false);
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let answer = r#"{"choices":[{"message":{"content":"spoken"}}]}"#;
+        let (target, target_server) = serve(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                answer.len(),
+                answer
+            ),
+            1,
+            Arc::clone(&target_hits),
+        );
+        let entry_hits = Arc::new(AtomicUsize::new(0));
+        let (entry, entry_server) = serve(
+            format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{target}/v1/chat/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            1,
+            Arc::clone(&entry_hits),
+        );
+        let followed = runtime.block_on(format_text(
+            "a transcript",
+            "",
+            None,
+            &Provider::from_str(&format!("custom:http://127.0.0.1:{entry}/v1")),
+            None,
+        ));
+        let _ = entry_server.join();
+        let _ = target_server.join();
+        assert_eq!(
+            followed,
+            Ok("spoken".to_string()),
+            "an ordinary redirect still has to be followed"
+        );
+        assert_eq!(entry_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+
+        // 3. The recording itself, with Local only *off*, against a redirect it
+        // could follow. It does not: a streaming multipart body cannot be
+        // replayed, so the redirect comes back as the response instead. One
+        // request, and the audio never left for the second host.
+        let audio_hits = Arc::new(AtomicUsize::new(0));
+        let (audio_entry, audio_server) = serve(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://example.com/v1/audio/transcriptions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            1,
+            Arc::clone(&audio_hits),
+        );
+        let audio = runtime.block_on(transcribe_audio(
+            vec![0u8; 64],
+            "",
+            None,
+            &Provider::from_str(&format!("custom:http://127.0.0.1:{audio_entry}/v1")),
+            None,
+            None,
+        ));
+        let _ = audio_server.join();
+        assert!(audio.is_err(), "a 307 is not a transcript");
+        assert_eq!(
+            audio_hits.load(Ordering::SeqCst),
+            1,
+            "the recording must not be re-sent to the redirect target"
+        );
+    }
+
+    /// Everything that writes the process-wide flag takes turns, including
+    /// `settings::tests`, which proves the setting arms this guard.
+    pub(crate) static LOCAL_ONLY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn explicit_output_modalities_override_generic_model_names() {

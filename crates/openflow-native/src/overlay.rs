@@ -26,6 +26,7 @@ use objc2_foundation::{
     NSDictionary, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 
+use openflow_core::audio::{meter_decay, meter_fraction};
 use openflow_core::engine::{Engine, RecordingState};
 
 // ── Geometry, ported from overlay.html ────────────────────
@@ -194,18 +195,24 @@ pub fn corner_radii(position: &str) -> [f64; 4] {
     }
 }
 
-// ── Animation, ported from the CSS keyframes ──────────────
+// ── Animation ─────────────────────────────────────────────
+//
+// The dots are still the CSS keyframes, ported. The waveform is not: it is the
+// microphone. See `Waveform`.
 
-/// `animation-delay` per bar, in seconds, in document order.
-const WAVE_DELAYS: [f64; 10] = [0.0, 0.07, 0.14, 0.1, 0.03, 0.18, 0.06, 0.12, 0.16, 0.09];
-/// `wave` runs 0.45s and alternates, so a full cycle is twice that.
-const WAVE_PERIOD: f64 = 0.9;
+/// One bar per reading on screen at once.
+const WAVE_BARS: usize = 10;
 const WAVE_BAR_WIDTH: f64 = 2.5;
 const WAVE_BAR_GAP: f64 = 2.0;
-/// The waveform's own width: one bar per entry in `WAVE_DELAYS`, with a gap
-/// between each pair. Derived rather than written down twice, so the text that
-/// sits after the bars cannot drift away from where they actually end.
-const WAVEFORM_WIDTH: f64 = WAVE_BAR_WIDTH * 10.0 + WAVE_BAR_GAP * 9.0;
+/// The waveform's own width: one bar per reading, with a gap between each pair.
+/// Derived rather than written down twice, so the text that sits after the bars
+/// cannot drift away from where they actually end.
+const WAVEFORM_WIDTH: f64 =
+    WAVE_BAR_WIDTH * WAVE_BARS as f64 + WAVE_BAR_GAP * (WAVE_BARS as f64 - 1.0);
+/// Ticks between shifts. At 30 Hz three ticks is a new bar every 100 ms, so the
+/// ten on screen are the last second of speech: quick enough to feel live, slow
+/// enough that a syllable is a bar rather than a blur.
+const WAVE_STEP_TICKS: usize = 3;
 /// The gap either side of a run of content inside the pill.
 const PILL_PADDING: f64 = 6.0;
 /// How much of a clipped line is faded out at its leading edge.
@@ -221,12 +228,60 @@ fn ease_in_out(t: f64) -> f64 {
     0.5 - 0.5 * (PI * t).cos()
 }
 
-/// Height of waveform bar `index` at `elapsed` seconds.
-pub fn wave_height(index: usize, elapsed: f64) -> f64 {
-    let delay = WAVE_DELAYS[index % WAVE_DELAYS.len()];
-    let phase = (elapsed + delay).rem_euclid(WAVE_PERIOD) / (WAVE_PERIOD / 2.0);
-    let triangle = if phase <= 1.0 { phase } else { 2.0 - phase };
-    WAVE_MIN_HEIGHT + (WAVE_MAX_HEIGHT - WAVE_MIN_HEIGHT) * ease_in_out(triangle)
+/// What the bars have heard, and what they are currently drawing.
+///
+/// The bars used to be a clock. `overlay.html` animates them with ten CSS
+/// keyframes on ten `animation-delay`s, and the port reproduced that faithfully
+/// -- so the waveform danced identically whether the microphone was live, muted
+/// or never granted, which is exactly the moment the pill is the only thing the
+/// user can see. It is the microphone now.
+///
+/// Pure and deterministic: readings in, heights out, no AppKit. The shape of
+/// the wave is testable without a microphone or a screen.
+#[derive(Default)]
+pub struct Waveform {
+    /// Newest at the end. The wave travels leftwards, the way every other
+    /// waveform display does.
+    heard: [f64; WAVE_BARS],
+    /// What is drawn, which lags `heard`: see `sample`.
+    shown: [f64; WAVE_BARS],
+    /// The loudest reading since the last shift. A bar covers three ticks, so
+    /// without this two readings in three would be dropped -- and the one kept
+    /// would be whichever the clock happened to land on rather than the loudest
+    /// thing said in that window.
+    pending: f64,
+    ticks: usize,
+}
+
+impl Waveform {
+    /// One 30 Hz tick at `level`, 0.0 to 1.0.
+    pub fn sample(&mut self, level: f64) {
+        self.pending = self.pending.max(level.clamp(0.0, 1.0));
+        self.ticks += 1;
+        if self.ticks >= WAVE_STEP_TICKS {
+            self.heard.rotate_left(1);
+            self.heard[WAVE_BARS - 1] = self.pending;
+            self.pending = 0.0;
+            self.ticks = 0;
+        }
+        // Each bar rises to its reading at once and eases down towards it, so a
+        // peak keeps its shape as it travels instead of flickering between the
+        // ten-a-second shifts. The same curve the core meter falls on.
+        for (shown, heard) in self.shown.iter_mut().zip(self.heard) {
+            *shown = meter_decay(*shown as f32, heard as f32) as f64;
+        }
+    }
+
+    /// Back to a flat line, for the start of the next recording.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Bar heights in points, in drawing order.
+    pub fn heights(&self) -> [f64; WAVE_BARS] {
+        self.shown
+            .map(|level| WAVE_MIN_HEIGHT + (WAVE_MAX_HEIGHT - WAVE_MIN_HEIGHT) * level)
+    }
 }
 
 /// Opacity of transcribing dot `index` at `elapsed` seconds: 0.25 at the ends
@@ -257,6 +312,8 @@ pub struct PillIvars {
     partial: RefCell<String>,
     /// True once the readings have stopped but the line is still worth showing.
     partial_held: Cell<bool>,
+    /// What the bars are drawing, fed from the microphone on every tick.
+    waveform: RefCell<Waveform>,
     engine: RefCell<Option<Arc<Engine>>>,
 }
 
@@ -316,6 +373,7 @@ impl PillView {
             outcome: Cell::new(None),
             partial: RefCell::new(String::new()),
             partial_held: Cell::new(false),
+            waveform: RefCell::new(Waveform::default()),
             engine: RefCell::new(None),
         });
         let frame = NSRect::new(
@@ -435,7 +493,7 @@ impl PillView {
         ));
 
         match state {
-            RecordingState::Recording => self.draw_waveform(bounds, logo_x + logo_size, elapsed),
+            RecordingState::Recording => self.draw_waveform(bounds, logo_x + logo_size),
             RecordingState::Transcribing => self.draw_dots(bounds, logo_x + logo_size, elapsed),
             _ => {}
         }
@@ -458,8 +516,10 @@ impl PillView {
         }
     }
 
-    /// Ten 2.5 px bars, 2 px apart, growing from 4 px to 16 px.
-    fn draw_waveform(&self, bounds: NSRect, after_logo: f64, elapsed: f64) {
+    /// Ten 2.5 px bars, 2 px apart, between 4 px and 16 px tall -- the same
+    /// geometry `overlay.html` draws, with the heights coming from what was
+    /// heard rather than from a clock.
+    fn draw_waveform(&self, bounds: NSRect, after_logo: f64) {
         {
             NSColor::colorWithSRGBRed_green_blue_alpha(
                 239.0 / 255.0,
@@ -472,8 +532,7 @@ impl PillView {
         let bar_width = WAVE_BAR_WIDTH;
         let gap = WAVE_BAR_GAP;
         let mut x = after_logo + PILL_PADDING;
-        for index in 0..WAVE_DELAYS.len() {
-            let height = wave_height(index, elapsed);
+        for height in self.ivars().waveform.borrow().heights() {
             let y = (bounds.size.height - height) / 2.0;
             let bar = NSRect::new(NSPoint::new(x, y), NSSize::new(bar_width, height));
             let path = { NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bar, 1.25, 1.25) };
@@ -967,6 +1026,19 @@ impl Overlay {
         let block = block2::RcBlock::new(move |_timer: core::ptr::NonNull<NSTimer>| {
             let ivars = view.ivars();
             ivars.elapsed.set(ivars.elapsed.get() + 1.0 / 30.0);
+            // Only while there are bars to feed. Transcribing animates too, and
+            // the pill draws dots then; asking the recorder how loud it is when
+            // it has already stopped would sample a level that is pinned at
+            // zero and scroll a flat line across a waveform nobody is drawing.
+            if ivars.state.get() == RecordingState::Recording {
+                let level = ivars
+                    .engine
+                    .borrow()
+                    .as_ref()
+                    .map(|engine| meter_fraction(engine.input_level()))
+                    .unwrap_or(0.0);
+                ivars.waveform.borrow_mut().sample(level as f64);
+            }
             view.setNeedsDisplay(true);
         });
         // Built unscheduled and added in the common modes, not scheduled in the
@@ -986,6 +1058,8 @@ impl Overlay {
             timer.invalidate();
         }
         self.view.ivars().elapsed.set(0.0);
+        // Flat again, or the next recording opens on the tail of the last one.
+        self.view.ivars().waveform.borrow_mut().reset();
     }
 }
 
@@ -1233,16 +1307,9 @@ mod tests {
     }
 
     #[test]
-    fn the_waveform_stays_inside_the_css_keyframes() {
+    fn the_dots_stay_inside_the_css_keyframes() {
         for step in 0..90 {
             let elapsed = step as f64 / 30.0;
-            for index in 0..10 {
-                let height = wave_height(index, elapsed);
-                assert!(
-                    (WAVE_MIN_HEIGHT..=WAVE_MAX_HEIGHT).contains(&height),
-                    "bar {index} at {elapsed}s was {height}"
-                );
-            }
             for index in 0..3 {
                 let opacity = dot_opacity(index, elapsed);
                 assert!(
@@ -1251,9 +1318,105 @@ mod tests {
                 );
             }
         }
-        // The bars have to actually move, or the assertions above would hold
-        // for a constant.
-        assert!((wave_height(0, 0.0) - wave_height(0, 0.225)).abs() > 1.0);
+        // They have to actually move, or the assertion above would hold for a
+        // constant.
         assert!((dot_opacity(0, 0.0) - dot_opacity(0, 0.4)).abs() > 0.5);
+    }
+
+    /// Whatever it is fed, it draws inside the geometry `overlay.html` uses.
+    /// A bar taller than the pill would be clipped by the panel, and a
+    /// negative one would draw upside down.
+    #[test]
+    fn the_bars_stay_inside_the_pill_whatever_the_microphone_says() {
+        let mut wave = Waveform::default();
+        for (step, level) in [0.0, 1.0, 0.5, -3.0, 7.0, f64::MAX, 0.0]
+            .into_iter()
+            .cycle()
+            .take(120)
+            .enumerate()
+        {
+            wave.sample(level);
+            for height in wave.heights() {
+                assert!(
+                    (WAVE_MIN_HEIGHT..=WAVE_MAX_HEIGHT).contains(&height),
+                    "step {step} at level {level} drew {height}"
+                );
+            }
+        }
+    }
+
+    /// Silence is a flat line. This is the whole point of the change: the bars
+    /// used to dance to a clock, so a muted or ungranted microphone looked
+    /// exactly like a working one at the only moment the pill is on screen.
+    #[test]
+    fn silence_is_flat_and_speech_is_not() {
+        let mut wave = Waveform::default();
+        for _ in 0..60 {
+            wave.sample(0.0);
+        }
+        assert!(wave.heights().iter().all(|h| *h == WAVE_MIN_HEIGHT));
+
+        for _ in 0..60 {
+            wave.sample(0.9);
+        }
+        assert!(wave.heights().iter().any(|h| *h > WAVE_MIN_HEIGHT + 5.0));
+    }
+
+    /// One loud moment becomes one tall bar, and that bar walks to the left as
+    /// the readings behind it arrive. A waveform that grew everywhere at once
+    /// would be a level meter wearing ten bars.
+    #[test]
+    fn a_peak_travels_leftwards() {
+        let mut wave = Waveform::default();
+        // Fill the row with silence so the peak is the only thing in it.
+        for _ in 0..WAVE_BARS * WAVE_STEP_TICKS {
+            wave.sample(0.0);
+        }
+        for _ in 0..WAVE_STEP_TICKS {
+            wave.sample(1.0);
+        }
+        let loudest = |wave: &Waveform| {
+            let heights = wave.heights();
+            (0..WAVE_BARS)
+                .max_by(|a, b| heights[*a].partial_cmp(&heights[*b]).unwrap())
+                .unwrap()
+        };
+        // It arrives at the right-hand end, where the newest reading goes.
+        let first = loudest(&wave);
+        assert_eq!(first, WAVE_BARS - 1);
+
+        for _ in 0..WAVE_STEP_TICKS * 3 {
+            wave.sample(0.0);
+        }
+        let later = loudest(&wave);
+        assert!(later < first, "peak sat at {first} and then {later}");
+    }
+
+    /// A bar is three ticks, and it is the loudest of the three. Keeping
+    /// whichever the clock landed on would drop two readings in three and miss
+    /// exactly the transients a waveform exists to show.
+    #[test]
+    fn a_bar_keeps_the_loudest_of_the_ticks_it_covers() {
+        let mut loud = Waveform::default();
+        let mut quiet = Waveform::default();
+        // Same window, same total, but one of them has a spike in it.
+        for level in [0.0, 1.0, 0.0] {
+            loud.sample(level);
+        }
+        for _ in 0..WAVE_STEP_TICKS {
+            quiet.sample(0.0);
+        }
+        assert!(loud.heights()[WAVE_BARS - 1] > quiet.heights()[WAVE_BARS - 1]);
+    }
+
+    /// The next recording opens on a flat line, not on the tail of the last.
+    #[test]
+    fn reset_flattens_it() {
+        let mut wave = Waveform::default();
+        for _ in 0..60 {
+            wave.sample(1.0);
+        }
+        wave.reset();
+        assert!(wave.heights().iter().all(|h| *h == WAVE_MIN_HEIGHT));
     }
 }
