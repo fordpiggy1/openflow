@@ -591,6 +591,14 @@ fn transcribe_file(path: &str) -> i32 {
 }
 
 pub fn main() {
+    // Before anything AppKit, and before the instance lock: `--version` is what
+    // a bug report and the bundle script both ask, and neither wants a second
+    // copy of the app refusing to start or a keychain prompt on the way to one
+    // line of text.
+    if std::env::args().any(|argument| argument == "--version") {
+        println!("{}", crate::version::long());
+        std::process::exit(0);
+    }
     if std::env::args().any(|argument| argument == "--self-check") {
         std::process::exit(self_check());
     }

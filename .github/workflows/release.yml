@@ -1,0 +1,140 @@
+name: Release
+
+# A tag is the trigger, and the tag is the whole input: `v0.2.0` builds
+# whatever `crates/openflow-native/Cargo.toml` says at that commit and
+# publishes it. The job refuses if the two disagree, because a DMG called
+# `OpenFlow_0.1.0_aarch64.dmg` hanging off a release called `v0.2.0` is a
+# support question nobody can answer afterwards.
+on:
+  push:
+    tags: ["v*"]
+  # A dry run: everything except the release. Worth having, because the only
+  # other way to find out whether this workflow works is to push a tag, and a
+  # tag is hard to take back once people have fetched it.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS disk image
+    # Pinned to the same image as CI's macOS matrix leg rather than
+    # `macos-latest`, so the artifact people download is built on the runner
+    # the tests ran on, and a GitHub image rollover cannot change what is
+    # published without a commit saying so. macos-14 is Apple silicon, which
+    # is why the DMG is aarch64.
+    runs-on: macos-14
+    permissions:
+      contents: write # `gh release create` writes a release and its assets.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `build.rs` falls back to `git rev-parse --short HEAD`, and a
+          # shallow checkout can still answer that -- but OPENFLOW_COMMIT
+          # below is what actually decides, so this only keeps the fallback
+          # honest if the env var is ever dropped.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Name the artifacts
+        id: artifacts
+        # One source for the rule: the bundle script already knows how the DMG
+        # is named, and `--print-artifacts` returns before it builds anything.
+        run: bash scripts/bundle-native.sh --print-artifacts >> "$GITHUB_OUTPUT"
+
+      - name: The tag and the crate version agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="${{ steps.artifacts.outputs.version }}"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match crates/openflow-native/Cargo.toml version $crate" >&2
+            exit 1
+          fi
+
+      - run: cargo test --workspace
+
+      # Ad hoc signed, because a GitHub runner has no keychain of ours and this
+      # workflow deliberately holds no signing secret. The consequence is real
+      # and belongs in the release notes: Gatekeeper will not let a downloaded
+      # ad hoc bundle open on a first double-click.
+      #
+      # Developer ID and notarisation plug in exactly here, and nowhere else:
+      # an `apple-actions/import-codesign-certs` step before this one to load a
+      # Developer ID Application certificate from repository secrets into a
+      # temporary keychain, `OPENFLOW_SIGN_IDENTITY` set to its common name so
+      # bundle-native.sh signs with it (the script already prefers that
+      # variable over the local identity), and an `xcrun notarytool submit
+      # --wait` plus `xcrun stapler staple` step after the DMG exists. Nothing
+      # else in this file changes.
+      - name: Build and bundle
+        run: |
+          # build.rs prefers OPENFLOW_COMMIT over asking git itself, so the
+          # commit is the one the workflow checked out and not whatever a
+          # detached HEAD resolves to. Abbreviated through git rather than
+          # cutting `github.sha` to a fixed width, so a release build's version
+          # string is the same shape as a developer's.
+          export OPENFLOW_COMMIT="$(git rev-parse --short "${GITHUB_SHA}^{commit}")" # an annotated tag's sha names the tag object
+          bash scripts/bundle-native.sh --dmg
+
+      - name: Verify the image and what it says about itself
+        env:
+          DMG: target/${{ steps.artifacts.outputs.dmg }}
+        run: |
+          hdiutil verify "$DMG"
+          codesign --verify --strict --verbose=2 target/OpenFlow.app
+          plutil -p target/OpenFlow.app/Contents/Info.plist \
+            | grep -E 'CFBundleShortVersionString|CFBundleVersion|OpenFlowCommit'
+          ./target/release/openflow-native --version
+          ./target/release/openflow-native --self-check
+          # The form `shasum -c` reads back, with the bare file name in it so a
+          # downloader can run it in the directory they downloaded into.
+          ( cd target && shasum -a 256 "${DMG#target/}" > "${DMG#target/}.sha256" )
+          cat "$DMG.sha256"
+
+      - name: Release notes from the changelog
+        # Everything under `## Unreleased` up to the next `## ` heading. A
+        # release whose notes would be empty is a release nobody wrote an entry
+        # for, and that is worth stopping on rather than publishing blank.
+        run: |
+          awk '/^## Unreleased/{flag=1;next}/^## /{flag=0}flag' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no Unreleased section to release" >&2
+            exit 1
+          fi
+          cat release-notes.md
+
+      - name: Upload the build for a dry run
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifacts.outputs.dmg }}
+          path: |
+            target/${{ steps.artifacts.outputs.dmg }}
+            target/${{ steps.artifacts.outputs.dmg }}.sha256
+
+      # `gh` rather than softprops/action-gh-release: it is preinstalled on
+      # every GitHub runner, it is maintained by the same people as the API it
+      # calls, and it needs no third-party action pinned to a commit and
+      # re-audited. The action's extra features -- globbing, a generated body,
+      # updating an existing release -- are ones this workflow does not want:
+      # two named files and the changelog's own words.
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG: target/${{ steps.artifacts.outputs.dmg }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "OpenFlow $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            "$DMG" "$DMG.sha256"
