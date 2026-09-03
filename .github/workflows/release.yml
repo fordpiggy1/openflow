@@ -13,9 +13,6 @@ on:
   # tag is hard to take back once people have fetched it.
   workflow_dispatch:
 
-permissions:
-  contents: write # `gh release create` writes a release and its assets.
-
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -29,6 +26,8 @@ jobs:
     # published without a commit saying so. macos-14 is Apple silicon, which
     # is why the DMG is aarch64.
     runs-on: macos-14
+    permissions:
+      contents: write # `gh release create` writes a release and its assets.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +82,7 @@ jobs:
           # detached HEAD resolves to. Abbreviated through git rather than
           # cutting `github.sha` to a fixed width, so a release build's version
           # string is the same shape as a developer's.
-          export OPENFLOW_COMMIT="$(git rev-parse --short "$GITHUB_SHA")"
+          export OPENFLOW_COMMIT="$(git rev-parse --short "${GITHUB_SHA}^{commit}")" # an annotated tag's sha names the tag object
           bash scripts/bundle-native.sh --dmg
 
       - name: Verify the image and what it says about itself
