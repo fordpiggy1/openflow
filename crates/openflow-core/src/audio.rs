@@ -304,10 +304,16 @@ impl AudioRecorder {
             .map_err(|_| "Microphone snapshot timed out".to_string())?
     }
 
-    /// The loudest sample of the most recent buffer, 0.0 to 1.0.
+    /// The loudest sample of the most recent buffer, as an amplitude.
     ///
     /// Zero when nothing is recording. Never blocks and never talks to the
     /// audio thread, so it is safe to ask on a redraw.
+    ///
+    /// Not bounded by 1.0, which this said until a built-in microphone was
+    /// measured returning 1.15: `cpal` hands over whatever the device produced
+    /// and full scale is a convention rather than a limit, so a loud transient
+    /// can land above it. Callers that draw it want [`meter_fraction`], which
+    /// takes the reading to a 0..1 bar and already clamps the top.
     pub fn input_level(&self) -> f32 {
         f32::from_bits(self.level.load(Ordering::Relaxed))
     }
