@@ -151,7 +151,7 @@ define_class!(
     unsafe impl NSWindowDelegate for HistoryWindow {
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
-            self.ivars().window.orderOut(None);
+            crate::ui::dismiss_window(&self.ivars().window, "history");
             false
         }
     }
@@ -315,6 +315,11 @@ impl HistoryWindow {
             controls.table.setTarget(Some(target));
             controls.table.setDoubleAction(Some(sel!(copyRow:)));
         }
+    }
+
+    /// On screen, as the Dock-icon rule reads it.
+    pub fn is_visible(&self) -> bool {
+        self.ivars().window.isVisible()
     }
 
     pub fn present(&self) {

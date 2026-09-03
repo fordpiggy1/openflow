@@ -17,6 +17,14 @@ Impact: `crates/openflow-core/src/{runner.rs,postpass.rs,transcribe.rs,engine.rs
 - **`--transcribe <wav>`** runs the transcription leg headless and prints the text and elapsed milliseconds, since the GUI cannot be launched from a shell without breaking its TCC grants. `OPENFLOW_APP_DIR` points it at a scratch directory, so measuring does not run against the settings, history and keychain of whoever is measuring.
 - **"Live preview while recording"** is on the General tab now, bound to `live_preview`, with its cost written out: free against a machine on your network, a re-send of the whole recording every 0.8 s against a provider that bills per minute of audio.
 - Still Milestone B: streaming TTS beyond the Settings preview.
+### A Dock icon for as long as a window is open
+By: Ford (with Claude)
+Impact: `crates/openflow-native/src/app.rs`, `crates/openflow-native/src/ui/mod.rs`, `crates/openflow-native/src/ui/{settings,history,onboarding,plugins}.rs`
+
+- The native host was an accessory app with no way out of that: the Tauri build puts OpenFlow in the Dock and the app switcher, and the native build never appeared in either, so a window that lost focus could only be found again through the status item. It now switches to `Regular` while any of its four windows is on screen and back to `Accessory` once they are all closed, which is the shape a menu bar app with real windows normally takes.
+- The switch happens in the pair every window already goes through. `present_window` asks for the Dock icon *before* ordering the window front, because an accessory app cannot take focus the way a regular one can and activating first leaves the window up but behind whatever the user was in. A new `dismiss_window` orders out and gives the icon back, and the four `windowShouldClose` handlers call it instead of `orderOut` directly.
+- Visibility is asked of the windows rather than counted. They are hidden rather than closed and AppKit can order them out itself, so a counter would drift and strand the Dock icon with nothing behind it.
+- The pill and the status item are deliberately not windows for this purpose: an app that jumped into the Dock every time someone spoke would be worse than one that never appeared there at all. `LSUIElement` still decides how the app *launches* -- as an accessory, with no Dock icon until something asks for one.
 
 ### Native macOS app: the rest of the UI (Milestone B, part 1)
 By: Titan (with Claude)
