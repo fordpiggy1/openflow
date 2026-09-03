@@ -9,6 +9,25 @@ By: Titan (with Claude)
 Impact: `crates/openflow-core/src/runner.rs`
 
 - `the_install_and_model_checks_are_not_re_run_on_every_start` writes a `#!/bin/sh` stand-in for Python and sets its mode with `PermissionsExt`, which does not exist on Windows, so `openflow-core`'s test build has been red on `windows-latest` since the runner landed. The test is now `#[cfg(unix)]`, like the two hook tests in `plugins.rs` that do the same thing.
+### Benchmark addendum: Moonshine and Cohere Transcribe
+By: Titan (with Claude)
+Impact: `docs/native-port/local-runner-benchmark.md`
+
+- Moonshine tiny-en and base-en measured on the reference clip: base-en matches Qwen 0.6B on speed at half the memory and one seventh of the download, on CPU alone, and spells the product names as well as Qwen 1.7B. The 2026 streaming models are slower offline and misheard the trailing date.
+- Cohere Transcribe could not be measured: both community MLX checkpoints load into mlx-audio with a third of the parameters missing, and the canonical weights are gated. The rerun command is recorded.
+- Revised recommendation: Moonshine base-en as the light tier, Qwen 1.7B stays accurate, and a direct `libmoonshine` link as the route to a local mode without Python.
+
+### Shipping: versioned DMG, release workflow, About
+By: Titan (with Claude)
+Impact: `scripts/bundle-native.sh`, `.github/workflows/release.yml`, `crates/openflow-native/{build.rs,src/version.rs,src/menu.rs,src/main.rs,src/app.rs}`, `README.md`
+
+- **A build could not say which build it was.** Every binary between two releases calls itself `0.1.0`, and the ones people actually run are all of the ones in between. `build.rs` now bakes the short commit in: from `OPENFLOW_COMMIT` if the environment sets it, else `git rev-parse --short HEAD`, else the literal `unknown` for a source drop with no `.git`, which is a fallback and not an error. `openflow-native --version` prints `OpenFlow 0.1.0 (a1b2c3d)` and exits before AppKit, the instance lock and the keychain, so asking costs nothing and starts nothing.
+- **An About item in the app menu**, above Quit. It is Apple's standard panel, given the two strings explicitly: `NSAboutPanelOptionApplicationVersion` is the version and `NSAboutPanelOptionVersion` the commit, which AppKit renders as the same line `--version` prints. A nil-target `orderFrontStandardAboutPanel:` would have been less code and would have shown no version at all under `cargo run`, since it can only read a bundle's `Info.plist`, and never the commit, because no plist key carries one.
+- **The disk image is named for what is in it**: `target/OpenFlow_<version>_<arch>.dmg`, the version read from `crates/openflow-native/Cargo.toml`, the same line `CFBundleShortVersionString` and `CFBundleVersion` come from, so a bundle cannot disagree with itself. `--print-artifacts` prints the version, the architecture and the name without building anything, so the release workflow names the asset it is about to upload from the script rather than from a second copy of the rule.
+- **The commit in `Info.plist` is asked of the binary, not of git.** `OpenFlowCommit` comes from running the freshly built executable's `--version`; under `--skip-build` git would answer for the tree as it is now and the plist would describe a different commit than the executable beside it. It is not folded into `CFBundleVersion`, because that is the number macOS compares between installs and a hash there makes every build look like a downgrade.
+- The image is deterministic in the sense that matters for a download: a fixed `OpenFlow` volume name, an Applications symlink, no background image, no window geometry, `hdiutil -format UDZO` from a staged folder, and a re-run that overwrites rather than accumulating. Not bit-identical, because `hdiutil` stamps HFS+ creation times into the filesystem it builds. The script prints the path and the SHA-256.
+- **`.github/workflows/release.yml`** runs on a `v*` tag on `macos-14`: it refuses if the tag and the crate version disagree, runs `cargo test --workspace`, bundles, verifies the image and the plist, takes the release notes from the changelog's Unreleased section and refuses if that section is empty, and publishes with `gh release create`, which is preinstalled on the runner with, no third-party action to pin and re-audit. `workflow_dispatch` does the same without the release, so the workflow can be proved without pushing a tag. CI's existing jobs are untouched.
+- **CI signs ad hoc and that is visible in the workflow**: no signing secret lives here, so Gatekeeper will refuse a downloaded image on a first double-click. Developer ID and notarisation plug in at one named point, marked in the file: import the certificate, set `OPENFLOW_SIGN_IDENTITY`, and add `notarytool submit --wait` plus `stapler staple` after the DMG exists. Nothing else changes.
 
 ### Settings joins the main window, and the wizard becomes a sheet on it
 By: Ford (with Claude)

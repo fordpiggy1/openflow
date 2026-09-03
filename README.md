@@ -207,6 +207,9 @@ cargo build -p openflow-native --release
 # Prove the engine comes up without opening a window
 ./target/release/openflow-native --self-check
 
+# Which build is this? Version from Cargo.toml, commit baked in at build time
+./target/release/openflow-native --version      # OpenFlow 0.1.0 (a1b2c3d)
+
 # Transcribe one file with the saved settings and print the text and timing
 ./target/release/openflow-native --transcribe clip.wav
 
@@ -241,6 +244,41 @@ signed: cdhash H"..."                                                  # does no
 ```
 
 The certificate is self-signed and never leaves this machine; it proves nothing to anyone else and is not a step towards distribution, which still wants a Developer ID. Set `OPENFLOW_SIGN_IDENTITY` to sign with something else, and expect to answer the microphone and accessibility prompts one last time on the first build after switching identities. `scripts/local-signing-identity.sh --remove` puts things back.
+
+### Which build am I running
+
+Three places say it, and they say the same thing because there is one source for each half. The version is the `version` line in `crates/openflow-native/Cargo.toml`; the commit is baked into the binary by `crates/openflow-native/build.rs`, from `OPENFLOW_COMMIT` if the environment sets it, else `git rev-parse --short HEAD`, else the literal `unknown` outside a checkout.
+
+| Where | Shows |
+| --- | --- |
+| `openflow-native --version` | `OpenFlow 0.1.0 (a1b2c3d)` |
+| **About OpenFlow** in the app menu | the same line, in Apple's standard About panel |
+| `OpenFlow.app/Contents/Info.plist` | `CFBundleShortVersionString` and `CFBundleVersion` = the version, `OpenFlowCommit` = the commit |
+
+The bundle script does not compute the commit itself: it runs the binary it just assembled with `--version` and copies the answer into the plist, so an app bundle can never name a commit its own executable was not built from. To read it back out of an installed app:
+
+```bash
+plutil -p /Applications/OpenFlow.app/Contents/Info.plist | grep -E 'Version|OpenFlowCommit'
+```
+
+### Cutting a release
+
+```bash
+bash scripts/bundle-native.sh --print-artifacts   # version=0.1.0  arch=aarch64  dmg=OpenFlow_0.1.0_aarch64.dmg
+bash scripts/bundle-native.sh --dmg               # builds it, then prints the path and its SHA-256
+```
+
+The disk image is `target/OpenFlow_<version>_<arch>.dmg`: volume name `OpenFlow`, the app and an `Applications` symlink, nothing else. Re-running overwrites it. It is deterministic in name, layout and contents, not in bytes -- `hdiutil` writes filesystem creation times into the image, so two runs a minute apart differ.
+
+To publish one:
+
+1. Put the release's entry under `## Unreleased` in `CHANGELOG.md` and bump `version` in `crates/openflow-native/Cargo.toml`. Those are the two inputs; everything else is derived.
+2. Push a tag whose name is `v` plus that version: `git tag v0.2.0 && git push origin v0.2.0`. `.github/workflows/release.yml` refuses if the two disagree, so a mistyped tag fails before it builds anything.
+3. The workflow runs on `macos-14`: `cargo test --workspace`, `bash scripts/bundle-native.sh --dmg`, `hdiutil verify`, then `gh release create` with the DMG, a `.sha256` beside it, and the Unreleased section as the release notes.
+
+`workflow_dispatch` runs the same job without publishing and leaves the image as a build artifact, which is how to prove a change to the workflow without spending a tag.
+
+**The published image is signed ad hoc**, because no signing secret lives in this repository. macOS will refuse to open it on a first double-click; right-click and Open, or `xattr -d com.apple.quarantine`, until the follow-up lands. That follow-up is a Developer ID certificate in repository secrets plus `xcrun notarytool submit --wait` and `xcrun stapler staple`, and it plugs into one marked point in `release.yml` -- the bundle script already prefers `OPENFLOW_SIGN_IDENTITY` over everything else, so nothing but the workflow changes.
 
 ## How dictation works
 
