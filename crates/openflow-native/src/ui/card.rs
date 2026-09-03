@@ -70,6 +70,34 @@ define_class!(
     }
 );
 
+define_class!(
+    // SAFETY: `NSView` is designed for subclassing, this class adds no ivars
+    // and implements no Drop, and `isFlipped` is a property AppKit already
+    // defines with this signature.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "OpenFlowFlippedView"]
+    pub struct Flipped;
+
+    impl Flipped {
+        /// Origin at the top left. A scroll view shows the origin of its
+        /// document first, so an unflipped document opens on its bottom --
+        /// the end of a settings page rather than the start of it.
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+    }
+);
+
+impl Flipped {
+    pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm);
+        // SAFETY: `initWithFrame:` is `NSView`'s designated initialiser.
+        unsafe { msg_send![this, initWithFrame: frame] }
+    }
+}
+
 impl Card {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm);

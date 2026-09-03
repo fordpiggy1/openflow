@@ -1,4 +1,10 @@
-//! The Settings window: one `NSWindow` with four tabs, autosaving.
+//!
+//! A page of the main window, and no longer an `NSTabView`. The four groups
+//! are cards stacked down one scrolling column, which is what Ventura's System
+//! Settings does and what a tab strip riding on the edge of a rectangle stopped
+//! being. Each card is only as tall as its own form -- `Form::fit` is what
+//! makes that possible, since only the form knows how far down its rows got.
+//! The Settings page: one `NSWindow` with four tabs, autosaving.
 //!
 //! Every key in the parity checklist of `docs/native-port/PLAN.md` section 4
 //! has a control here, with the same default the web settings screen shows for
@@ -14,15 +20,12 @@ use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{
-    define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
-    Message,
-};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSBackingStoreType, NSComboBox, NSControl, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSPopUpButton, NSSecureTextField, NSSwitch, NSTabView,
-    NSTabViewItem, NSTextDelegate, NSTextField, NSTextView, NSTextViewDelegate, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSComboBox, NSControl, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSPopUpButton, NSScrollView,
+    NSSecureTextField, NSSwitch, NSTextDelegate, NSTextField, NSTextView, NSTextViewDelegate,
+    NSView,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -34,20 +37,13 @@ use openflow_core::transcribe::ModelInfo;
 
 use crate::hotkeys;
 use crate::overlay;
+use crate::ui::card::{Card, Flipped, GAP, MARGIN, PADDING};
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::{
     allow_wrapping, button, combo, label, note, popup, secure_field, switch_control, text_field,
     text_view, wire, Form, ROW,
 };
 
-const WINDOW_WIDTH: f64 = 420.0;
-const WINDOW_HEIGHT: f64 = 560.0;
-/// Fallback size of one tab's form, used only if `NSTabView` declines to say
-/// what its content rect is. The real size is asked for at build time: the
-/// inset a tab view keeps for its own frame and tab strip is AppKit's to
-/// choose, and guessing it low is what clipped the right-hand column.
-const TAB_WIDTH: f64 = 386.0;
-const TAB_HEIGHT: f64 = 496.0;
 /// The dictionary is sent to the transcriber as a spelling hint and the web
 /// settings screen caps it here.
 pub const DICTIONARY_LIMIT: usize = 800;
@@ -209,8 +205,12 @@ struct Controls {
 
 pub struct SettingsIvars {
     engine: Arc<Engine>,
-    window: Retained<NSWindow>,
-    tabs: Retained<NSTabView>,
+    view: Retained<NSView>,
+    /// The scroller, so naming a section can bring it into view.
+    scroll: Retained<NSScrollView>,
+    /// One entry per [`SECTIONS`] row: the heading and its card, as a single
+    /// rect in the document's coordinates.
+    sections: Vec<NSRect>,
     controls: Controls,
     /// The event monitor a hotkey field installs while it is listening.
     recorder: ChordRecorder,
@@ -224,26 +224,13 @@ define_class!(
     // only ivars and implements no Drop.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "OpenFlowSettingsWindow"]
+    #[name = "OpenFlowSettingsPage"]
     #[ivars = SettingsIvars]
-    pub struct SettingsWindow;
+    pub struct SettingsPage;
 
-    unsafe impl NSObjectProtocol for SettingsWindow {}
+    unsafe impl NSObjectProtocol for SettingsPage {}
 
-    unsafe impl NSWindowDelegate for SettingsWindow {
-        /// Hide, never close: the window is built once and kept.
-        #[unsafe(method(windowShouldClose:))]
-        fn window_should_close(&self, _sender: &NSWindow) -> bool {
-            self.stop_recording_hotkey();
-            // Resigning first responder ends editing, which is what commits a
-            // key or a URL the user typed and never tabbed out of.
-            self.ivars().window.makeFirstResponder(None);
-            crate::ui::dismiss_window(&self.ivars().window, "settings");
-            false
-        }
-    }
-
-    unsafe impl NSControlTextEditingDelegate for SettingsWindow {
+    unsafe impl NSControlTextEditingDelegate for SettingsPage {
         /// Live autosave, for the fields where a write is a row in SQLite.
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, notification: &NSNotification) {
@@ -271,9 +258,9 @@ define_class!(
         }
     }
 
-    unsafe impl NSTextViewDelegate for SettingsWindow {}
+    unsafe impl NSTextViewDelegate for SettingsPage {}
 
-    unsafe impl NSTextDelegate for SettingsWindow {
+    unsafe impl NSTextDelegate for SettingsPage {
         /// The dictionary text view. Enforces the 800 character cap as it is
         /// typed rather than truncating silently on save.
         #[unsafe(method(textDidChange:))]
@@ -282,7 +269,7 @@ define_class!(
         }
     }
 
-    impl SettingsWindow {
+    impl SettingsPage {
         #[unsafe(method(controlChanged:))]
         fn control_changed(&self, sender: &NSControl) {
             self.write(sender.tag());
@@ -337,88 +324,22 @@ impl SettingsIvars {
     }
 }
 
-impl SettingsWindow {
-    pub fn new(app: &std::rc::Rc<crate::app::App>, mtm: MainThreadMarker) -> Retained<Self> {
+impl SettingsPage {
+    /// Build the page into a view of `size`, the content pane the main window
+    /// has to give it.
+    pub fn new(
+        app: &std::rc::Rc<crate::app::App>,
+        mtm: MainThreadMarker,
+        size: NSSize,
+    ) -> Retained<Self> {
         let engine = Arc::clone(app.engine());
-
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
-                ),
-                NSWindowStyleMask::Titled
-                    | NSWindowStyleMask::Closable
-                    | NSWindowStyleMask::Miniaturizable
-                    | NSWindowStyleMask::Resizable,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
-        window.setTitle(&NSString::from_str("OpenFlow Settings"));
-        // Resizable like History and Plugins already are, but never smaller
-        // than the form was laid out for: the rows are positioned absolutely,
-        // so shrinking past this would clip them with no way to get them back.
-        window.setContentMinSize(NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
-        unsafe { window.setReleasedWhenClosed(false) };
-        window.center();
-
-        let tabs = {
-            NSTabView::initWithFrame(
-                NSTabView::alloc(mtm),
-                NSRect::new(
-                    NSPoint::new(10.0, 10.0),
-                    NSSize::new(WINDOW_WIDTH - 20.0, WINDOW_HEIGHT - 20.0),
-                ),
-            )
-        };
-
-        // Ask the tab view how much room a tab actually gets rather than
-        // assuming: everything inside is laid out at absolute coordinates, so a
-        // form built even a few points too wide loses its right-hand column
-        // off the edge of the window.
-        let content = tabs.contentRect();
-        let (tab_width, tab_height) = if content.size.width > 1.0 && content.size.height > 1.0 {
-            (content.size.width, content.size.height)
-        } else {
-            (TAB_WIDTH, TAB_HEIGHT)
-        };
-        // The tabs follow the window. Their forms keep the width they were
-        // laid out at, so growing the window adds margin rather than reflowing
-        // the rows -- but the box, the tab strip and the scrollable area all
-        // track the frame instead of stranding themselves in a corner.
-        tabs.setAutoresizingMask(
-            objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
-                | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
-        );
-        let (general, providers, voice, privacy, controls) = build_tabs(mtm, tab_width, tab_height);
-        for (title, view) in [
-            ("General", &general),
-            ("Providers", &providers),
-            ("Voice", &voice),
-            ("Privacy", &privacy),
-        ] {
-            let item = unsafe {
-                NSTabViewItem::initWithIdentifier(
-                    NSTabViewItem::alloc(),
-                    Some(&NSString::from_str(title)),
-                )
-            };
-            {
-                item.setLabel(&NSString::from_str(title));
-                item.setView(Some(view));
-            }
-            tabs.addTabViewItem(&item);
-        }
-        if let Some(content) = window.contentView() {
-            content.addSubview(&tabs);
-        }
+        let (view, scroll, sections, controls) = build_page(mtm, size);
 
         let this = Self::alloc(mtm).set_ivars(SettingsIvars {
             engine,
-            window,
-            tabs,
+            view,
+            scroll,
+            sections,
             controls,
             recorder: ChordRecorder::default(),
             recording_action: RefCell::new(None),
@@ -426,17 +347,17 @@ impl SettingsWindow {
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
-        this.ivars()
-            .window
-            .setDelegate(Some(ProtocolObject::from_ref(&*this)));
         this.wire_actions();
-        this.reload();
+        // Deliberately not reloaded here. `reload` reads three keychain items
+        // and enumerates the audio devices, and the four pages are built
+        // together when the main window is -- so doing it in the constructor
+        // charged every launch for a screen the user may never open. It is not
+        // that the work is slow; it is that it is the user's keychain.
+        // `show_page` reloads on the way in, every time, which is where a cost
+        // like that belongs.
         this
     }
 
-    /// Point every control at this object. Done in one place so a control that
-    /// is added later and forgotten here simply does nothing, rather than
-    /// firing an action on a stale target.
     fn wire_actions(&self) {
         let controls = &self.ivars().controls;
         let target: &AnyObject = self.as_ref();
@@ -523,30 +444,53 @@ impl SettingsWindow {
     }
 
     /// On screen, as the Dock-icon rule reads it.
-    pub fn is_visible(&self) -> bool {
-        self.ivars().window.isVisible()
+    /// The view the main window installs in its content pane.
+    pub fn view(&self) -> Retained<NSView> {
+        self.ivars().view.clone()
     }
 
-    pub fn present(&self) {
-        crate::ui::present_window(&self.ivars().window, "settings");
-    }
-
-    pub fn select_tab(&self, tab: &str) {
-        let index = match tab {
-            "General" | "general" => 0,
-            "Providers" | "providers" | "onboarding" => 1,
-            "Voice" | "voice" => 2,
-            "Privacy" | "privacy" | "history" => 3,
-            _ => return,
+    /// Bring a named group to the top of the scroller.
+    ///
+    /// The tray and the wizard name a group rather than a page, and they used
+    /// to name a tab. Scrolling is the version of "select" a single column
+    /// has: the other groups stay reachable, which is the point of stacking
+    /// them, so this puts the named one at the top rather than hiding the
+    /// rest.
+    pub fn select_section(&self, name: &str) {
+        let Some(index) = section_index(name) else {
+            return;
         };
-        self.ivars().tabs.selectTabViewItemAtIndex(index);
+        let ivars = self.ivars();
+        let Some(rect) = ivars.sections.get(index) else {
+            return;
+        };
+        // A little above the heading, so it does not sit flush against the
+        // top edge of the scroller.
+        let top = (rect.origin.y - MARGIN).max(0.0);
+        ivars
+            .scroll
+            .contentView()
+            .scrollToPoint(NSPoint::new(0.0, top));
+        ivars
+            .scroll
+            .reflectScrolledClipView(&ivars.scroll.contentView());
+    }
+
+    /// Stop the hotkey recorder and commit any half-typed field. Called when
+    /// the page is navigated away from, which is what closing the window used
+    /// to mean.
+    pub fn on_hidden(&self) {
+        self.stop_recording_hotkey();
+        self.commit_pending_edits();
     }
 
     /// Force whatever field is being edited to commit, if this window is the
     /// one the user is typing in. Editing ends when first responder is given
     /// up, and that is what writes the deferred fields.
     pub fn commit_pending_edits(&self) {
-        let window = &self.ivars().window;
+        let Some(window) = self.ivars().view.window() else {
+            return;
+        };
         if window.isVisible() && window.isKeyWindow() {
             window.makeFirstResponder(None);
         }
@@ -1130,17 +1074,17 @@ pub fn join_provider(kind: &str, url: &str) -> String {
 // ── Tab construction ──────────────────────────────────────
 
 #[allow(clippy::type_complexity)]
-fn build_tabs(
+/// Build the four groups' forms at `width`, each shrunk to the height its own
+/// rows used.
+///
+/// `height` is only the room the rows are laid out into before `fit` takes the
+/// slack back, so it has to be generous rather than right: a form that ran off
+/// the bottom of it would have nowhere to put its last rows.
+fn build_sections(
     mtm: MainThreadMarker,
     width: f64,
     height: f64,
-) -> (
-    Retained<objc2_app_kit::NSView>,
-    Retained<objc2_app_kit::NSView>,
-    Retained<objc2_app_kit::NSView>,
-    Retained<objc2_app_kit::NSView>,
-    Controls,
-) {
+) -> ([Retained<objc2_app_kit::NSView>; SECTIONS.len()], Controls) {
     // General
     let mut form = Form::new(mtm, width, height);
     let (l, c) = form.row(ROW);
@@ -1196,7 +1140,7 @@ fn build_tabs(
     form.add(&label(mtm, "Language", l));
     let language = popup(mtm, c, TAG_LANGUAGE, &titles(LANGUAGES));
     form.add(&language);
-    let general = form.view.clone();
+    let general = form.fit();
 
     // Providers
     let mut form = Form::new(mtm, width, height);
@@ -1279,7 +1223,7 @@ fn build_tabs(
     let models_status = note(mtm, "", n);
     allow_wrapping(&models_status, n.size.width);
     form.add(&models_status);
-    let providers = form.view.clone();
+    let providers = form.fit();
 
     // Voice
     let mut form = Form::new(mtm, width, height);
@@ -1346,7 +1290,7 @@ fn build_tabs(
     let voice_status = note(mtm, "", n);
     allow_wrapping(&voice_status, n.size.width);
     form.add(&voice_status);
-    let voice = form.view.clone();
+    let voice = form.fit();
 
     // Privacy
     let mut form = Form::new(mtm, width, height);
@@ -1387,7 +1331,7 @@ fn build_tabs(
     let history_status = note(mtm, "", n);
     allow_wrapping(&history_status, n.size.width);
     form.add(&history_status);
-    let privacy = form.view.clone();
+    let privacy = form.fit();
 
     let controls = Controls {
         microphone,
@@ -1427,7 +1371,153 @@ fn build_tabs(
         history_status,
         actions: vec![fetch, setup, play, stop, clear],
     };
-    (general, providers, voice, privacy, controls)
+    ([general, providers, voice, privacy], controls)
+}
+
+// ── The page ──────────────────────────────────────────────
+
+/// The groups, in the order they are stacked. The second string is what the
+/// heading over the card says about the group; the web screen's section
+/// headings say the same.
+const SECTIONS: &[(&str, &str)] = &[
+    ("General", "How recording feels on this Mac."),
+    ("Providers", "Who transcribes, and who cleans the text up."),
+    ("Voice", "The voice used to read text back."),
+    ("Privacy", "What is kept on this Mac, and for how long."),
+];
+
+/// The group `name` refers to. Accepts the names the tray, the wizard and the
+/// old tab strip all used, so no caller had to be rewritten to find a group.
+pub fn section_index(name: &str) -> Option<usize> {
+    match name {
+        "General" | "general" => Some(0),
+        "Providers" | "providers" | "onboarding" => Some(1),
+        "Voice" | "voice" => Some(2),
+        "Privacy" | "privacy" | "history" => Some(3),
+        _ => None,
+    }
+}
+
+/// Height of a section heading, and the gap under it.
+const HEADING: f64 = 17.0;
+const HEADING_GAP: f64 = 7.0;
+/// The room the forms are laid out into before `Form::fit` takes the slack
+/// back. Larger than any group needs; see `build_sections`.
+const FORM_SPACE: f64 = 2400.0;
+/// The widest a form is allowed to get, whatever the window does.
+///
+/// A two-column form stops reading as one past a certain width: the label
+/// stays on the far left, the control stretches to the far right, and a hotkey
+/// button four hundred points wide announces nothing but its own emptiness.
+/// The column is capped and centred instead, which is the shape System
+/// Settings keeps as its own window grows.
+const MAX_FORM_WIDTH: f64 = 430.0;
+
+/// The column keeps its width and stays centred as the window grows, rather
+/// than stretching with it.
+const CENTRED_COLUMN: NSAutoresizingMaskOptions = NSAutoresizingMaskOptions(
+    NSAutoresizingMaskOptions::ViewMinXMargin.0 | NSAutoresizingMaskOptions::ViewMaxXMargin.0,
+);
+
+/// One scrolling column of headed cards, and the scroller around it.
+///
+/// Returns the rect of each heading-and-card pair as well, in the document's
+/// own coordinates, because that is what `select_section` scrolls to.
+#[allow(clippy::type_complexity)]
+fn build_page(
+    mtm: MainThreadMarker,
+    size: NSSize,
+) -> (
+    Retained<NSView>,
+    Retained<NSScrollView>,
+    Vec<NSRect>,
+    Controls,
+) {
+    let available = (size.width - MARGIN * 2.0).max(320.0);
+    let form_width = (available - PADDING * 2.0).clamp(280.0, MAX_FORM_WIDTH);
+    let card_width = form_width + PADDING * 2.0;
+    let card_x = ((size.width - card_width) / 2.0).max(MARGIN);
+    let (forms, controls) = build_sections(mtm, form_width, FORM_SPACE);
+
+    // Measure first, place second: the document has to be as tall as its
+    // contents before anything can be positioned inside it.
+    let heights: Vec<f64> = forms
+        .iter()
+        .map(|form| form.frame().size.height + PADDING * 2.0)
+        .collect();
+    let total: f64 = heights
+        .iter()
+        .map(|card| HEADING + HEADING_GAP + card + GAP)
+        .sum::<f64>()
+        - GAP
+        + MARGIN * 2.0;
+
+    // Flipped, so the column starts at the top and the scroller opens on the
+    // first group rather than the last.
+    let document = Flipped::new(
+        mtm,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size.width, total)),
+    );
+    document.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+
+    let mut y = MARGIN;
+    let mut sections = Vec::with_capacity(SECTIONS.len());
+    for (index, ((title, blurb), form)) in SECTIONS.iter().zip(forms.iter()).enumerate() {
+        let top = y;
+
+        // The heading sits outside the card, on the window's background. That
+        // is where System Settings puts a group's name, and it is why the card
+        // below it can be a plain rounded rectangle with nothing written on
+        // its edge.
+        let heading = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+        heading.setFrame(NSRect::new(
+            NSPoint::new(card_x, y),
+            NSSize::new(card_width, HEADING),
+        ));
+        heading.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, 0.3)));
+        heading.setToolTip(Some(&NSString::from_str(blurb)));
+        heading.setAutoresizingMask(CENTRED_COLUMN);
+        document.addSubview(&heading);
+        y += HEADING + HEADING_GAP;
+
+        let card = Card::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(card_x, y),
+                NSSize::new(card_width, heights[index]),
+            ),
+        );
+        card.setAutoresizingMask(CENTRED_COLUMN);
+        form.setFrameOrigin(NSPoint::new(PADDING, PADDING));
+        card.addSubview(form);
+        document.addSubview(&card);
+        y += heights[index] + GAP;
+
+        sections.push(NSRect::new(
+            NSPoint::new(0.0, top),
+            NSSize::new(size.width, y - top),
+        ));
+    }
+
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), size),
+    );
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), size),
+    );
+    scroll.setHasVerticalScroller(true);
+    scroll.setAutohidesScrollers(true);
+    scroll.setDrawsBackground(false);
+    scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
+    scroll.setDocumentView(Some(&document));
+    scroll.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    view.addSubview(&scroll);
+
+    (view, scroll, sections, controls)
 }
 
 /// The action buttons, in the order `build_tabs` creates them.

@@ -1,3 +1,10 @@
+//!
+//! Presented as a sheet on the main window rather than as a window of its own.
+//! It is still an `NSWindow` -- a sheet is -- but it hangs off the one window
+//! the app now has, so setup happens over the workspace it is setting up
+//! instead of beside it. `Closable` is kept even though a sheet draws no close
+//! button: `performClose:` still runs, so the Cmd+W in the app menu is still
+//! the way out of a wizard the user does not want to finish.
 //! First-run setup: the native form of `App.tsx`'s onboarding screen.
 //!
 //! The web wizard has three steps (provider, credentials, models). This one has
@@ -286,6 +293,8 @@ struct Controls {
     heading: Retained<NSTextField>,
     error: Retained<NSTextField>,
     back: Retained<NSButton>,
+    /// The way out of a wizard the user does not want to finish.
+    later: Retained<NSButton>,
     primary: Retained<NSButton>,
 
     providers: Vec<Retained<NSButton>>,
@@ -332,11 +341,13 @@ define_class!(
     unsafe impl NSWindowDelegate for OnboardingWindow {
         /// Hide, never close: setup can be reopened from Settings and the
         /// window is built once.
+        /// Cmd+W, since a sheet draws no close button. Hiding, not closing:
+        /// the wizard is built once and kept.
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             self.stop_recording_hotkey();
             self.ivars().window.makeFirstResponder(None);
-            crate::ui::dismiss_window(&self.ivars().window, "onboarding");
+            crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
             false
         }
     }
@@ -362,6 +373,15 @@ define_class!(
         #[unsafe(method(stepNext:))]
         fn step_next(&self, _sender: &NSControl) {
             self.advance();
+        }
+
+        /// Leave setup without finishing it. Nothing is written -- the wizard
+        /// only writes on Finish -- so the app is exactly as configured, or
+        /// unconfigured, as it was before this was opened.
+        #[unsafe(method(skipSetup:))]
+        fn skip_setup(&self, _sender: &NSControl) {
+            self.ivars().window.makeFirstResponder(None);
+            crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
         }
 
         #[unsafe(method(providerChanged:))]
@@ -419,6 +439,7 @@ impl OnboardingWindow {
             content.addSubview(&panels);
             content.addSubview(&controls.error);
             content.addSubview(&controls.back);
+            content.addSubview(&controls.later);
             content.addSubview(&controls.primary);
         }
 
@@ -455,6 +476,7 @@ impl OnboardingWindow {
             sel!(providerChanged:),
         );
         wire(&controls.back, target, sel!(stepBack:));
+        wire(&controls.later, target, sel!(skipSetup:));
         wire(&controls.primary, target, sel!(stepNext:));
         wire(&controls.test, target, sel!(testConnection:));
         // The two credential fields report every keystroke, so the connection
@@ -479,8 +501,9 @@ impl OnboardingWindow {
         self.ivars().window.isVisible()
     }
 
-    pub fn present(&self) {
-        crate::ui::present_window(&self.ivars().window, "onboarding");
+    /// Hang the wizard off `parent` as a sheet.
+    pub fn present_on(&self, parent: &NSWindow) {
+        crate::ui::present_sheet(parent, &self.ivars().window, "onboarding");
     }
 
     /// Fill the controls from whatever is already saved and start at the front.
@@ -754,16 +777,17 @@ impl OnboardingWindow {
         Ok(())
     }
 
-    /// Setup is saved: hide this window and hand the user to Settings, which
-    /// reads the same rows back.
+    /// Setup is saved: end the sheet and leave the user on the main screen.
+    ///
+    /// The web wizard's last button says "Open my workspace" and lands on its
+    /// main screen. This one handed the user to Settings instead, because
+    /// until the main window existed there was no workspace to open. There is
+    /// now, so the two agree again.
     fn finish(&self) {
-        // Ordered out directly rather than dismissed: Settings is presented on
-        // the next line, so routing through `dismiss_window` would drop the
-        // Dock icon and immediately ask for it back, which the Dock animates.
-        self.ivars().window.orderOut(None);
+        crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
         crate::app::with_app(|app| {
-            app.with_settings(|window| window.reload());
-            app.show_settings(None);
+            app.with_settings(|page| page.reload());
+            app.show_main(Some("dictate"));
         });
     }
 
@@ -1007,6 +1031,18 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
         "Back",
         0,
     );
+    // A sheet draws no close button, and `performClose:` is refused on one, so
+    // Cmd+W is not a way out either -- without this the wizard is a room with
+    // no door. Escape is the gesture a sheet is supposed to answer, and the
+    // button says so out loud rather than leaving it to be guessed.
+    let later = button(
+        mtm,
+        NSRect::new(NSPoint::new(118.0, 12.0), NSSize::new(130.0, 28.0)),
+        "Do this later",
+        0,
+    );
+    later.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+
     let primary = button(
         mtm,
         NSRect::new(
@@ -1023,6 +1059,7 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
         heading,
         error,
         back,
+        later,
         primary,
         providers,
         same_provider,
