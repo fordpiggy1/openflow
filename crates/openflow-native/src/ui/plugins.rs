@@ -1,4 +1,8 @@
-//! The Plugins window: the web build's plugins screen as an `NSTableView`.
+//! The Plugins page: the web build's plugins screen as an `NSTableView`.
+//!
+//! A page, not a window: the main window owns the frame and hands this one a
+//! content rect to build itself into. See [`crate::ui::history`] for why the
+//! rect is passed in rather than assumed.
 //!
 //! Same cell-based table as History, for the same reason: the rows are strings.
 //! Enable and Disable go straight to `PluginManager`, and Install reads a
@@ -16,19 +20,20 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSControl, NSModalResponseOK,
-    NSOpenPanel, NSScrollView, NSTableColumn, NSTableView, NSTableViewDataSource, NSTextField,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSAutoresizingMaskOptions, NSButton, NSControl, NSModalResponseOK, NSOpenPanel, NSScrollView,
+    NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewStyle, NSTextField, NSView,
+    NSWorkspace,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL};
 
 use openflow_core::engine::Engine;
 use openflow_core::plugins::PluginInfo;
 
-use crate::ui::{button, note};
+use crate::ui::card::{Card, GAP, MARGIN};
+use crate::ui::{button, empty_state, note};
 
-const WINDOW_WIDTH: f64 = 640.0;
-const WINDOW_HEIGHT: f64 = 400.0;
+/// Gap between the card's edge and the table inside it, matching History's.
+const TABLE_INSET: f64 = 10.0;
 
 const COLUMN_NAME: &str = "name";
 const COLUMN_VERSION: &str = "version";
@@ -243,6 +248,8 @@ pub fn installed_line(name: &str, files: usize) -> String {
 
 struct Controls {
     table: Retained<NSTableView>,
+    /// Shown in the card in place of the list when there is nothing to list.
+    empty: crate::ui::EmptyState,
     status: Retained<NSTextField>,
     toggle: Retained<NSButton>,
     install: Retained<NSButton>,
@@ -251,7 +258,7 @@ struct Controls {
 
 pub struct PluginsIvars {
     engine: Arc<Engine>,
-    window: Retained<NSWindow>,
+    view: Retained<NSView>,
     controls: Controls,
     rows: RefCell<Vec<PluginInfo>>,
 }
@@ -261,21 +268,13 @@ define_class!(
     // only ivars and implements no Drop.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "OpenFlowPluginsWindow"]
+    #[name = "OpenFlowPluginsPage"]
     #[ivars = PluginsIvars]
-    pub struct PluginsWindow;
+    pub struct PluginsPage;
 
-    unsafe impl NSObjectProtocol for PluginsWindow {}
+    unsafe impl NSObjectProtocol for PluginsPage {}
 
-    unsafe impl NSWindowDelegate for PluginsWindow {
-        #[unsafe(method(windowShouldClose:))]
-        fn window_should_close(&self, _sender: &NSWindow) -> bool {
-            crate::ui::dismiss_window(&self.ivars().window, "plugins");
-            false
-        }
-    }
-
-    unsafe impl NSTableViewDataSource for PluginsWindow {
+    unsafe impl NSTableViewDataSource for PluginsPage {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows(&self, _table: &NSTableView) -> isize {
             self.ivars().rows.borrow().len() as isize
@@ -298,7 +297,7 @@ define_class!(
         }
     }
 
-    impl PluginsWindow {
+    impl PluginsPage {
         #[unsafe(method(toggleSelected:))]
         fn toggle_selected(&self, _sender: &NSControl) {
             let Some(plugin) = self.selected() else {
@@ -376,50 +375,26 @@ define_class!(
     }
 );
 
-impl PluginsWindow {
-    pub fn new(app: &std::rc::Rc<crate::app::App>, mtm: MainThreadMarker) -> Retained<Self> {
+impl PluginsPage {
+    /// Build the page into a view of `size`, the content pane the main window
+    /// has to give it.
+    pub fn new(
+        app: &std::rc::Rc<crate::app::App>,
+        mtm: MainThreadMarker,
+        size: NSSize,
+    ) -> Retained<Self> {
         let engine = Arc::clone(app.engine());
 
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
-                ),
-                NSWindowStyleMask::Titled
-                    | NSWindowStyleMask::Closable
-                    | NSWindowStyleMask::Miniaturizable
-                    | NSWindowStyleMask::Resizable,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
-        window.setTitle(&NSString::from_str("OpenFlow Plugins"));
-        unsafe { window.setReleasedWhenClosed(false) };
-        window.setMinSize(NSSize::new(520.0, 280.0));
-        window.center();
-
-        let (scroll, controls) = build_content(mtm);
-        if let Some(content) = window.contentView() {
-            content.addSubview(&scroll);
-            content.addSubview(&controls.toggle);
-            content.addSubview(&controls.install);
-            content.addSubview(&controls.reveal);
-            content.addSubview(&controls.status);
-        }
+        let (view, controls) = build_content(mtm, size);
 
         let this = Self::alloc(mtm).set_ivars(PluginsIvars {
             engine,
-            window,
+            view,
             controls,
             rows: RefCell::new(Vec::new()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
-        this.ivars()
-            .window
-            .setDelegate(Some(ProtocolObject::from_ref(&*this)));
         let table = &this.ivars().controls.table;
         // Weak property: the table does not retain us.
         unsafe { table.setDataSource(Some(ProtocolObject::from_ref(&*this))) };
@@ -443,17 +418,13 @@ impl PluginsWindow {
         }
     }
 
-    /// On screen, as the Dock-icon rule reads it.
-    pub fn is_visible(&self) -> bool {
-        self.ivars().window.isVisible()
+    /// The view the main window installs in its content pane.
+    pub fn view(&self) -> Retained<NSView> {
+        self.ivars().view.clone()
     }
 
-    pub fn present(&self) {
-        crate::ui::present_window(&self.ivars().window, "plugins");
-    }
-
-    /// Re-read the plugin directory. Called when the window opens and after
-    /// every change this window makes; nothing else writes it.
+    /// Re-read the plugin directory. Called when the page is shown and after
+    /// every change this page makes; nothing else writes it.
     pub fn load(&self) {
         let ivars = self.ivars();
         let plugins = ivars.engine.plugins().list_plugins();
@@ -461,7 +432,22 @@ impl PluginsWindow {
         *ivars.rows.borrow_mut() = plugins;
         ivars.controls.table.reloadData();
         self.update_toggle();
-        self.say(&status_line(count));
+        // The empty state carries the sentence when there is nothing to list,
+        // so the line under the card would only repeat it.
+        ivars.controls.empty.set_hidden(count > 0);
+        ivars
+            .controls
+            .table
+            .enclosingScrollView()
+            .inspect(|scroll| {
+                scroll.setHidden(count == 0);
+            });
+        let line = if count == 0 {
+            String::new()
+        } else {
+            status_line(count)
+        };
+        self.say(&line);
     }
 
     fn update_toggle(&self) {
@@ -522,14 +508,69 @@ impl PluginsWindow {
 
 // ── Layout ────────────────────────────────────────────────
 
-fn build_content(mtm: MainThreadMarker) -> (Retained<NSScrollView>, Controls) {
-    let scroll = NSScrollView::initWithFrame(
-        NSScrollView::alloc(mtm),
-        NSRect::new(NSPoint::new(16.0, 56.0), NSSize::new(608.0, 328.0)),
+/// Lay the page out into a view of `size`. Same shape as History's: a card
+/// holding the list, a row of verbs under it, and a margin all the way round.
+fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Controls) {
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), size),
     );
+    let inner = size.width - MARGIN * 2.0;
+
+    // ── Bottom row: the verbs, and the status line above them ──
+    let mut x = MARGIN;
+    let mut action = |title: &str, width: f64| {
+        let control = button(
+            mtm,
+            NSRect::new(NSPoint::new(x, MARGIN), NSSize::new(width, 26.0)),
+            title,
+            0,
+        );
+        control.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+        x += width + 8.0;
+        control
+    };
+    let toggle = action("Enable", 90.0);
+    let install = action("Install from folder", 150.0);
+    let reveal = action("Reveal in Finder", 140.0);
+
+    let status = note(
+        mtm,
+        "",
+        NSRect::new(
+            NSPoint::new(MARGIN, MARGIN + 30.0),
+            NSSize::new(inner, 16.0),
+        ),
+    );
+    status.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+
+    // ── The list, on a card above them ──
+    let card_bottom = MARGIN + 30.0 + 16.0 + GAP;
+    let card_height = (size.height - MARGIN - card_bottom).max(0.0);
+    let card = Card::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(MARGIN, card_bottom),
+            NSSize::new(inner, card_height),
+        ),
+    );
+    card.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    let table_frame = NSRect::new(
+        NSPoint::new(TABLE_INSET, TABLE_INSET),
+        NSSize::new(
+            (inner - TABLE_INSET * 2.0).max(0.0),
+            (card_height - TABLE_INSET * 2.0).max(0.0),
+        ),
+    );
+    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), table_frame);
     let table = NSTableView::initWithFrame(
         NSTableView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(608.0, 328.0)),
+        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
     );
     for (identifier, title, width) in [
         (COLUMN_NAME, "Plugin", 130.0),
@@ -546,44 +587,41 @@ fn build_content(mtm: MainThreadMarker) -> (Retained<NSScrollView>, Controls) {
         column.setTitle(&NSString::from_str(title));
         table.addTableColumn(&column);
     }
-    table.setUsesAlternatingRowBackgroundColors(true);
+    table.setStyle(NSTableViewStyle::Inset);
+    table.setUsesAlternatingRowBackgroundColors(false);
     table.setAllowsMultipleSelection(false);
     scroll.setHasVerticalScroller(true);
-    scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
+    scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
+    scroll.setDrawsBackground(false);
     scroll.setDocumentView(Some(&table));
     scroll.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
+    card.addSubview(&scroll);
 
-    let mut x = 16.0;
-    let mut action = |title: &str, width: f64| {
-        let control = button(
-            mtm,
-            NSRect::new(NSPoint::new(x, 14.0), NSSize::new(width, 26.0)),
-            title,
-            0,
-        );
-        control.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
-        x += width + 8.0;
-        control
-    };
-    let toggle = action("Enable", 90.0);
-    let install = action("Install from folder", 150.0);
-    let reveal = action("Reveal in Finder", 140.0);
-
-    let status = note(
+    // Sits over the table, in the card, and takes its place when the list is
+    // empty. The status line below then says nothing rather than saying the
+    // same sentence twice.
+    let empty = empty_state(
         mtm,
-        "",
-        NSRect::new(NSPoint::new(16.0, 44.0), NSSize::new(608.0, 16.0)),
+        table_frame,
+        "puzzlepiece.extension",
+        "No plugins yet",
+        "Install one from a folder holding a manifest.json.",
     );
-    status.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
-    );
+    card.addSubview(&empty.view);
+
+    view.addSubview(&card);
+    view.addSubview(&toggle);
+    view.addSubview(&install);
+    view.addSubview(&reveal);
+    view.addSubview(&status);
 
     (
-        scroll,
+        view,
         Controls {
             table,
+            empty,
             status,
             toggle,
             install,

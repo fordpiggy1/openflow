@@ -19,6 +19,7 @@ pub const RECENTS: usize = 20;
 /// Where a recent's preview is cut, matching the same function.
 pub const PREVIEW_CHARS: usize = 40;
 
+const ID_MAIN: &str = "main";
 const ID_SETTINGS: &str = "settings";
 const ID_HISTORY: &str = "history";
 const ID_PLUGINS: &str = "plugins";
@@ -130,21 +131,30 @@ fn build_menu(engine: &Arc<Engine>, state: RecordingState) -> Result<(Menu, Menu
     }
 
     append(&PredefinedMenuItem::separator())?;
+    // The window first, then the pages inside it. History and Plugins are no
+    // longer windows of their own: they open the main window on that page,
+    // which is why they keep their names but lose their ellipses.
     append(&MenuItem::with_id(
-        MenuId::new(ID_SETTINGS),
-        "Settings...",
+        MenuId::new(ID_MAIN),
+        "Open OpenFlow",
         true,
         None,
     ))?;
     append(&MenuItem::with_id(
         MenuId::new(ID_HISTORY),
-        "History...",
+        "History",
         true,
         None,
     ))?;
     append(&MenuItem::with_id(
         MenuId::new(ID_PLUGINS),
-        "Plugins...",
+        "Plugins",
+        true,
+        None,
+    ))?;
+    append(&MenuItem::with_id(
+        MenuId::new(ID_SETTINGS),
+        "Settings...",
         true,
         None,
     ))?;
@@ -181,6 +191,8 @@ pub fn install_handler() {
         crate::trace!("tray click id={}", id);
         crate::events::on_main(move || {
             crate::app::with_app(|app| match id.as_str() {
+                // No page named: the window reopens where the user left it.
+                ID_MAIN => app.handle_event(EngineEvent::Navigate("main".to_string())),
                 // No tab: the window reopens where the user left it.
                 ID_SETTINGS => app.handle_event(EngineEvent::Navigate("settings".to_string())),
                 ID_HISTORY => app.handle_event(EngineEvent::Navigate("history".to_string())),

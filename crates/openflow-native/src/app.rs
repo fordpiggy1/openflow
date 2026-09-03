@@ -37,9 +37,8 @@ use crate::instance::InstanceLock;
 use crate::overlay::{Outcome, Overlay};
 use crate::tray::Tray;
 use crate::tts_player::TtsPlayer;
-use crate::ui::history::HistoryWindow;
+use crate::ui::main_window::MainWindow;
 use crate::ui::onboarding::OnboardingWindow;
-use crate::ui::plugins::PluginsWindow;
 use crate::ui::settings::SettingsWindow;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
@@ -103,10 +102,13 @@ pub struct App {
     tts: TtsPlayer,
     // One slot per window, each built on first use and kept: closing hides,
     // so reopening from the menu bar is instant and no state is rebuilt.
+    //
+    // Three slots, not five. Dictate, History and Plugins are pages of `main`
+    // now rather than windows of their own; Settings is still separate, and
+    // moving it in is the next change rather than this one.
+    main: RefCell<Option<Retained<MainWindow>>>,
     settings: RefCell<Option<Retained<SettingsWindow>>>,
     onboarding: RefCell<Option<Retained<OnboardingWindow>>>,
-    history: RefCell<Option<Retained<HistoryWindow>>>,
-    plugins: RefCell<Option<Retained<PluginsWindow>>>,
     mtm: MainThreadMarker,
 }
 
@@ -141,7 +143,7 @@ impl App {
         window.as_deref().map(body)
     }
 
-    /// True while any of the four windows is on screen.
+    /// True while any of the three windows is on screen.
     ///
     /// Asks the windows rather than counting opens and closes: they are hidden
     /// rather than closed and can be ordered out by AppKit itself, and a
@@ -153,10 +155,33 @@ impl App {
         ) -> bool {
             slot.borrow().as_deref().is_some_and(is_visible)
         }
-        visible(&self.settings, |w| w.is_visible())
+        visible(&self.main, |w| w.is_visible())
+            || visible(&self.settings, |w| w.is_visible())
             || visible(&self.onboarding, |w| w.is_visible())
-            || visible(&self.history, |w| w.is_visible())
-            || visible(&self.plugins, |w| w.is_visible())
+    }
+
+    /// Run `body` against the main window if it has been built.
+    pub fn with_main<R>(&self, body: impl FnOnce(&MainWindow) -> R) -> Option<R> {
+        let window = self.main.borrow().clone();
+        window.as_deref().map(body)
+    }
+
+    /// Show the main window, building it on first use, on `page`. `None` leaves
+    /// it on whichever page the user left it.
+    pub fn show_main(self: &Rc<Self>, page: Option<&str>) {
+        // The borrow ends before the window is touched, for the reason spelled
+        // out on `show_settings`: building and presenting run AppKit code that
+        // can call straight back in here.
+        let window = {
+            let mut slot = self.main.borrow_mut();
+            slot.get_or_insert_with(|| MainWindow::new(self, self.mtm))
+                .clone()
+        };
+        if let Some(page) = page {
+            window.show_named(page);
+        }
+        window.reload();
+        window.present();
     }
 
     /// Show the setup wizard, building it on first use, from the front.
@@ -169,34 +194,6 @@ impl App {
                 .clone()
         };
         window.reload();
-        window.present();
-    }
-
-    /// Run `body` against the history window if it has been built.
-    pub fn with_history<R>(&self, body: impl FnOnce(&HistoryWindow) -> R) -> Option<R> {
-        let window = self.history.borrow().clone();
-        window.as_deref().map(body)
-    }
-
-    /// Show the history window, building it on first use.
-    pub fn show_history(self: &Rc<Self>) {
-        let window = {
-            let mut slot = self.history.borrow_mut();
-            slot.get_or_insert_with(|| HistoryWindow::new(self, self.mtm))
-                .clone()
-        };
-        window.load();
-        window.present();
-    }
-
-    /// Show the plugins window, building it on first use.
-    pub fn show_plugins(self: &Rc<Self>) {
-        let window = {
-            let mut slot = self.plugins.borrow_mut();
-            slot.get_or_insert_with(|| PluginsWindow::new(self, self.mtm))
-                .clone()
-        };
-        window.load();
         window.present();
     }
 
@@ -230,6 +227,7 @@ impl App {
                 // rather than inventing a fourth pill.
                 self.overlay.set_state(state);
                 self.tray.set_status(state);
+                self.with_main(|window| window.set_state(state));
             }
             EngineEvent::TranscriptionResult(transcription) => {
                 let text = transcription
@@ -238,6 +236,9 @@ impl App {
                     .unwrap_or(&transcription.raw_text);
                 self.notify("OpenFlow", &first_line(text));
                 self.overlay.show_outcome(Outcome::Done);
+                // The web screen's result button, which says the text is on the
+                // clipboard because the pipeline has just put it there.
+                self.with_main(|window| window.dictate().set_last(text, "Copied to clipboard"));
             }
             // The pill owns this one entirely: a reading of a recording still
             // in progress is never notified, saved or typed.
@@ -255,12 +256,16 @@ impl App {
                 self.overlay.show_outcome(Outcome::Error);
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
-            // The recents menu and the History window are the two surfaces
-            // holding a copy of the list, and both re-read it here. The window
-            // re-runs its own search, so a filtered list stays filtered.
+            // The recents menu and the main window are the two surfaces
+            // holding a copy of the list, and both re-read it here. The page
+            // re-runs its own search, so a filtered list stays filtered, and
+            // Dictate re-reads the newest row for its result card.
             EngineEvent::HistoryChanged => {
                 self.tray.rebuild(&self.engine);
-                self.with_history(|window| window.load());
+                self.with_main(|window| {
+                    window.history().load();
+                    window.dictate().load();
+                });
             }
             EngineEvent::TtsStarted(started) => self.tts.started(&started),
             EngineEvent::TtsChunk(chunk) => self.tts.chunk(&chunk),
@@ -304,8 +309,9 @@ impl App {
                 // reopens where the user left it.
                 "settings" => self.show_settings(None),
                 "onboarding" => self.show_onboarding(),
-                "history" => self.show_history(),
-                "plugins" => self.show_plugins(),
+                "main" => self.show_main(None),
+                "history" => self.show_main(Some("history")),
+                "plugins" => self.show_main(Some("plugins")),
                 tab => self.show_settings(Some(tab)),
             },
         }
@@ -437,7 +443,7 @@ define_class!(
             crate::trace!("reopen");
             // Same present path as the tray, so the reopen click brings the
             // window to the active Space and the app forward with it.
-            with_app(|app| app.show_settings(None));
+            with_app(|app| app.show_main(None));
             true
         }
     }
@@ -476,10 +482,9 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         tray,
         hotkeys: RefCell::new(hotkeys),
         tts,
+        main: RefCell::new(None),
         settings: RefCell::new(None),
         onboarding: RefCell::new(None),
-        history: RefCell::new(None),
-        plugins: RefCell::new(None),
         mtm,
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
@@ -491,16 +496,16 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     apply_theme(app.engine.settings().theme().as_deref(), mtm);
     app.overlay.apply_visibility_setting();
     // A fresh install has no provider saved, and setup is what it needs first.
-    // Otherwise open Settings, because the Tauri build's main window is
-    // `"visible": true` in `tauri.conf.json` and so puts a window up on every
-    // launch. An accessory app that draws nothing but a menu bar item looks
-    // like a launch that failed, which is what a smoke run reported. The tray
-    // stays the way in and out afterwards; this is the launch presentation
-    // only.
+    // Otherwise open the main window, because the Tauri build's window is
+    // `"visible": true` in `tauri.conf.json` and so puts one up on every
+    // launch, on its main screen. An accessory app that draws nothing but a
+    // menu bar item looks like a launch that failed, which is what a smoke run
+    // reported. Until this window existed the stand-in was Settings, which
+    // opened the app on its own preferences; now there is a screen to land on.
     if !app.engine.settings().onboarding_complete() {
         app.show_onboarding();
     } else {
-        app.show_settings(None);
+        app.show_main(None);
     }
     Ok(())
 }

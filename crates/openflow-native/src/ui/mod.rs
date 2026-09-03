@@ -1,10 +1,17 @@
 //! Stock AppKit controls, laid out by hand.
 //!
-//! No auto layout: every window here is a fixed size with a two-column form, so
-//! frames are shorter to read than constraints and there is nothing to solve at
-//! run time.
+//! No auto layout anywhere in this crate: frames are shorter to read than
+//! constraints and there is nothing to solve at run time. Windows that are a
+//! two-column form are a fixed size and set their frames outright; the main
+//! window's pages are handed the size of the pane they were given and spring
+//! off it with autoresizing masks. `NSSplitViewController` does use auto layout
+//! to place its own two panes, but that stops at the pane -- no view here mixes
+//! the two models.
 
+pub mod card;
+pub mod dictate;
 pub mod history;
+pub mod main_window;
 pub mod onboarding;
 pub mod plugins;
 pub mod recorder;
@@ -14,9 +21,10 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAnimationContext, NSApplication, NSBezelStyle, NSButton, NSComboBox, NSControl, NSFont,
-    NSPopUpButton, NSScrollView, NSSecureTextField, NSSwitch, NSTextAlignment, NSTextField,
-    NSTextView, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSAnimationContext, NSApplication, NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSColor,
+    NSComboBox, NSControl, NSFont, NSImage, NSImageSymbolConfiguration, NSImageView, NSPopUpButton,
+    NSScrollView, NSSecureTextField, NSSwitch, NSTextAlignment, NSTextField, NSTextView, NSView,
+    NSWindow, NSWindowCollectionBehavior,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -177,6 +185,130 @@ impl Form {
 
     pub fn add(&self, view: &NSView) {
         self.view.addSubview(view);
+    }
+}
+
+/// A four-way spring: the horizontal margins keep a block centred as its
+/// container widens, and the vertical ones share the extra height out rather
+/// than letting it drift to one edge.
+pub const CENTRED: NSAutoresizingMaskOptions = NSAutoresizingMaskOptions(
+    NSAutoresizingMaskOptions::ViewMinXMargin.0
+        | NSAutoresizingMaskOptions::ViewMaxXMargin.0
+        | NSAutoresizingMaskOptions::ViewMinYMargin.0
+        | NSAutoresizingMaskOptions::ViewMaxYMargin.0,
+);
+
+/// The block an empty list shows in place of its rows: a symbol, a headline,
+/// and the one line that says what would put something in it.
+///
+/// It goes *inside* the card, where the rows would have been. Both list pages
+/// used to say this under the table instead, which leaves the eye a framed
+/// rectangle of nothing with a caption beneath it -- the caption explains the
+/// emptiness from outside it, and the emptiness stays the biggest thing on the
+/// screen. The system's own empty lists put the sentence where the content
+/// would be, and so does this.
+///
+/// The caller hides and shows it, and may rewrite the two lines: an empty list
+/// and a search that found nothing are both empty, and saying so in the same
+/// words would lose the difference between them.
+pub struct EmptyState {
+    pub view: Retained<NSView>,
+    headline: Retained<NSTextField>,
+    detail: Retained<NSTextField>,
+}
+
+impl EmptyState {
+    pub fn say(&self, headline: &str, detail: &str) {
+        self.headline.setStringValue(&NSString::from_str(headline));
+        self.detail.setStringValue(&NSString::from_str(detail));
+    }
+
+    pub fn set_hidden(&self, hidden: bool) {
+        self.view.setHidden(hidden);
+    }
+}
+
+pub fn empty_state(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    symbol: &str,
+    headline: &str,
+    detail: &str,
+) -> EmptyState {
+    let holder = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    holder.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    const GLYPH: f64 = 38.0;
+    const HEADLINE: f64 = 22.0;
+    const DETAIL: f64 = 16.0;
+    const BLOCK: f64 = GLYPH + 12.0 + HEADLINE + 4.0 + DETAIL;
+
+    let width = frame.size.width;
+    // Laid out downwards from the top of a block centred in the frame.
+    let mut y = (frame.size.height + BLOCK) / 2.0;
+
+    let glyph = NSImageView::initWithFrame(
+        NSImageView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new((width - GLYPH) / 2.0, y - GLYPH),
+            NSSize::new(GLYPH, GLYPH),
+        ),
+    );
+    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(symbol),
+        Some(&NSString::from_str(headline)),
+    ) {
+        glyph.setImage(Some(&image));
+        // `NSFontWeight` is a bare `CGFloat`; 0.0 is the regular weight.
+        glyph.setSymbolConfiguration(Some(
+            &NSImageSymbolConfiguration::configurationWithPointSize_weight(GLYPH - 8.0, 0.0),
+        ));
+        // Tertiary, not the accent colour: nothing here is being pointed at.
+        glyph.setContentTintColor(Some(&NSColor::tertiaryLabelColor()));
+    }
+    glyph.setAutoresizingMask(CENTRED);
+    holder.addSubview(&glyph);
+    y -= GLYPH + 12.0;
+
+    let title = NSTextField::labelWithString(&NSString::from_str(headline), mtm);
+    title.setFrame(NSRect::new(
+        NSPoint::new(0.0, y - HEADLINE),
+        NSSize::new(width, HEADLINE),
+    ));
+    title.setAlignment(NSTextAlignment::Center);
+    title.setFont(Some(&NSFont::systemFontOfSize(15.0)));
+    title.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    title.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewMinYMargin
+            | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    holder.addSubview(&title);
+    y -= HEADLINE + 4.0;
+
+    let line = NSTextField::labelWithString(&NSString::from_str(detail), mtm);
+    line.setFrame(NSRect::new(
+        NSPoint::new(0.0, y - DETAIL),
+        NSSize::new(width, DETAIL),
+    ));
+    line.setAlignment(NSTextAlignment::Center);
+    line.setFont(Some(&NSFont::systemFontOfSize(
+        NSFont::smallSystemFontSize(),
+    )));
+    line.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+    line.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewMinYMargin
+            | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    holder.addSubview(&line);
+
+    EmptyState {
+        view: holder,
+        headline: title,
+        detail: line,
     }
 }
 
