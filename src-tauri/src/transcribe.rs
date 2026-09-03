@@ -533,12 +533,23 @@ pub fn speech_mime(format: &str) -> &'static str {
     }
 }
 
+/// One client for the life of the process. Building a `reqwest::Client`
+/// constructs a TLS configuration and a connection pool each time; doing that
+/// per request cost a fresh TCP and TLS handshake on every call and threw the
+/// pool away before the next one could reuse it.
 fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .user_agent("OpenFlow/0.1")
-        .build()
-        .map_err(|error| format!("Could not initialize network client: {}", error))
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .user_agent("OpenFlow/0.1")
+                .build()
+                .map_err(|error| format!("Could not initialize network client: {}", error))
+        })
+        .clone()
 }
 
 /// Attaches the Authorization header only when there is a key to attach.
