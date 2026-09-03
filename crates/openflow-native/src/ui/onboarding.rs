@@ -39,8 +39,8 @@ use openflow_core::transcribe::ModelInfo;
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::settings::{join_provider, split_provider};
 use crate::ui::{
-    button, combo, label, note, popup, radio, secure_field, switch_control, text_field, wire, Form,
-    ROW,
+    button, combo, label, note, popup, radio, secure_field, switch_control, text_field, wire, wrap,
+    Form, ROW,
 };
 
 const WINDOW_WIDTH: f64 = 520.0;
@@ -1211,15 +1211,22 @@ fn build_provider(
         TAG_LOCAL_CARD,
     );
     form.add(&local_card);
-    let frame = form.full(28.0);
-    form.add(&note(
+    // The sentence under the card is 607pt of text in a 468pt column, in a row
+    // that was tall enough for two lines but never had wrapping turned on. So
+    // it drew as one line and was cut mid-word: "...No key, no network, and no
+    // audio leaves the machine. Needs Pyth". Wrapped, it is 26pt -- which is
+    // what the 28 was guessing at -- so the row is measured rather than guessed.
+    let note_x = frame.origin.x + 20.0;
+    let note_width = STEP_WIDTH - 20.0 - frame.origin.x;
+    let local_note = note(
         mtm,
         LOCAL_CARD_DESCRIPTION,
-        NSRect::new(
-            NSPoint::new(frame.origin.x + 20.0, frame.origin.y),
-            NSSize::new(STEP_WIDTH - 20.0 - frame.origin.x, 28.0),
-        ),
-    ));
+        NSRect::new(NSPoint::new(note_x, 0.0), NSSize::new(note_width, 14.0)),
+    );
+    wrap(&local_note, note_width);
+    let frame = form.full(local_note.frame().size.height);
+    local_note.setFrameOrigin(NSPoint::new(note_x, frame.origin.y));
+    form.add(&local_note);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Same for cleanup", l));
