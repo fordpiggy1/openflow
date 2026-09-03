@@ -299,6 +299,13 @@ define_class!(
             self.request_models();
         }
 
+        #[unsafe(method(runSetup:))]
+        fn run_setup(&self, _sender: &NSControl) {
+            // The wizard writes the same rows this window does, so hand it the
+            // window and let `reload` pick the result up when it comes back.
+            crate::app::with_app(|app| app.show_onboarding());
+        }
+
         #[unsafe(method(previewVoice:))]
         fn preview_voice(&self, _sender: &NSControl) {
             self.start_preview();
@@ -1232,8 +1239,23 @@ fn build_tabs(
     form.add(&chat_model);
 
     let c = form.control_only(ROW);
-    let fetch = button(mtm, c, "Fetch models", TAG_FETCH_MODELS);
+    let fetch = button(
+        mtm,
+        NSRect::new(c.origin, NSSize::new(130.0, c.size.height)),
+        "Fetch models",
+        TAG_FETCH_MODELS,
+    );
     form.add(&fetch);
+    let setup = button(
+        mtm,
+        NSRect::new(
+            NSPoint::new(c.origin.x + 138.0, c.origin.y),
+            NSSize::new(130.0, c.size.height),
+        ),
+        "Run setup again",
+        0,
+    );
+    form.add(&setup);
     let n = form.control_only(28.0);
     let models_status = note(mtm, "", n);
     form.add(&models_status);
@@ -1389,14 +1411,15 @@ fn build_tabs(
         save_history,
         retention,
         history_status,
-        actions: vec![fetch, play, stop, clear],
+        actions: vec![fetch, setup, play, stop, clear],
     };
     (general, providers, voice, privacy, controls)
 }
 
 /// The action buttons, in the order `build_tabs` creates them.
-const ACTION_SELECTORS: [fn() -> Sel; 4] = [
+const ACTION_SELECTORS: [fn() -> Sel; 5] = [
     || sel!(fetchModels:),
+    || sel!(runSetup:),
     || sel!(previewVoice:),
     || sel!(stopVoice:),
     || sel!(clearHistory:),

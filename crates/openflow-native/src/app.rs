@@ -37,6 +37,7 @@ use crate::instance::InstanceLock;
 use crate::overlay::Overlay;
 use crate::tray::Tray;
 use crate::tts_player::TtsPlayer;
+use crate::ui::onboarding::OnboardingWindow;
 use crate::ui::settings::SettingsWindow;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
@@ -68,7 +69,10 @@ pub struct App {
     tray: Tray,
     hotkeys: RefCell<Hotkeys>,
     tts: TtsPlayer,
+    // One slot per window, each built on first use and kept: closing hides,
+    // so reopening from the menu bar is instant and no state is rebuilt.
     settings: RefCell<Option<Retained<SettingsWindow>>>,
+    onboarding: RefCell<Option<Retained<OnboardingWindow>>>,
     mtm: MainThreadMarker,
 }
 
@@ -95,6 +99,25 @@ impl App {
     pub fn with_settings<R>(&self, body: impl FnOnce(&SettingsWindow) -> R) -> Option<R> {
         let window = self.settings.borrow().clone();
         window.as_deref().map(body)
+    }
+
+    /// Run `body` against the onboarding window if it has been built.
+    pub fn with_onboarding<R>(&self, body: impl FnOnce(&OnboardingWindow) -> R) -> Option<R> {
+        let window = self.onboarding.borrow().clone();
+        window.as_deref().map(body)
+    }
+
+    /// Show the setup wizard, building it on first use, from the front.
+    pub fn show_onboarding(self: &Rc<Self>) {
+        // Same narrowed borrow as `show_settings`: building, reloading and
+        // presenting all run AppKit code that can call back in here.
+        let window = {
+            let mut slot = self.onboarding.borrow_mut();
+            slot.get_or_insert_with(|| OnboardingWindow::new(self, self.mtm))
+                .clone()
+        };
+        window.reload();
+        window.present();
     }
 
     /// Show the settings window, building it on first use, and select `tab`.
@@ -179,6 +202,7 @@ impl App {
                 // The menu bar's Settings item names no tab, so the window
                 // reopens where the user left it.
                 "settings" => self.show_settings(None),
+                "onboarding" => self.show_onboarding(),
                 tab => self.show_settings(Some(tab)),
             },
         }
@@ -312,6 +336,7 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         hotkeys: RefCell::new(hotkeys),
         tts,
         settings: RefCell::new(None),
+        onboarding: RefCell::new(None),
         mtm,
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
@@ -320,12 +345,15 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     // click during startup cannot reach a half-built state.
     crate::hotkeys::install_handler();
     crate::tray::install_handler();
+    // Key equivalents only exist if there is a main menu to route them
+    // through, even though an accessory app never draws one.
+    crate::menu::install(mtm);
 
     apply_theme(app.engine.settings().theme().as_deref(), mtm);
     app.overlay.apply_visibility_setting();
     // A fresh install has no provider saved, and setup is what it needs first.
     if !app.engine.settings().onboarding_complete() {
-        app.show_settings(Some("Providers"));
+        app.show_onboarding();
     }
     Ok(())
 }

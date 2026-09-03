@@ -4,6 +4,7 @@
 //! frames are shorter to read than constraints and there is nothing to solve at
 //! run time.
 
+pub mod onboarding;
 pub mod recorder;
 pub mod settings;
 
@@ -239,6 +240,20 @@ pub fn button(mtm: MainThreadMarker, frame: NSRect, title: &str, tag: isize) -> 
             NSFont::smallSystemFontSize(),
         )));
     }
+    button
+}
+
+/// One option of a radio group. AppKit groups radio buttons by superview and
+/// action, so every option in a group has to be added to the same view and
+/// wired to the same selector; the tag says which one was picked.
+pub fn radio(mtm: MainThreadMarker, frame: NSRect, title: &str, tag: isize) -> Retained<NSButton> {
+    let button = NSButton::initWithFrame(NSButton::alloc(mtm), frame);
+    button.setButtonType(objc2_app_kit::NSButtonType::Radio);
+    button.setTitle(&NSString::from_str(title));
+    button.setTag(tag);
+    button.setFont(Some(&NSFont::systemFontOfSize(
+        NSFont::smallSystemFontSize(),
+    )));
     button
 }
 
