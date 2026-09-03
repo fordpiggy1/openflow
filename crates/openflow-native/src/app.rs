@@ -37,6 +37,9 @@ use crate::instance::InstanceLock;
 use crate::overlay::{Outcome, Overlay};
 use crate::tray::Tray;
 use crate::tts_player::TtsPlayer;
+use crate::ui::history::HistoryWindow;
+use crate::ui::onboarding::OnboardingWindow;
+use crate::ui::plugins::PluginsWindow;
 use crate::ui::settings::SettingsWindow;
 
 /// The bundle identifier the Tauri build uses, so both read one database and
@@ -68,7 +71,12 @@ pub struct App {
     tray: Tray,
     hotkeys: RefCell<Hotkeys>,
     tts: TtsPlayer,
+    // One slot per window, each built on first use and kept: closing hides,
+    // so reopening from the menu bar is instant and no state is rebuilt.
     settings: RefCell<Option<Retained<SettingsWindow>>>,
+    onboarding: RefCell<Option<Retained<OnboardingWindow>>>,
+    history: RefCell<Option<Retained<HistoryWindow>>>,
+    plugins: RefCell<Option<Retained<PluginsWindow>>>,
     mtm: MainThreadMarker,
 }
 
@@ -95,6 +103,53 @@ impl App {
     pub fn with_settings<R>(&self, body: impl FnOnce(&SettingsWindow) -> R) -> Option<R> {
         let window = self.settings.borrow().clone();
         window.as_deref().map(body)
+    }
+
+    /// Run `body` against the onboarding window if it has been built.
+    pub fn with_onboarding<R>(&self, body: impl FnOnce(&OnboardingWindow) -> R) -> Option<R> {
+        let window = self.onboarding.borrow().clone();
+        window.as_deref().map(body)
+    }
+
+    /// Show the setup wizard, building it on first use, from the front.
+    pub fn show_onboarding(self: &Rc<Self>) {
+        // Same narrowed borrow as `show_settings`: building, reloading and
+        // presenting all run AppKit code that can call back in here.
+        let window = {
+            let mut slot = self.onboarding.borrow_mut();
+            slot.get_or_insert_with(|| OnboardingWindow::new(self, self.mtm))
+                .clone()
+        };
+        window.reload();
+        window.present();
+    }
+
+    /// Run `body` against the history window if it has been built.
+    pub fn with_history<R>(&self, body: impl FnOnce(&HistoryWindow) -> R) -> Option<R> {
+        let window = self.history.borrow().clone();
+        window.as_deref().map(body)
+    }
+
+    /// Show the history window, building it on first use.
+    pub fn show_history(self: &Rc<Self>) {
+        let window = {
+            let mut slot = self.history.borrow_mut();
+            slot.get_or_insert_with(|| HistoryWindow::new(self, self.mtm))
+                .clone()
+        };
+        window.load();
+        window.present();
+    }
+
+    /// Show the plugins window, building it on first use.
+    pub fn show_plugins(self: &Rc<Self>) {
+        let window = {
+            let mut slot = self.plugins.borrow_mut();
+            slot.get_or_insert_with(|| PluginsWindow::new(self, self.mtm))
+                .clone()
+        };
+        window.load();
+        window.present();
     }
 
     /// Show the settings window, building it on first use, and select `tab`.
@@ -152,7 +207,13 @@ impl App {
                 self.overlay.show_outcome(Outcome::Error);
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
-            EngineEvent::HistoryChanged => self.tray.rebuild(&self.engine),
+            // The recents menu and the History window are the two surfaces
+            // holding a copy of the list, and both re-read it here. The window
+            // re-runs its own search, so a filtered list stays filtered.
+            EngineEvent::HistoryChanged => {
+                self.tray.rebuild(&self.engine);
+                self.with_history(|window| window.load());
+            }
             EngineEvent::TtsStarted(started) => self.tts.started(&started),
             EngineEvent::TtsChunk(chunk) => self.tts.chunk(&chunk),
             // Both of these are written against the request id, never
@@ -186,6 +247,9 @@ impl App {
                 // The menu bar's Settings item names no tab, so the window
                 // reopens where the user left it.
                 "settings" => self.show_settings(None),
+                "onboarding" => self.show_onboarding(),
+                "history" => self.show_history(),
+                "plugins" => self.show_plugins(),
                 tab => self.show_settings(Some(tab)),
             },
         }
@@ -286,6 +350,9 @@ define_class!(
         /// here; the Tauri build opens its window on the same signal.
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
         fn should_handle_reopen(&self, _sender: &NSApplication, _has_visible: bool) -> bool {
+            crate::trace!("reopen");
+            // Same present path as the tray, so the reopen click brings the
+            // window to the active Space and the app forward with it.
             with_app(|app| app.show_settings(None));
             true
         }
@@ -304,6 +371,16 @@ impl Delegate {
 fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     let (engine, _preview) = build_engine(app_dir)?;
 
+    // The handlers go on before the things that raise events exist. Both are
+    // process-wide callbacks that hop to the main thread and then ask
+    // `with_app`, which answers `None` until the app is in its slot below, so
+    // an event raised during construction is dropped rather than reaching a
+    // half-built app. Installed the other way round, a menu click or a hotkey
+    // press between `Tray::new` and `install_handler` would have no handler at
+    // all and be lost with no trace of why.
+    crate::hotkeys::install_handler();
+    crate::tray::install_handler();
+
     let overlay = Overlay::new(&engine, mtm);
     let tray = Tray::new(&engine)?;
     let hotkeys = Hotkeys::new(engine.settings())?;
@@ -316,20 +393,22 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         hotkeys: RefCell::new(hotkeys),
         tts,
         settings: RefCell::new(None),
+        onboarding: RefCell::new(None),
+        history: RefCell::new(None),
+        plugins: RefCell::new(None),
         mtm,
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
 
-    // The handlers are installed only once the app exists, so a hotkey or menu
-    // click during startup cannot reach a half-built state.
-    crate::hotkeys::install_handler();
-    crate::tray::install_handler();
+    // Key equivalents only exist if there is a main menu to route them
+    // through, even though an accessory app never draws one.
+    crate::menu::install(mtm);
 
     apply_theme(app.engine.settings().theme().as_deref(), mtm);
     app.overlay.apply_visibility_setting();
     // A fresh install has no provider saved, and setup is what it needs first.
     if !app.engine.settings().onboarding_complete() {
-        app.show_settings(Some("Providers"));
+        app.show_onboarding();
     }
     Ok(())
 }

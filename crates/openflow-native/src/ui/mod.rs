@@ -4,14 +4,19 @@
 //! frames are shorter to read than constraints and there is nothing to solve at
 //! run time.
 
+pub mod history;
+pub mod onboarding;
+pub mod plugins;
+pub mod recorder;
 pub mod settings;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{msg_send, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAnimationContext, NSBezelStyle, NSButton, NSComboBox, NSControl, NSFont, NSPopUpButton,
-    NSScrollView, NSSecureTextField, NSSwitch, NSTextAlignment, NSTextField, NSTextView, NSView,
+    NSAnimationContext, NSApplication, NSBezelStyle, NSButton, NSComboBox, NSControl, NSFont,
+    NSPopUpButton, NSScrollView, NSSecureTextField, NSSwitch, NSTextAlignment, NSTextField,
+    NSTextView, NSView, NSWindow, NSWindowCollectionBehavior,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -23,6 +28,46 @@ pub const GAP: f64 = 10.0;
 pub const LABEL_WIDTH: f64 = 132.0;
 /// Where the control column starts.
 pub const CONTROL_X: f64 = LABEL_WIDTH + 10.0;
+
+/// Bring `window` forward from a menu bar click, the way the Tauri host does.
+///
+/// The Tauri equivalent is `WebviewWindow::show()` followed by `set_focus()`,
+/// and `set_focus` on macOS ends in `activateIgnoringOtherApps:YES` plus
+/// `makeKeyAndOrderFront:`. The first Milestone A build called only
+/// `makeKeyAndOrderFront:` and the cooperative `NSApplication::activate()`, and
+/// for an `LSUIElement` app invoked from a status item that is not enough: the
+/// app is not the active app, so the cooperative activate is declined, and the
+/// window opens unseen. Three calls fix it, and each is doing separate work:
+///
+/// - `MoveToActiveSpace` so the window follows the user to whichever Space is
+///   in front. Without it, a window ordered front while another Space is active
+///   opens on the Space it was last on, which looks exactly like nothing
+///   happening.
+/// - `FullScreenAuxiliary` so it can also open over a full-screen app. That is
+///   the reachable case here rather than a wrong one: the status item is
+///   clickable while another app is full screen, so the window the click asks
+///   for has to be able to join that Space. Without it macOS either swaps
+///   Spaces under the user or leaves the window behind.
+/// - `orderFrontRegardless` for the ordering an inactive app is otherwise
+///   refused, and `activateIgnoringOtherApps:` for the activation. Deprecated
+///   since macOS 14 in favour of the cooperative `activate`, still functional,
+///   and still what a menu bar app needs, which is why it goes through
+///   `msg_send!` rather than the deprecated binding.
+pub fn present_window(window: &NSWindow, name: &str) {
+    crate::trace!("show window={}", name);
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::MoveToActiveSpace
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    window.makeKeyAndOrderFront(None);
+    window.orderFrontRegardless();
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        // SAFETY: a no-argument-beyond-BOOL void method on NSApplication, sent
+        // on the main thread.
+        let _: () = unsafe { msg_send![&*app, activateIgnoringOtherApps: true] };
+    }
+}
 
 /// Run `body` inside an animation group of `duration` seconds. Unlike
 /// `setFrame:display:animate:` this does not block the main thread, which
@@ -197,6 +242,20 @@ pub fn button(mtm: MainThreadMarker, frame: NSRect, title: &str, tag: isize) -> 
             NSFont::smallSystemFontSize(),
         )));
     }
+    button
+}
+
+/// One option of a radio group. AppKit groups radio buttons by superview and
+/// action, so every option in a group has to be added to the same view and
+/// wired to the same selector; the tag says which one was picked.
+pub fn radio(mtm: MainThreadMarker, frame: NSRect, title: &str, tag: isize) -> Retained<NSButton> {
+    let button = NSButton::initWithFrame(NSButton::alloc(mtm), frame);
+    button.setButtonType(objc2_app_kit::NSButtonType::Radio);
+    button.setTitle(&NSString::from_str(title));
+    button.setTag(tag);
+    button.setFont(Some(&NSFont::systemFontOfSize(
+        NSFont::smallSystemFontSize(),
+    )));
     button
 }
 
