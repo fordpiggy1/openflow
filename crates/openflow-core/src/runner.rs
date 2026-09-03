@@ -783,6 +783,14 @@ impl LocalRunner {
                 }
             }
             if Instant::now() >= deadline {
+                // A claim with no child behind it, a whole window later, is a
+                // claim nobody is going to release. Left alone it would send
+                // every later start into this same wait; the owner cannot still
+                // be between claiming and spawning after all this time.
+                let mut inner = self.lock();
+                if inner.pid.is_none() {
+                    inner.starting = false;
+                }
                 return Err("Timed out waiting for the local runner to start".to_string());
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -843,6 +851,17 @@ impl LocalRunner {
         // the pid of the process that exited; this catches the case where a
         // live sidecar would otherwise be overwritten and left running with no
         // one holding its pid.
+        // This launch's identity is claimed *before* anything is killed, and
+        // the order is the whole point: the monitor of the child about to be
+        // replaced compares the id it was given against the current one, and if
+        // the kill came first it would still see its own id as current and read
+        // being replaced as having crashed -- clearing the live sidecar's pid,
+        // counting a restart and spawning a third process.
+        let launch_id = {
+            let mut inner = self.lock();
+            inner.launch_id += 1;
+            inner.launch_id
+        };
         let replaced = {
             let mut inner = self.lock();
             inner.pid.take()
@@ -883,7 +902,8 @@ impl LocalRunner {
         // check was outside: `stop` found no pid to kill because there was not
         // one yet, and the spawn stored it a moment later.
         let mut inner = self.lock();
-        if inner.generation != generation {
+        if inner.generation != generation || inner.launch_id != launch_id {
+            // Stopped, or overtaken by a launch that started after this one.
             return Err("The local runner was stopped while starting".to_string());
         }
         let mut child = Command::new(&python)
@@ -916,9 +936,7 @@ impl LocalRunner {
 
         let pid = child.id();
         inner.pid = Some(pid);
-        inner.launch_id += 1;
         inner.starting = true;
-        let launch_id = inner.launch_id;
         drop(inner);
         // Both of the supervisor's own threads hold a *weak* reference. A
         // monitor blocked in `wait` for the life of the sidecar would otherwise
@@ -956,18 +974,40 @@ impl LocalRunner {
                 let Some(runner) = runner.upgrade() else {
                     return;
                 };
-                runner.child_exited(generation, outcome.ok().and_then(|status| status.code()));
+                runner.child_exited(
+                    generation,
+                    launch_id,
+                    outcome.ok().and_then(|status| status.code()),
+                );
             })
             .map_err(|error| format!("Could not supervise the local runner: {}", error))?;
         Ok(())
     }
 
-    /// The sidecar exited. Either we asked it to, or it crashed.
-    fn child_exited(self: &Arc<Self>, generation: u64, code: Option<i32>) {
+    /// The sidecar exited. Either we asked it to, or it crashed, or it was
+    /// replaced -- and only the middle one is a reason to restart anything.
+    ///
+    /// Two identities are checked, because they mean different things. The
+    /// *generation* changes when the user stops or reconfigures the runner, and
+    /// a monitor for a process from an older generation has nothing to do. The
+    /// *launch id* changes on every spawn, so a mismatch means this child was
+    /// replaced by a newer one that is running right now: `launch` kills the
+    /// child it is about to overwrite, and without this check that kill came
+    /// back here as a crash. It would then clear `inner.pid` -- the pid of the
+    /// *live* sidecar, which the supervisor would no longer be holding -- count
+    /// a restart, wait out the backoff and spawn a third process. One kill,
+    /// three sidecars, and no way to stop two of them.
+    fn child_exited(self: &Arc<Self>, generation: u64, launch_id: u64, code: Option<i32>) {
         {
             let mut inner = self.lock();
             if inner.generation != generation {
                 // We stopped it, or reconfigured past it. Nothing to do.
+                return;
+            }
+            if inner.launch_id != launch_id {
+                // Already replaced. The newer launch owns the pid slot and its
+                // own monitor; this exit is the replacement happening, not a
+                // failure.
                 return;
             }
             inner.pid = None;
@@ -1805,7 +1845,7 @@ server.serve_forever()
             eprintln!("skipped: no python3 on this machine");
             return;
         };
-        let (runner, _recorder) = build(&fixture, &[]);
+        let (runner, recorder) = build(&fixture, &[]);
         let generation = {
             let mut inner = runner.lock();
             inner.generation += 1;
@@ -1826,8 +1866,42 @@ server.serve_forever()
             "the sidecar being replaced must be killed, not abandoned"
         );
 
+        // The kill above lands in the first child's monitor thread. It must
+        // read there as "replaced", not as "crashed": a crash would clear the
+        // pid of the sidecar that is still running, count a restart, wait out
+        // the backoff and spawn a third. Long enough here to cover the longest
+        // backoff, so a restart would have happened by now if one were coming.
+        std::thread::sleep(BACKOFF[BACKOFF.len() - 1] + Duration::from_millis(400));
+        assert_eq!(
+            runner.pid(),
+            Some(second),
+            "the supervisor must still be holding the live sidecar's pid"
+        );
+        assert!(alive(second), "and that sidecar must still be running");
+
+        // Two spawns, two Starting states. A third would mean the replacement
+        // was mistaken for a crash. Ports are not the proxy: the first child is
+        // killed before its port line can be accepted (its launch id is stale by
+        // then, which is the guard doing its job), so only one port is ever
+        // published.
+        let starts = recorder
+            .phases()
+            .iter()
+            .filter(|phase| **phase == RunnerPhase::Starting)
+            .count();
+        assert_eq!(
+            starts, 2,
+            "expected exactly two spawns, saw {starts} starting states"
+        );
+        assert_eq!(live_sidecars(&fixture.script), 1, "one live sidecar");
+
         runner.stop();
         assert!(wait_for(Duration::from_secs(5), || !alive(second)));
+        assert!(
+            wait_for(Duration::from_secs(5), || live_sidecars(&fixture.script)
+                == 0),
+            "nothing may be left running"
+        );
         let _ = std::fs::remove_dir_all(&fixture.directory);
     }
 
