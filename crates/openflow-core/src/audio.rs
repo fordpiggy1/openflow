@@ -35,13 +35,22 @@ pub struct AudioRecorder {
     level: Arc<AtomicU32>,
 }
 
-/// Where the meter bottoms out, in dBFS.
+/// Where the meter bottoms out, in dBFS: the silence gate's own line.
 ///
-/// Not -60: speech that the auto-gain will happily lift sits well below that,
-/// and a bar that spends its life in the first tenth reads as broken. The gain
-/// stage targets `TARGET_PEAK`, about -13.5 dBFS, so a normal voice lands
-/// around three quarters of the way up this scale.
-pub const METER_FLOOR_DB: f32 = -54.0;
+/// Not a number chosen for looks. `SILENCE_LEVEL` is where a take stops being
+/// worth uploading, and pinning the bar's zero to it buys a property worth
+/// having: **if the bar never moved, the take is going to be refused.** A
+/// higher floor -- -54 dBFS was the first guess here -- leaves a band where the
+/// bar reads nothing and the recording transcribes perfectly well, which is the
+/// meter lying in the one place a user would act on it.
+///
+/// Not the converse, and it cannot be: the gate measures a percentile over the
+/// whole take and this measures a peak over one buffer, so a bar that twitched
+/// once is no promise. The implication only runs one way.
+///
+/// It costs nothing to align them. The gain stage targets `TARGET_PEAK`, about
+/// -13.5 dBFS, which lands at 0.77 of this scale against 0.75 of the old one.
+pub const METER_FLOOR_DB: f32 = -60.0;
 
 /// How much of the way a falling meter travels each frame. Rising is instant:
 /// a meter that lags the transient it is meant to show is worse than none.
@@ -871,6 +880,18 @@ mod tests {
         assert_eq!(meter_fraction(-0.5), 0.0);
         assert_eq!(meter_fraction(f32::NAN), 0.0);
         assert_eq!(meter_fraction(2.0), 1.0);
+    }
+
+    /// The bar's zero is the gate's line, so "it never moved" and "that take
+    /// will be refused" are the same observation. Tied to the constant rather
+    /// than to -60 written twice, because the point is that they agree.
+    #[test]
+    fn the_meter_bottoms_out_where_the_silence_gate_does() {
+        let gate_db = 20.0 * SILENCE_LEVEL.log10();
+        assert!((gate_db - METER_FLOOR_DB).abs() < 0.01, "{gate_db}");
+        assert_eq!(meter_fraction(SILENCE_LEVEL), 0.0);
+        // And a take with room to spare over the gate is off zero.
+        assert!(meter_fraction(SILENCE_LEVEL * 2.0) > 0.0);
     }
 
     /// The scale exists to make speech visible, so the amplitude the gain stage
