@@ -336,7 +336,7 @@ define_class!(
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             self.stop_recording_hotkey();
             self.ivars().window.makeFirstResponder(None);
-            self.ivars().window.orderOut(None);
+            crate::ui::dismiss_window(&self.ivars().window, "onboarding");
             false
         }
     }
@@ -472,6 +472,11 @@ impl OnboardingWindow {
         }
         wire(&controls.refresh, target, sel!(refreshMicrophones:));
         wire(&controls.hotkey, target, sel!(recordHotkey:));
+    }
+
+    /// On screen, as the Dock-icon rule reads it.
+    pub fn is_visible(&self) -> bool {
+        self.ivars().window.isVisible()
     }
 
     pub fn present(&self) {
@@ -752,6 +757,9 @@ impl OnboardingWindow {
     /// Setup is saved: hide this window and hand the user to Settings, which
     /// reads the same rows back.
     fn finish(&self) {
+        // Ordered out directly rather than dismissed: Settings is presented on
+        // the next line, so routing through `dismiss_window` would drop the
+        // Dock icon and immediately ask for it back, which the Dock animates.
         self.ivars().window.orderOut(None);
         crate::app::with_app(|app| {
             app.with_settings(|window| window.reload());
