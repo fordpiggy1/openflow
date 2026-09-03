@@ -4,6 +4,18 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Outcome badge and live preview on the native pill
+By: Ford (with Claude)
+Impact: `crates/openflow-core/src/engine.rs`, `crates/openflow-core/src/settings.rs`, `crates/openflow-core/src/insert.rs`, `crates/openflow-native/src/overlay.rs`, `crates/openflow-native/src/app.rs`, `overlay.html`, `src-tauri/src/lib.rs`
+
+- Brings the four merged overlay and perf changes into the native host, which branched before them and so drew neither the outcome badge nor a live preview. Milestone A ships both hosts, so the native pill going quiet where the Tauri one speaks would have been a regression on arrival.
+- Reading a recording that is still running moved into the engine. `Engine::start_partials` re-transcribes the capture every `PARTIAL_INTERVAL` (800 ms) and emits `EngineEvent::TranscriptionPartial`; both hosts render it and neither owns the timing. The loop sleeps between readings rather than on a schedule, so a reading is never issued while one is outstanding -- the transcriber is serialized, and the take the user waits on at key-up can queue behind at most one. A generation counter, bumped whenever a capture starts or ends, drops a reading that was still in the air when the key came up.
+- `PARTIAL_WINDOW` retires previews after 20 s. A reading costs the take it previews, and the cost grows with the square of the recording: about 40 ms of expected delay at key-up for a 10 s dictation against 220 ms for a 38 s one, measured against a LAN 0.6B. The last reading is marked `held` and drawn dimmed, because a preview that has stopped tracking and one whose transcriber has died look alike otherwise.
+- `Outcome` is a view concern in `overlay.rs`, not a fifth `RecordingState`: the engine has no "done", and a display detail does not belong in a state machine two hosts share. Driven by the result and error events as `overlay.html` drives it, holding 1.2 s for success and 2.2 s for failure, at the resting width so the pill does not move while it is read. The `idle` that follows a result is ignored while a badge is up; the badge's own timer settles the pill.
+- The pill draws text for the first time. `draw_partial` measures the longest suffix that fits, so the words being spoken now stay on screen while the beginning scrolls out, and fades the leading edge with columns of the body colour in place of the CSS mask. The waveform's width is now derived from its bar metrics rather than written twice, since the text starts where the bars end.
+- `prewarm_typing` lands in `insert.rs` and runs from `began_capturing`, so both hosts pay the first CGEvent's ~40 ms while the user is still speaking rather than after the transcript arrives. The `live_preview` gate is a `Settings` accessor: unset means on for a self-hosted endpoint and off for a hosted one, since a request every 800 ms multiplies what one dictation bills.
+- `transcribe_partial` and `live_preview_enabled` are gone as Tauri commands; the webview overlay listens for `transcription-partial` instead of polling. One implementation, in the crate both hosts share.
+
 ### Native macOS app: Rust + AppKit, no webview (Milestone A)
 By: Titan (with Claude)
 Impact: `crates/openflow-native/*`, `crates/openflow-core/src/engine.rs`, `Cargo.toml`, `scripts/bundle-native.sh`, `README.md`
