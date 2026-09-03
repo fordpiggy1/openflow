@@ -87,9 +87,17 @@ not. The same field still goes to Whisper as a prompt on the online providers,
 so one dictionary works everywhere.
 
 **Local only** (same panel) refuses any request that would leave this Mac,
-checked against the URL before a connection is opened. It turns off cleanup and
-voice unless those are also pointed at something running here. The runner itself
-binds loopback and nothing else, so it is not reachable from another machine.
+checked against the URL before a connection is opened, and again on every
+redirect. It turns off cleanup and voice unless those are also pointed at
+something running here. The runner itself binds loopback and nothing else, so it
+is not reachable from another machine.
+
+Two things it does not cover, both by design. **Install and Download** contact
+PyPI and Hugging Face -- they are one-time steps you press a button for.
+And **enabled plugins are separate programs**: OpenFlow hands them your
+transcript over standard input and has no say in what they do with it, so a
+plugin can reach the network whatever this toggle says. Only enable plugins you
+trust.
 
 To measure it without opening a window:
 

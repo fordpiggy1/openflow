@@ -1827,6 +1827,12 @@ fn build_local_panel(
         0,
     );
     form.add(&local_stop);
+    let n = form.control_only(26.0);
+    form.add(&note(
+        mtm,
+        "Install and Download reach PyPI and Hugging Face. Local only does not cover them: they are one-time steps you ask for.",
+        n,
+    ));
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Unload after", l));

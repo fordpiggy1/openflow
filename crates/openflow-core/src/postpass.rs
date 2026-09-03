@@ -89,6 +89,14 @@ pub fn capped(dictionary: Option<&str>, limit: usize) -> Option<String> {
 pub struct Entry {
     /// What to look for, lower-cased for matching.
     pub match_lowercased: String,
+    /// The same needle as characters, split once here rather than at every
+    /// index of every transcript.
+    ///
+    /// [`apply_entries`] walks the text one character at a time and tries each
+    /// entry at each position, so building this inside that loop allocated a
+    /// `Vec` per (entry, index) pair -- for a 1 000-character transcript and
+    /// ten dictionary entries, ten thousand allocations to do nothing.
+    pub needle: Vec<char>,
     /// What to write instead.
     pub replacement: String,
 }
@@ -130,17 +138,13 @@ pub fn entries(dictionary: Option<&str>) -> Vec<Entry> {
         }
         seen.push(key.clone());
         parsed.push(Entry {
+            needle: key.chars().collect(),
             match_lowercased: key,
             replacement: replacement.to_string(),
         });
     }
     // Rule 2: longest first, stable within a length so ties keep typed order.
-    parsed.sort_by(|a, b| {
-        b.match_lowercased
-            .chars()
-            .count()
-            .cmp(&a.match_lowercased.chars().count())
-    });
+    parsed.sort_by_key(|entry| std::cmp::Reverse(entry.needle.len()));
     parsed
 }
 
@@ -174,7 +178,7 @@ pub fn apply_entries(text: &str, entries: &[Entry]) -> String {
     while index < source.len() {
         let mut matched = false;
         for entry in entries {
-            let needle: Vec<char> = entry.match_lowercased.chars().collect();
+            let needle = &entry.needle;
             if needle.is_empty() || index + needle.len() > lowered.len() {
                 continue;
             }
@@ -416,6 +420,30 @@ mod tests {
             .collect();
         multiline.sort();
         assert_eq!(multiline, ["ENTRO.LY", "FastPay", "Lark"]);
+    }
+
+    /// The parsed needle is the match, split once. If the two ever drift, rule
+    /// 2 would sort by one string while rule 1 matched another -- silently, and
+    /// only for entries whose two forms differ.
+    #[test]
+    fn every_entrys_needle_is_its_match() {
+        let parsed = entries(Some(
+            "ENTRO.LY, intro dot lie -> ENTRO.LY, iphone -> iPhone",
+        ));
+        assert!(!parsed.is_empty());
+        for entry in &parsed {
+            assert_eq!(
+                entry.needle,
+                entry.match_lowercased.chars().collect::<Vec<char>>(),
+                "{:?} matches on something other than what it sorts by",
+                entry.match_lowercased
+            );
+        }
+        // ...and rule 2 still orders by that length.
+        let lengths: Vec<usize> = parsed.iter().map(|entry| entry.needle.len()).collect();
+        let mut sorted = lengths.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(lengths, sorted, "longest first");
     }
 
     #[test]

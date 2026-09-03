@@ -502,7 +502,19 @@ fn transcribe_file(path: &str) -> i32 {
     impl EngineEvents for StderrEvents {
         fn emit(&self, event: EngineEvent) -> Result<(), String> {
             if let EngineEvent::RunnerState(status) = event {
-                eprintln!("runner {}: {}", status.phase.as_str(), status.detail);
+                // The port is part of the line because it arrives *after* the
+                // spawn -- the child picks it and prints it -- so a start
+                // reports twice, and without the port the second line reads
+                // like a second sidecar.
+                match status.port {
+                    Some(port) => eprintln!(
+                        "runner {} :{}: {}",
+                        status.phase.as_str(),
+                        port,
+                        status.detail
+                    ),
+                    None => eprintln!("runner {}: {}", status.phase.as_str(), status.detail),
+                }
             }
             Ok(())
         }

@@ -42,7 +42,7 @@ use crate::engine::{EngineEvent, EngineEvents};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, Weak};
@@ -256,6 +256,20 @@ struct Inner {
     log: VecDeque<String>,
     /// A start, install or download is already running on some thread.
     working: bool,
+    /// A spawn is in flight and has not reached ready or failed yet.
+    ///
+    /// This is what makes `start` single-flight. Without it, `prewarm` on
+    /// key-down and `ensure_ready` on key-up both saw "not ready" and both
+    /// spawned: the second overwrote the first's pid, the first's monitor saw a
+    /// generation mismatch and did nothing, and that sidecar went on to load a
+    /// model and hold 1 to 2.5 GB until the app quit, reachable by nobody.
+    starting: bool,
+    /// Set once the venv has been proven importable, so the check is not a
+    /// Python process on every key-up. Cleared by `install`.
+    installed_verified: bool,
+    /// The repo whose weights have been proven present, for the same reason.
+    /// Cleared by `download` and by a model change in `configure`.
+    model_verified: Option<String>,
 }
 
 pub struct LocalRunner {
@@ -291,6 +305,9 @@ impl LocalRunner {
                 idle_minutes: 10,
                 log: VecDeque::new(),
                 working: false,
+                starting: false,
+                installed_verified: false,
+                model_verified: None,
             }),
         })
     }
@@ -430,6 +447,16 @@ impl LocalRunner {
         }
     }
 
+    /// A spawn is no longer in flight, if the one that finished is the one
+    /// that claimed the flag. A stale readiness wait -- one whose launch has
+    /// already been replaced -- must not release a claim it does not hold.
+    fn clear_starting_for(&self, launch_id: u64) {
+        let mut inner = self.lock();
+        if inner.launch_id == launch_id {
+            inner.starting = false;
+        }
+    }
+
     fn set_phase(&self, phase: RunnerPhase, detail: &str) {
         self.update(|status| {
             status.phase = phase;
@@ -454,6 +481,10 @@ impl LocalRunner {
         let changed = {
             let mut inner = self.lock();
             let changed = inner.model_key != model_key || inner.idle_minutes != idle_minutes;
+            if inner.model_key != model_key {
+                // Different weights to prove present.
+                inner.model_verified = None;
+            }
             inner.model_key = model_key.to_string();
             inner.idle_minutes = idle_minutes;
             changed
@@ -469,6 +500,40 @@ impl LocalRunner {
     }
 
     // ── Install ───────────────────────────────────────────
+
+    /// [`LocalRunner::is_installed`], answered from the cache once it has been
+    /// true.
+    ///
+    /// The uncached check runs a Python process, and `start` runs it on the
+    /// key-up path of every dictation whose sidecar is not already up: two
+    /// interpreter launches (this and the model check) in front of the take the
+    /// user is waiting for. A venv that imports does not stop importing on its
+    /// own, so the answer is remembered until `install` runs again. Only a
+    /// *true* answer is cached: a missing venv becomes present the moment the
+    /// user presses Install, and that must be noticed.
+    fn installed_now(&self) -> bool {
+        if self.lock().installed_verified {
+            return true;
+        }
+        let verified = self.is_installed();
+        if verified {
+            self.lock().installed_verified = true;
+        }
+        verified
+    }
+
+    /// [`LocalRunner::is_model_present`], cached per repo for the same reason.
+    fn model_present_now(&self) -> bool {
+        let repo = self.model_repo();
+        if self.lock().model_verified.as_deref() == Some(repo.as_str()) {
+            return true;
+        }
+        let verified = self.is_model_present();
+        if verified {
+            self.lock().model_verified = Some(repo);
+        }
+        verified
+    }
 
     pub fn is_installed(&self) -> bool {
         let python = self.venv_python();
@@ -489,7 +554,10 @@ impl LocalRunner {
     /// without downloading anything, so pressing Install twice is free and a
     /// half-built venv is repaired by pressing it again.
     pub fn install(&self) -> Result<(), String> {
-        if self.is_installed() {
+        // Re-prove it: the point of pressing Install on a broken venv is that
+        // the cached answer is the thing being doubted.
+        self.lock().installed_verified = false;
+        if self.installed_now() {
             self.set_phase(
                 RunnerPhase::Stopped,
                 "On-device transcription is installed.",
@@ -529,7 +597,7 @@ impl LocalRunner {
                 .arg("huggingface_hub"),
             RunnerPhase::Installing,
         )?;
-        if !self.is_installed() {
+        if !self.installed_now() {
             let message = "The Python environment installed but mlx-audio will not import. Remove the runner folder in the app's data directory and try again.".to_string();
             self.set_phase(RunnerPhase::Failed, &message);
             return Err(message);
@@ -564,13 +632,14 @@ impl LocalRunner {
 
     /// Fetch the weights for the configured model. Blocking.
     pub fn download(&self) -> Result<(), String> {
-        if !self.is_installed() {
+        if !self.installed_now() {
             return Err(
                 "Install the Python environment first, then download the model.".to_string(),
             );
         }
+        self.lock().model_verified = None;
         let repo = self.model_repo();
-        if self.is_model_present() {
+        if self.model_present_now() {
             self.set_phase(RunnerPhase::Stopped, &format!("{repo} is downloaded."));
             return Ok(());
         }
@@ -583,6 +652,7 @@ impl LocalRunner {
             ]),
             RunnerPhase::Downloading,
         )?;
+        self.lock().model_verified = Some(repo.clone());
         self.set_phase(RunnerPhase::Stopped, &format!("{repo} is downloaded."));
         Ok(())
     }
@@ -659,15 +729,75 @@ impl LocalRunner {
         self.start(timeout)
     }
 
-    /// Spawn the sidecar and wait for `/health`.
+    /// Spawn the sidecar and wait for `/health`, or join a start already in
+    /// flight.
+    ///
+    /// Single-flight, and that is the whole of it: `prewarm` on key-down and
+    /// `ensure_ready` on key-up are two callers asking the same question a few
+    /// seconds apart, and the first has not finished answering when the second
+    /// arrives. Spawning twice left the first sidecar loading a model nobody
+    /// could reach and nobody would kill until quit.
     pub fn start(self: &Arc<Self>, timeout: Duration) -> Result<u16, String> {
+        {
+            let mut inner = self.lock();
+            if inner.starting {
+                drop(inner);
+                return self.wait_for_start(timeout);
+            }
+            // Claimed here rather than in `launch`, because everything between
+            // here and the spawn -- the install and model checks -- is time a
+            // second caller could walk straight through.
+            inner.starting = true;
+        }
+        let outcome = self.start_claimed(timeout);
+        if outcome.is_err() {
+            // `await_ready` clears the claim for its own launch; this covers
+            // the paths that never got that far.
+            self.lock().starting = false;
+        }
+        outcome
+    }
+
+    /// Wait out the start someone else is already running.
+    fn wait_for_start(&self, timeout: Duration) -> Result<u16, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let inner = self.lock();
+                if inner.status.phase == RunnerPhase::Ready {
+                    if let Some(port) = inner.status.port {
+                        return Ok(port);
+                    }
+                }
+                if inner.status.phase == RunnerPhase::Failed {
+                    return Err(inner.status.detail.clone());
+                }
+                if !inner.starting {
+                    // It finished, and not with a ready sidecar.
+                    let detail = inner.status.detail.clone();
+                    return Err(if detail.is_empty() {
+                        "The local runner did not start".to_string()
+                    } else {
+                        detail
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("Timed out waiting for the local runner to start".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The body of a start whose claim this caller holds.
+    fn start_claimed(self: &Arc<Self>, timeout: Duration) -> Result<u16, String> {
         let needs_install = self
             .program
             .as_ref()
             .map(|program| program.needs_install)
             .unwrap_or(true);
         if needs_install {
-            if !self.is_installed() {
+            if !self.installed_now() {
                 let message = if Self::find_python().is_some() {
                     "On-device transcription is not installed yet. Open Settings and press Install."
                         .to_string()
@@ -684,7 +814,7 @@ impl LocalRunner {
                 );
                 return Err(message);
             }
-            if !self.is_model_present() {
+            if !self.model_present_now() {
                 let message = format!(
                     "{} is not downloaded yet. Open Settings and press Download.",
                     self.model_repo()
@@ -708,16 +838,24 @@ impl LocalRunner {
     /// One spawn. Shared by the first start and every restart, so a restarted
     /// sidecar is configured exactly like the original.
     fn launch(self: &Arc<Self>, generation: u64) -> Result<(), String> {
+        // Whatever this launch is replacing dies first. On the ordinary restart
+        // path there is nothing here, because `child_exited` already cleared
+        // the pid of the process that exited; this catches the case where a
+        // live sidecar would otherwise be overwritten and left running with no
+        // one holding its pid.
+        let replaced = {
+            let mut inner = self.lock();
+            inner.pid.take()
+        };
+        if let Some(pid) = replaced {
+            terminate(pid);
+        }
+
         let (model_key, idle_minutes) = {
             let inner = self.lock();
             (inner.model_key.clone(), inner.idle_minutes)
         };
         let repo = model_for(&model_key).repo.to_string();
-        let port = free_loopback_port()?;
-        {
-            let mut inner = self.lock();
-            inner.launch_id += 1;
-        }
 
         let (python, script, extra) = match &self.program {
             Some(program) => (
@@ -732,7 +870,8 @@ impl LocalRunner {
             status.phase = RunnerPhase::Starting;
             status.detail = format!("Starting {repo}...");
             status.model = repo.clone();
-            status.port = Some(port);
+            // Unknown until the child says so; see the `--port 0` note below.
+            status.port = None;
             status.resident_bytes = None;
         });
 
@@ -749,8 +888,13 @@ impl LocalRunner {
         }
         let mut child = Command::new(&python)
             .arg(&script)
+            // The *child* picks the port. A parent that picks one has to close
+            // its listener before the child binds, and two sidecars starting at
+            // once can be handed the same number in that gap -- the loser then
+            // exits on a bind error that reads as a crash. The child asks the
+            // kernel for a port it is about to hold and prints it.
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--model")
             .arg(&repo)
             .arg("--idle-minutes")
@@ -772,6 +916,9 @@ impl LocalRunner {
 
         let pid = child.id();
         inner.pid = Some(pid);
+        inner.launch_id += 1;
+        inner.starting = true;
+        let launch_id = inner.launch_id;
         drop(inner);
         // Both of the supervisor's own threads hold a *weak* reference. A
         // monitor blocked in `wait` for the life of the sidecar would otherwise
@@ -783,10 +930,17 @@ impl LocalRunner {
             std::thread::Builder::new()
                 .name("openflow-runner-log".into())
                 .spawn(move || {
+                    let mut port_published = false;
                     for line in BufReader::new(stream).lines().map_while(Result::ok) {
                         let Some(runner) = runner.upgrade() else {
                             return;
                         };
+                        if !port_published {
+                            if let Some(port) = parse_listening_port(&line) {
+                                port_published = true;
+                                runner.publish_port(port, launch_id);
+                            }
+                        }
                         runner.note(&line);
                     }
                 })
@@ -827,6 +981,7 @@ impl LocalRunner {
             }
             inner.restarts.push_back(now);
             if inner.restarts.len() > MAX_RESTARTS {
+                inner.starting = false;
                 drop(inner);
                 let tail = self
                     .log()
@@ -872,34 +1027,58 @@ impl LocalRunner {
             .ok();
     }
 
+    /// The port the child bound, once it has told us, and only for the launch
+    /// that is still current.
+    fn publish_port(&self, port: u16, launch_id: u64) {
+        if self.lock().launch_id != launch_id {
+            return;
+        }
+        self.update(|status| status.port = Some(port));
+    }
+
     /// Poll `/health` until the sidecar answers, or the window closes.
     ///
     /// A bounded wait on a process that has just been spawned, not a timer on
     /// the idle path: it ends the moment the first answer arrives, and there is
-    /// nothing running between starts.
+    /// nothing running between starts. The first thing it waits for is the port
+    /// itself, which the child prints once it has bound one.
     fn await_ready(self: &Arc<Self>, timeout: Duration) -> Result<u16, String> {
         let deadline = Instant::now() + timeout;
-        let port = self
-            .lock()
-            .status
-            .port
-            .ok_or_else(|| "The local runner has no port".to_string())?;
         let (generation, launch_id) = {
             let inner = self.lock();
             (inner.generation, inner.launch_id)
         };
         loop {
-            {
+            let port = {
                 let inner = self.lock();
                 if inner.generation != generation || inner.launch_id != launch_id {
                     // Stopped, reconfigured, or already relaunched. Whatever
-                    // this wait learns is about a process nobody is waiting for.
+                    // this wait learns is about a process nobody is waiting for,
+                    // and the claim it would release belongs to that newer
+                    // launch, so it is left alone.
                     return Err("The local runner was replaced while starting".to_string());
                 }
                 if inner.status.phase == RunnerPhase::Failed {
-                    return Err(inner.status.detail.clone());
+                    let detail = inner.status.detail.clone();
+                    drop(inner);
+                    self.clear_starting_for(launch_id);
+                    return Err(detail);
                 }
-            }
+                inner.status.port
+            };
+            let Some(port) = port else {
+                // The child has not printed its port yet.
+                if Instant::now() >= deadline {
+                    let message =
+                        "The local runner never reported a port. Check that Python can run."
+                            .to_string();
+                    self.set_phase(RunnerPhase::Failed, &message);
+                    self.clear_starting_for(launch_id);
+                    return Err(message);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
             match health(port, Duration::from_secs(2)) {
                 Ok(health) => {
                     self.update(|status| {
@@ -917,8 +1096,10 @@ impl LocalRunner {
                             RunnerPhase::Failed,
                             &format!("The local runner could not load the model: {error}"),
                         );
+                        self.clear_starting_for(launch_id);
                         return Err(error);
                     }
+                    self.clear_starting_for(launch_id);
                     return Ok(port);
                 }
                 Err(_) if Instant::now() < deadline => {
@@ -933,6 +1114,7 @@ impl LocalRunner {
                         .unwrap_or(error);
                     let message = format!("The local runner did not start: {tail}");
                     self.set_phase(RunnerPhase::Failed, &message);
+                    self.clear_starting_for(launch_id);
                     return Err(message);
                 }
             }
@@ -994,6 +1176,8 @@ impl LocalRunner {
             let mut inner = self.lock();
             inner.generation += 1;
             inner.restarts.clear();
+            // Nothing is in flight after a stop, whoever claimed it.
+            inner.starting = false;
             inner.pid.take()
         };
         if let Some(pid) = pid {
@@ -1056,21 +1240,21 @@ fn terminate(pid: u32) {
 #[cfg(not(unix))]
 fn terminate(_pid: u32) {}
 
-/// A free loopback port, by binding one and letting go.
+/// The port out of the sidecar's own "runner listening" line.
 ///
-/// There is a window between letting go and the sidecar binding it in which
-/// something else could take the port. That is what the restart path is for: a
-/// sidecar that cannot bind exits, and the supervisor tries again with a fresh
-/// port. Handing the socket to the child instead would mean the child could not
-/// be restarted without the parent re-opening it anyway.
-fn free_loopback_port() -> Result<u16, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| format!("Could not find a free port: {}", error))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| format!("Could not find a free port: {}", error))?
-        .port();
-    Ok(port)
+/// The child binds `127.0.0.1:0` and prints what the kernel gave it, so the
+/// port is never chosen by a parent that then has to let go of it -- which is
+/// what let two sidecars starting at once be handed the same number, with the
+/// loser exiting on a bind error that read as a crash.
+///
+/// Deliberately strict about the host: a line naming any other address is not
+/// this contract, and following it would point the supervisor's health checks
+/// somewhere off the machine.
+fn parse_listening_port(line: &str) -> Option<u16> {
+    let rest = line.split("runner listening on http://127.0.0.1:").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let port: u16 = digits.parse().ok()?;
+    (port != 0).then_some(port)
 }
 
 // ── The loopback client ───────────────────────────────────
@@ -1238,7 +1422,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._reply()
 
-ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler).serve_forever()
+server = ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler)
+sys.stderr.write(
+    "runner listening on http://127.0.0.1:%d model=%s idle=%.1fm\n"
+    % (server.server_address[1], arguments.model, arguments.idle_minutes)
+)
+sys.stderr.flush()
+server.serve_forever()
 "#;
 
     struct Fixture {
@@ -1267,6 +1457,14 @@ ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler).serve_forever()
     }
 
     fn build(fixture: &Fixture, extra: &[&str]) -> (Arc<LocalRunner>, Arc<Recorder>) {
+        build_checked(fixture, extra, false)
+    }
+
+    fn build_checked(
+        fixture: &Fixture,
+        extra: &[&str],
+        needs_install: bool,
+    ) -> (Arc<LocalRunner>, Arc<Recorder>) {
         let recorder = Arc::new(Recorder::default());
         let events: Arc<dyn EngineEvents> = recorder.clone();
         let runner = LocalRunner::with_program(
@@ -1277,10 +1475,24 @@ ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler).serve_forever()
                 python: fixture.python.clone(),
                 script: fixture.script.clone(),
                 extra_args: extra.iter().map(|argument| argument.to_string()).collect(),
-                needs_install: false,
+                needs_install,
             }),
         );
         (runner, recorder)
+    }
+
+    /// How many sidecars from this fixture are running right now. Each fixture
+    /// writes its script into its own uuid directory, so the path is unique to
+    /// this test.
+    fn live_sidecars(script: &Path) -> usize {
+        let needle = script.display().to_string();
+        let Ok(output) = Command::new("/bin/ps").args(["-A", "-o", "args="]).output() else {
+            return 0;
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .count()
     }
 
     fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
@@ -1521,6 +1733,206 @@ ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler).serve_forever()
             }
         }
         let _ = std::fs::remove_dir_all(&fixture.directory);
+    }
+
+    /// Two callers asking for a runner at once get one sidecar.
+    ///
+    /// This is the shape of a real leak, not a hypothetical: `prewarm` fires on
+    /// key-down and `ensure_ready` on key-up, a second or two later, and the
+    /// first has not finished starting. Before `start` was single-flight the
+    /// second spawned a second sidecar, the first's pid was overwritten, its
+    /// monitor saw a generation mismatch and did nothing, and that process went
+    /// on to load a model and hold 1 to 2.5 GB until the app quit.
+    #[test]
+    fn a_prewarm_and_a_start_together_spawn_one_sidecar() {
+        let Some(fixture) = fixture() else {
+            eprintln!("skipped: no python3 on this machine");
+            return;
+        };
+        let (runner, recorder) = build(&fixture, &[]);
+
+        runner.prewarm();
+        let port = runner
+            .start(Duration::from_secs(20))
+            .expect("the second caller joins the start already running");
+        assert_eq!(runner.ready_port(), Some(port));
+
+        // One spawn: every port the host was ever told about is this one.
+        let ports: Vec<u16> = recorder
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|status| status.port)
+            .collect();
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            vec![port],
+            "two spawns would show two ports, and one of them would be unreachable"
+        );
+
+        // ...and one process, which is the thing the port count is standing in
+        // for. A second sidecar answers nobody and is killed by nobody.
+        assert!(
+            wait_for(Duration::from_secs(5), || live_sidecars(&fixture.script)
+                == 1),
+            "expected exactly one sidecar, found {}",
+            live_sidecars(&fixture.script)
+        );
+
+        runner.stop();
+        assert!(
+            wait_for(Duration::from_secs(5), || live_sidecars(&fixture.script)
+                == 0),
+            "stop must leave nothing running"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.directory);
+    }
+
+    /// A launch that replaces a live sidecar kills it first.
+    ///
+    /// The single-flight claim in `start` is what stops two launches racing, so
+    /// this path should now be unreachable from outside. It is kept and tested
+    /// because it is the last thing standing between a supervisor bug and a
+    /// 2.5 GB process nobody holds the pid of, and `launch` is driven directly
+    /// here rather than through the guard that is meant to prevent it.
+    #[test]
+    fn a_launch_that_replaces_a_live_sidecar_kills_it() {
+        let Some(fixture) = fixture() else {
+            eprintln!("skipped: no python3 on this machine");
+            return;
+        };
+        let (runner, _recorder) = build(&fixture, &[]);
+        let generation = {
+            let mut inner = runner.lock();
+            inner.generation += 1;
+            inner.generation
+        };
+
+        runner.launch(generation).expect("the first spawn");
+        let first = runner.pid().expect("a first pid");
+        assert!(alive(first));
+
+        runner
+            .launch(generation)
+            .expect("a second spawn, same generation");
+        let second = runner.pid().expect("a second pid");
+        assert_ne!(first, second, "the second launch has its own process");
+        assert!(
+            wait_for(Duration::from_secs(5), || !alive(first)),
+            "the sidecar being replaced must be killed, not abandoned"
+        );
+
+        runner.stop();
+        assert!(wait_for(Duration::from_secs(5), || !alive(second)));
+        let _ = std::fs::remove_dir_all(&fixture.directory);
+    }
+
+    /// The venv and weight checks are two Python launches, and `start` runs on
+    /// the key-up path of any dictation whose sidecar is not already up. They
+    /// are proved once and remembered, and forgotten again when the thing they
+    /// proved could have changed.
+    #[test]
+    fn the_install_and_model_checks_are_not_re_run_on_every_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(fixture) = fixture() else {
+            eprintln!("skipped: no python3 on this machine");
+            return;
+        };
+        // A stand-in for the venv interpreter that records every invocation.
+        let venv_bin = fixture.directory.join("runner").join("venv").join("bin");
+        std::fs::create_dir_all(&venv_bin).expect("venv bin");
+        let calls = fixture.directory.join("python-calls");
+        let python = venv_bin.join("python3");
+        std::fs::write(
+            &python,
+            format!("#!/bin/sh\necho call >> \"{}\"\nexit 0\n", calls.display()),
+        )
+        .expect("write the stand-in");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+        let count = || {
+            std::fs::read_to_string(&calls)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+
+        let (runner, _recorder) = build_checked(&fixture, &[], true);
+        runner.start(Duration::from_secs(20)).expect("first start");
+        assert_eq!(count(), 2, "one check for the venv, one for the weights");
+
+        runner.stop();
+        runner.start(Duration::from_secs(20)).expect("second start");
+        assert_eq!(
+            count(),
+            2,
+            "a second start must not pay for two interpreter launches again"
+        );
+
+        // A different model is different weights, so that half is proved again
+        // -- but the venv is still the venv.
+        runner.stop();
+        runner.configure("accurate", 10);
+        runner.start(Duration::from_secs(20)).expect("third start");
+        assert_eq!(
+            count(),
+            3,
+            "changing the model re-checks the weights and nothing else"
+        );
+
+        runner.stop();
+        let _ = std::fs::remove_dir_all(&fixture.directory);
+    }
+
+    /// The port comes off the child's own line. A parent that picks one has to
+    /// let go of it before the child binds, and two sidecars starting at once
+    /// could be handed the same number in that gap -- the loser exiting on a
+    /// bind error that reads as a crash.
+    #[test]
+    fn the_port_is_read_from_the_child_rather_than_chosen_for_it() {
+        assert_eq!(
+            parse_listening_port(
+                "runner listening on http://127.0.0.1:51610 model=mlx/x idle=10.0m"
+            ),
+            Some(51610)
+        );
+        // Nothing else is this line.
+        assert_eq!(
+            parse_listening_port("runner listening on http://10.0.0.5:8080 m=x"),
+            None
+        );
+        assert_eq!(
+            parse_listening_port("runner listening on http://127.0.0.1:abc"),
+            None
+        );
+        assert_eq!(
+            parse_listening_port("runner listening on http://127.0.0.1:0 m=x"),
+            None
+        );
+        assert_eq!(
+            parse_listening_port("Traceback (most recent call last):"),
+            None
+        );
+        assert_eq!(parse_listening_port(""), None);
+
+        // The sidecar has to be printing the line this parses, on loopback.
+        let source =
+            std::fs::read_to_string(LocalRunner::script_path().expect("runner.py")).expect("read");
+        assert!(
+            source.contains("runner listening on http://%s:%d"),
+            "the sidecar must publish its bound port"
+        );
+        assert!(
+            source.contains("BIND_HOST = \"127.0.0.1\""),
+            "and it has to be the host the parser accepts"
+        );
+        assert!(
+            source.contains("server.server_address[1]"),
+            "the port printed has to be the bound one, not the requested one"
+        );
     }
 
     /// The model table is what Settings offers and what `local_model` stores,

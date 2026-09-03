@@ -72,6 +72,18 @@ class ModelHolder:
 
     # ── state ────────────────────────────────────────────
     def state(self) -> str:
+        """Which of the three states this holder is in.
+
+        `_loading` is read *without* taking `lock`, deliberately. The loader
+        holds that lock for the several seconds a model load takes, so a
+        `/health` that took it would block for the whole load -- and a health
+        endpoint that stops answering while the thing it reports on is busy is
+        exactly how the supervisor decides a sidecar is dead. Reading the flag
+        unlocked can only be briefly stale in one direction at each edge
+        (`unloaded` a moment before `loading`, `loading` a moment before
+        `ready`), which is the resolution `/health` promises anyway: the next
+        poll, 120 ms later, corrects it. Nothing branches on the difference.
+        """
         if self._loading:
             return "loading"
         return "ready" if self._model is not None else "unloaded"
@@ -389,10 +401,15 @@ def main() -> int:
 
     server = ThreadingHTTPServer((BIND_HOST, arguments.port), Handler)
     server.daemon_threads = True
-    # The line the supervisor looks for in the log when a start goes wrong.
+    # `--port 0` asks the kernel for a free one, which is how the app starts us:
+    # a parent that picks the port has to let go of it before we bind, and two
+    # sidecars starting at once can be handed the same number in that gap. The
+    # bound port is published on the line below, and the supervisor reads it
+    # from our stderr rather than assuming it already knows.
+    port = server.server_address[1]
     sys.stderr.write(
         "runner listening on http://%s:%d model=%s idle=%.1fm\n"
-        % (BIND_HOST, arguments.port, arguments.model, arguments.idle_minutes)
+        % (BIND_HOST, port, arguments.model, arguments.idle_minutes)
     )
     sys.stderr.flush()
     try:
