@@ -177,6 +177,18 @@ impl Settings {
     /// Unset means yes for a self-hosted endpoint, where a preview costs a LAN
     /// round trip, and no for a hosted one, where it bills for one every
     /// 800 ms. Set either way, the user's choice stands.
+    ///
+    /// Turning it on for a hosted provider has two consequences a Settings
+    /// checkbox has to say out loud, because neither is visible from the pill:
+    ///
+    /// - **Rate limits.** A 20 s dictation makes up to 25 readings, which is
+    ///   75 requests a minute against Groq's 20 RPM for audio. The final take is
+    ///   the request that queues behind them, so the 429 lands on the
+    ///   transcription the user is actually waiting for, not on a preview.
+    /// - **Billing.** Each reading re-uploads the whole recording so far, and
+    ///   hosted transcription bills per minute of audio. Previewing a 20 s take
+    ///   bills roughly the sum of 0.8 s, 1.6 s ... 20 s -- about 4 minutes of
+    ///   audio for 20 seconds of speech, on top of the take itself.
     pub fn live_preview(&self) -> bool {
         live_preview_allowed(
             self.db.get_setting("live_preview").as_deref(),

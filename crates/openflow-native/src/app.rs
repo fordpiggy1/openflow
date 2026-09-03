@@ -407,8 +407,16 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
     apply_theme(app.engine.settings().theme().as_deref(), mtm);
     app.overlay.apply_visibility_setting();
     // A fresh install has no provider saved, and setup is what it needs first.
+    // Otherwise open Settings, because the Tauri build's main window is
+    // `"visible": true` in `tauri.conf.json` and so puts a window up on every
+    // launch. An accessory app that draws nothing but a menu bar item looks
+    // like a launch that failed, which is what a smoke run reported. The tray
+    // stays the way in and out afterwards; this is the launch presentation
+    // only.
     if !app.engine.settings().onboarding_complete() {
         app.show_onboarding();
+    } else {
+        app.show_settings(None);
     }
     Ok(())
 }

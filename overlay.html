@@ -314,6 +314,9 @@
         });
 
         async function settleIdle() {
+          // A capture may have started while the badge was up; that pill is the
+          // live one and idle is not what it is.
+          if (overlay.getAttribute('data-status') === 'recording') return;
           overlay.setAttribute('data-status', 'idle');
           overlay.querySelector('.status-label').textContent = '';
           await win.setSize(new LogicalSize(28, 28));
@@ -323,6 +326,10 @@
         }
 
         async function showOutcome(kind, holdMs) {
+          // The result for the previous take can land while the next capture is
+          // already recording. The badge would shrink that live pill to 28 px
+          // for the whole hold; the notification has already fired regardless.
+          if (overlay.getAttribute('data-status') === 'recording') return;
           badgeActive = true;
           if (badgeTimer) clearTimeout(badgeTimer);
           overlay.setAttribute('data-status', kind);

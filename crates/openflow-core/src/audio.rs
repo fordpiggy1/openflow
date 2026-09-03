@@ -182,14 +182,7 @@ impl AudioRecorder {
                                 continue;
                             }
                         };
-                        let Some(mono_16k) = prepare_take(&captured, native_sample_rate) else {
-                            let _ = reply.send(Err("Not enough audio yet".to_string()));
-                            continue;
-                        };
-                        // No silence gate here. A partial take is allowed to be
-                        // quiet, and rejecting it would only skip one update of
-                        // a preview, never a transcription the user asked for.
-                        let _ = reply.send(encode_wav(&auto_gain(&mono_16k), 16_000));
+                        let _ = reply.send(encode_partial(&captured, native_sample_rate));
                     }
                 }
             }
@@ -222,6 +215,10 @@ impl AudioRecorder {
     ///
     /// Leaves the buffer alone: the take that `stop` returns is unaffected by
     /// however many snapshots were read along the way.
+    ///
+    /// `Err` when there is nothing worth reading yet -- too little audio, or a
+    /// window that carried no voice. Both are a reading skipped, not a failure
+    /// the user is shown.
     pub fn snapshot(&self) -> Result<Vec<u8>, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
@@ -490,6 +487,31 @@ fn prepare_take(captured: &[f32], native_sample_rate: u32) -> Option<Vec<f32>> {
     (mono_16k.len() >= 800).then_some(mono_16k)
 }
 
+/// The WAV a reading of a recording in progress is sent, or the reason there is
+/// nothing worth sending yet.
+///
+/// It runs the same silence gate `stop` does. `auto_gain` boosts by up to 20x
+/// keyed on the 95th percentile, so a window that caught only room tone comes
+/// out as loud, structured-looking noise -- and Whisper answers noise by
+/// echoing the dictionary prompt back ("Sop, Lark"). A pause longer than
+/// [`crate::engine::PARTIAL_INTERVAL`] before the user starts speaking is
+/// exactly that window, and it is the common case at the top of a dictation.
+/// The gate is the whole-take one, not the per-sample silence stripping removed
+/// twice (3a9ebee, 0865284): quiet real speech measures 10x to 50x above the
+/// line and still previews.
+///
+/// The caller treats every `Err` here as a reading skipped, so a silent window
+/// costs one update of a preview and nothing else.
+fn encode_partial(captured: &[f32], native_sample_rate: u32) -> Result<Vec<u8>, String> {
+    let Some(mono_16k) = prepare_take(captured, native_sample_rate) else {
+        return Err("Not enough audio yet".to_string());
+    };
+    if is_silent(&mono_16k) {
+        return Err("Nothing to preview yet".to_string());
+    }
+    encode_wav(&auto_gain(&mono_16k), 16_000)
+}
+
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -672,16 +694,38 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_partial_is_still_encodable() {
-        // `stop` refuses a silent take, `snapshot` must not: a preview taken in
-        // the pause before someone starts speaking is not an error.
-        let mut hush = tone(300.0, 48_000, 0.5);
-        for sample in hush.iter_mut() {
-            *sample *= 0.0005;
+    fn a_silent_partial_is_refused_and_quiet_speech_is_not() {
+        // A snapshot runs the same gate `stop` does. Without it, the pause
+        // before someone starts speaking is gained up 20x and sent with the
+        // dictionary prompt, which Whisper answers by echoing the prompt.
+        assert_eq!(
+            encode_partial(&vec![0.0_f32; 16_000], 16_000),
+            Err("Nothing to preview yet".to_string())
+        );
+        let hiss: Vec<f32> = (0..16_000)
+            .map(|i| if i % 2 == 0 { 2e-4 } else { -2e-4 })
+            .collect();
+        assert!(
+            encode_partial(&hiss, 16_000).is_err(),
+            "a virtual device's noise floor must not be previewed"
+        );
+
+        // The same quiet-speech vector the whole-take gate keeps. A preview of
+        // a low-gain mic is a preview, not an error.
+        let mut quiet = tone(300.0, 16_000, 1.0);
+        for s in quiet.iter_mut() {
+            *s *= 0.01;
         }
-        let mono = prepare_take(&hush, 48_000).expect("half a second is enough");
-        assert!(is_silent(&mono), "the fixture must be quiet enough to gate");
-        assert!(encode_wav(&auto_gain(&mono), 16_000).is_ok());
+        assert!(
+            encode_partial(&quiet, 16_000).is_ok(),
+            "quiet real speech must still preview"
+        );
+
+        // Too little audio is still its own answer, not the silence one.
+        assert_eq!(
+            encode_partial(&tone(300.0, 48_000, 0.04), 48_000),
+            Err("Not enough audio yet".to_string())
+        );
     }
 
     #[test]
