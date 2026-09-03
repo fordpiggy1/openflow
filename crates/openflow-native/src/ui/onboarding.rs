@@ -869,8 +869,6 @@ impl OnboardingWindow {
         Ok(())
     }
 
-    /// Setup is saved: hide this window and hand the user to Settings, which
-    /// reads the same rows back.
     /// Setup is saved: end the sheet and leave the user on the main screen.
     ///
     /// The web wizard's last button says "Open my workspace" and lands on its

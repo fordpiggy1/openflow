@@ -1412,12 +1412,10 @@ fn build_sections(
     form.add(&label(mtm, "Live preview while recording", l));
     let live_preview = switch_control(mtm, switch_rect(c), TAG_LIVE_PREVIEW);
     form.add(&live_preview);
-    let n = form.control_only(26.0);
-    form.add(&note(
+    form.note_row(
         mtm,
         "Shows words in the pill as you speak. On a machine on your network it is free; on a paid provider it re-sends the recording every 0.8 s and bills for each one.",
-        n,
-    ));
+    );
     let general = form.fit();
 
     // Providers
