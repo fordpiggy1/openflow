@@ -1348,7 +1348,7 @@ fn local_model_values() -> Vec<(String, String)> {
         .map(|model| {
             (
                 model.key.to_string(),
-                format!("{} — {}", model.label, model.short_cost),
+                format!("{} · {}", model.label, model.short_cost),
             )
         })
         .collect()

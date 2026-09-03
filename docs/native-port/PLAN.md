@@ -125,6 +125,10 @@ New setting `transcription_backend = remote | local` plus `local_only = true|fal
 
 **Milestone B:** onboarding wizard, History window (list, search, delete, clear), Plugins window (list, enable, disable, install from folder), local runner (section 7), streaming TTS.
 
+- B1 **done**: onboarding, History and Plugins windows, tray and main menu, `OPENFLOW_TRACE`.
+- B2 **done** (section 10): dictionary post-pass, the `local_only` loopback guard, `LocalRunner` and `runner/runner.py`, the Settings and onboarding surfaces, and `--transcribe`. Measured on an M4 Air against the reference clip: 0.6B 0.40 s warm / 2.0 s from a cold spawn / 1.3 GB held, 1.7B 0.87 s warm / 4.0 s cold / 2.8 GB held, where "held" is the sidecar's resident set plus MLX's unified memory.
+- B3 **remaining**: streaming TTS beyond the Settings preview.
+
 **Milestone C:** retire `src-tauri`, `src/`, Vite and npm from CI; native build job on `macos-latest`; DMG in release workflow; stable local signing identity so TCC grants survive rebuilds.
 
 Gates for every milestone, run from the repo root:
