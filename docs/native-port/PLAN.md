@@ -36,8 +36,11 @@ crates/openflow-native/          AppKit binary, macOS only
   src/tts_player.rs              rodio playback for the voice preview
   src/ui/settings.rs             native Settings window (section 6)
   src/ui/onboarding.rs           Milestone B
-  src/ui/history.rs              Milestone B
-  src/ui/plugins.rs              Milestone B
+  src/ui/main_window.rs          sidebar + one page at a time
+  src/ui/dictate.rs              the main screen, hold to record
+  src/ui/card.rs                 the rounded card the pages group into
+  src/ui/history.rs              a page of the main window
+  src/ui/plugins.rs              a page of the main window
   Info.plist, entitlements.plist copied from src-tauri (same bundle id io.laisy.openflow)
 scripts/bundle-native.sh         assembles OpenFlow.app, codesigns ad hoc, optional DMG
 src-tauri/                       thin glue over openflow-core; commands and emits stay, bodies shrink

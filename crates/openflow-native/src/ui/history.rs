@@ -1,4 +1,10 @@
-//! The History window: the web build's history screen as an `NSTableView`.
+//! The History page: the web build's history screen as an `NSTableView`.
+//!
+//! A page, not a window. It owns a view and nothing more; the main window owns
+//! the frame, the title and the Dock rule, and hands this one a content rect to
+//! build itself into. The rect is passed in rather than assumed for the reason
+//! the settings tabs were: a form laid out at a guessed width loses its
+//! right-hand column off the edge, and only the container knows the real size.
 //!
 //! The list is cell-based on purpose. A view-based table would mean one
 //! `NSTextField` per visible cell and a delegate that recycles them; the rows
@@ -20,19 +26,22 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAutoresizingMaskOptions, NSBackingStoreType,
-    NSButton, NSControl, NSScrollView, NSSearchField, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAutoresizingMaskOptions, NSButton,
+    NSControl, NSScrollView, NSSearchField, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewStyle, NSTextField, NSView,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use openflow_core::db::Transcription;
 use openflow_core::engine::Engine;
 
+use crate::ui::card::{Card, GAP, MARGIN};
 use crate::ui::{button, note};
 
-const WINDOW_WIDTH: f64 = 640.0;
-const WINDOW_HEIGHT: f64 = 460.0;
+/// Gap between a table card's edge and the table inside it. Smaller than a
+/// form card's [`crate::ui::card::PADDING`]: a table brings its own row inset,
+/// and stacking the two reads as a frame around a frame.
+const TABLE_INSET: f64 = 10.0;
 /// The web screen asks for 50 rows and so does this one.
 const LIMIT: usize = 50;
 /// Where a row's text is cut. Longer than the tray's 40 because the column is
@@ -132,7 +141,7 @@ struct Controls {
 
 pub struct HistoryIvars {
     engine: Arc<Engine>,
-    window: Retained<NSWindow>,
+    view: Retained<NSView>,
     controls: Controls,
     rows: RefCell<Vec<Transcription>>,
 }
@@ -142,21 +151,13 @@ define_class!(
     // only ivars and implements no Drop.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "OpenFlowHistoryWindow"]
+    #[name = "OpenFlowHistoryPage"]
     #[ivars = HistoryIvars]
-    pub struct HistoryWindow;
+    pub struct HistoryPage;
 
-    unsafe impl NSObjectProtocol for HistoryWindow {}
+    unsafe impl NSObjectProtocol for HistoryPage {}
 
-    unsafe impl NSWindowDelegate for HistoryWindow {
-        #[unsafe(method(windowShouldClose:))]
-        fn window_should_close(&self, _sender: &NSWindow) -> bool {
-            crate::ui::dismiss_window(&self.ivars().window, "history");
-            false
-        }
-    }
-
-    unsafe impl NSTableViewDataSource for HistoryWindow {
+    unsafe impl NSTableViewDataSource for HistoryPage {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows(&self, _table: &NSTableView) -> isize {
             self.ivars().rows.borrow().len() as isize
@@ -180,7 +181,7 @@ define_class!(
         }
     }
 
-    impl HistoryWindow {
+    impl HistoryPage {
         #[unsafe(method(runSearch:))]
         fn run_search(&self, _sender: &NSControl) {
             self.load();
@@ -245,60 +246,39 @@ define_class!(
     }
 );
 
-impl HistoryWindow {
-    pub fn new(app: &std::rc::Rc<crate::app::App>, mtm: MainThreadMarker) -> Retained<Self> {
+impl HistoryPage {
+    /// Build the page into a view of `size`, which is the content pane the
+    /// main window has to give it.
+    pub fn new(
+        app: &std::rc::Rc<crate::app::App>,
+        mtm: MainThreadMarker,
+        size: NSSize,
+    ) -> Retained<Self> {
         let engine = Arc::clone(app.engine());
 
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
-                ),
-                NSWindowStyleMask::Titled
-                    | NSWindowStyleMask::Closable
-                    | NSWindowStyleMask::Miniaturizable
-                    | NSWindowStyleMask::Resizable,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
-        window.setTitle(&NSString::from_str("OpenFlow History"));
-        unsafe { window.setReleasedWhenClosed(false) };
-        window.setMinSize(NSSize::new(520.0, 320.0));
-        window.center();
-
-        let (scroll, controls) = build_content(mtm);
-        if let Some(content) = window.contentView() {
-            content.addSubview(&controls.search);
-            content.addSubview(&controls.clear);
-            content.addSubview(&scroll);
-            content.addSubview(&controls.copy);
-            content.addSubview(&controls.paste);
-            content.addSubview(&controls.delete);
-            content.addSubview(&controls.status);
-        }
+        let (view, controls) = build_content(mtm, size);
 
         let this = Self::alloc(mtm).set_ivars(HistoryIvars {
             engine,
-            window,
+            view,
             controls,
             rows: RefCell::new(Vec::new()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
-        this.ivars()
-            .window
-            .setDelegate(Some(ProtocolObject::from_ref(&*this)));
         let table = &this.ivars().controls.table;
         // A weak property: the table does not retain us, and `App` owns the
-        // only strong reference to this window. There is no table delegate,
+        // only strong reference to this page. There is no table delegate,
         // because a cell-based table needs none.
         unsafe { table.setDataSource(Some(ProtocolObject::from_ref(&*this))) };
         this.wire_actions();
         this.load();
         this
+    }
+
+    /// The view the main window installs in its content pane.
+    pub fn view(&self) -> Retained<NSView> {
+        self.ivars().view.clone()
     }
 
     fn wire_actions(&self) {
@@ -317,17 +297,8 @@ impl HistoryWindow {
         }
     }
 
-    /// On screen, as the Dock-icon rule reads it.
-    pub fn is_visible(&self) -> bool {
-        self.ivars().window.isVisible()
-    }
-
-    pub fn present(&self) {
-        crate::ui::present_window(&self.ivars().window, "history");
-    }
-
     /// Re-read the rows for whatever is in the search field. Called when the
-    /// window opens, when a search is submitted, and on `HistoryChanged`.
+    /// page is shown, when a search is submitted, and on `HistoryChanged`.
     pub fn load(&self) {
         let ivars = self.ivars();
         let query = ivars.controls.search.stringValue().to_string();
@@ -399,10 +370,43 @@ impl HistoryWindow {
 
 // ── Layout ────────────────────────────────────────────────
 
-fn build_content(mtm: MainThreadMarker) -> (Retained<NSScrollView>, Controls) {
+/// Lay the page out into a view of `size`.
+///
+/// Every frame is derived from `size` rather than written down, so the page is
+/// correct at whatever the content pane happens to be and stays correct when
+/// the window is resized: the springs below carry it from there.
+fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Controls) {
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), size),
+    );
+    let inner = size.width - MARGIN * 2.0;
+    let top = size.height - MARGIN;
+
+    // ── Top row: search, and Clear all pinned to the right ──
+    let clear = button(
+        mtm,
+        NSRect::new(
+            NSPoint::new(size.width - MARGIN - 110.0, top - 26.0),
+            NSSize::new(110.0, 26.0),
+        ),
+        "Clear all",
+        0,
+    );
+    // `ViewMinXMargin` is what was missing while this was a window: with only
+    // a flexible bottom margin the button kept its x, so widening the window
+    // grew the search field straight underneath it. It tracks the right edge
+    // now, which is where it was drawn to sit.
+    clear.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+
     let search = NSSearchField::initWithFrame(
         NSSearchField::alloc(mtm),
-        NSRect::new(NSPoint::new(16.0, 420.0), NSSize::new(400.0, 24.0)),
+        NSRect::new(
+            NSPoint::new(MARGIN, top - 25.0),
+            NSSize::new(inner - 110.0 - 10.0, 24.0),
+        ),
     );
     search.setPlaceholderString(Some(&NSString::from_str("Search what you have said")));
     // Submitting sends the action; so does clearing the field, which is what
@@ -411,49 +415,12 @@ fn build_content(mtm: MainThreadMarker) -> (Retained<NSScrollView>, Controls) {
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
 
-    let clear = button(
-        mtm,
-        NSRect::new(NSPoint::new(514.0, 419.0), NSSize::new(110.0, 26.0)),
-        "Clear all",
-        0,
-    );
-    clear.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
-
-    let scroll = NSScrollView::initWithFrame(
-        NSScrollView::alloc(mtm),
-        NSRect::new(NSPoint::new(16.0, 56.0), NSSize::new(608.0, 352.0)),
-    );
-    let table = NSTableView::initWithFrame(
-        NSTableView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(608.0, 352.0)),
-    );
-    for (identifier, title, width) in [
-        (COLUMN_TIME, "When", 150.0),
-        (COLUMN_TEXT, "What you said", 330.0),
-        (COLUMN_PROVIDER, "Provider", 110.0),
-    ] {
-        let column = NSTableColumn::initWithIdentifier(
-            NSTableColumn::alloc(mtm),
-            &NSString::from_str(identifier),
-        );
-        column.setWidth(width);
-        column.setTitle(&NSString::from_str(title));
-        table.addTableColumn(&column);
-    }
-    table.setUsesAlternatingRowBackgroundColors(true);
-    table.setAllowsMultipleSelection(false);
-    scroll.setHasVerticalScroller(true);
-    scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
-    scroll.setDocumentView(Some(&table));
-    scroll.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
-    );
-
-    let mut x = 16.0;
+    // ── Bottom row: the row verbs, and the status line beside them ──
+    let mut x = MARGIN;
     let mut action = |title: &str| {
         let control = button(
             mtm,
-            NSRect::new(NSPoint::new(x, 14.0), NSSize::new(90.0, 26.0)),
+            NSRect::new(NSPoint::new(x, MARGIN), NSSize::new(90.0, 26.0)),
             title,
             0,
         );
@@ -468,14 +435,79 @@ fn build_content(mtm: MainThreadMarker) -> (Retained<NSScrollView>, Controls) {
     let status = note(
         mtm,
         "",
-        NSRect::new(NSPoint::new(310.0, 18.0), NSSize::new(314.0, 16.0)),
+        NSRect::new(
+            NSPoint::new(x + 4.0, MARGIN + 5.0),
+            NSSize::new((size.width - MARGIN - x - 4.0).max(0.0), 16.0),
+        ),
     );
     status.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
     );
 
+    // ── The list, on a card between the two rows ──
+    let card_bottom = MARGIN + 26.0 + GAP;
+    let card_height = (top - 26.0 - 12.0 - card_bottom).max(0.0);
+    let card = Card::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(MARGIN, card_bottom),
+            NSSize::new(inner, card_height),
+        ),
+    );
+    card.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    let table_frame = NSRect::new(
+        NSPoint::new(TABLE_INSET, TABLE_INSET),
+        NSSize::new(
+            (inner - TABLE_INSET * 2.0).max(0.0),
+            (card_height - TABLE_INSET * 2.0).max(0.0),
+        ),
+    );
+    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), table_frame);
+    let table = NSTableView::initWithFrame(
+        NSTableView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
+    );
+    for (identifier, title, width) in [
+        (COLUMN_TIME, "When", 150.0),
+        (COLUMN_TEXT, "What you said", 330.0),
+        (COLUMN_PROVIDER, "Provider", 110.0),
+    ] {
+        let column = NSTableColumn::initWithIdentifier(
+            NSTableColumn::alloc(mtm),
+            &NSString::from_str(identifier),
+        );
+        column.setWidth(width);
+        column.setTitle(&NSString::from_str(title));
+        table.addTableColumn(&column);
+    }
+    // Inset rows and no alternating stripes: the card already separates the
+    // list from the window, and a bezel plus stripes inside it is the framed
+    // look this window was rebuilt to stop drawing.
+    table.setStyle(NSTableViewStyle::Inset);
+    table.setUsesAlternatingRowBackgroundColors(false);
+    table.setAllowsMultipleSelection(false);
+    scroll.setHasVerticalScroller(true);
+    scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
+    scroll.setDrawsBackground(false);
+    scroll.setDocumentView(Some(&table));
+    scroll.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    card.addSubview(&scroll);
+
+    view.addSubview(&search);
+    view.addSubview(&clear);
+    view.addSubview(&card);
+    view.addSubview(&copy);
+    view.addSubview(&paste);
+    view.addSubview(&delete);
+    view.addSubview(&status);
+
     (
-        scroll,
+        view,
         Controls {
             search,
             table,

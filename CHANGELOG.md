@@ -4,6 +4,20 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### One main window for the native host, with a sidebar instead of three windows
+By: Ford (with Claude)
+Impact: `crates/openflow-native/src/ui/{main_window,dictate,card}.rs` (new), `crates/openflow-native/src/ui/{history,plugins,mod}.rs`, `crates/openflow-native/src/{app.rs,tray.rs}`, `README.md`, `docs/native-port/PLAN.md`
+
+- **The native host had no main screen.** The Tauri build has been a single window with five screens since the beginning; the native host reached Settings, History and Plugins as three independent `NSWindow`s from the menu bar, and the one screen the menu bar could never stand in for -- the main one, with the hold-to-record button -- did not exist at all. It does now, and the three windows became pages of it. Settings is still its own window; moving it in is the next change.
+- **Dictate** is the web build's main screen, with its copy: the microphone, the three-state prompt, the hold button, the shortcut hints, and the last result as a card that copies it again when clicked. The button drives `hotkey_pressed` / `hotkey_released`, the same pair the global shortcut drives, so holding it is holding the shortcut -- silence gate, live preview and insert method are all decided downstream and cannot drift from the hotkey path.
+- Holding needs a button that can express it. `NSButton`'s action fires once, on mouse-up, and its `mouseDown:` runs a tracking loop that does not return until the mouse is released, so the press half is unreachable through target/action. `HoldButton` overrides both halves and does not call super.
+- **`NSSplitViewController` with a sidebar item, and no `NSTabView` anywhere.** The sidebar item is what supplies the vibrancy, the full-height layout that runs the sidebar up behind the title bar, and the collapse behaviour; an `NSVisualEffectView` painted by hand gets the translucency and none of the rest. `NSTabView`'s strip rides on the edge of a rectangle, which is the framed look this window exists to stop drawing -- pages swap in and out of a plain container instead, and their contents sit on rounded cards with a margin on every side.
+- Cards are drawn, not layered. A `CGColor` handed to `layer.backgroundColor` is resolved once, so a card built in light mode keeps its light fill after the user switches to dark; `drawRect:` reads the semantic colour every time AppKit asks, and AppKit asks on an appearance change.
+- Pages are built against the content pane's **measured** size. The window is laid out once before any page exists and each page is handed the rect it actually got, the same way the settings tabs ask `NSTabView` for their content rect rather than assuming one. The page sits inside the pane's safe area, so the first card clears the title bar that `FullSizeContentView` runs the content up behind.
+- **Fixed on the way through: History's Clear all did not track the window.** It had a flexible bottom margin and nothing horizontal, so widening the window kept the button at its x while the search field beside it grew -- straight underneath it. The sidebar's column had the mirror of the same bug: fixed width against a resizable pane, so the selection pill was cut square against the divider instead of being inset from it.
+- Layout stays on autoresizing masks. The split view controller uses auto layout internally to place its two panes, but that stops at the pane: inside it a page's frame is set by the container and its subviews spring off that, so no view in this crate mixes the two models.
+- `has_visible_window` asks three windows now instead of four, and the tray's History and Plugins items open the main window on that page rather than a window of their own. Launch and Dock-reopen land on the main window; until it existed the stand-in was Settings, which opened the app on its own preferences.
+
 ### A Dock icon for as long as a window is open
 By: Ford (with Claude)
 Impact: `crates/openflow-native/src/app.rs`, `crates/openflow-native/src/ui/mod.rs`, `crates/openflow-native/src/ui/{settings,history,onboarding,plugins}.rs`

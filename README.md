@@ -132,7 +132,7 @@ CI runs these checks from a clean install and compiles the desktop app on macOS,
 
 ## Native build (experimental, macOS only)
 
-`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, a setup wizard, Settings, History and Plugins windows, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. The plan is `docs/native-port/PLAN.md`; the local transcription runner is what is left of Milestone B.
+`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, a setup wizard, a main window whose sidebar holds Dictate, History and Plugins, a Settings window, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. The plan is `docs/native-port/PLAN.md`; the local transcription runner is what is left of Milestone B.
 
 A launch with no provider saved opens the setup wizard instead of Settings: provider, key, a connection test, then microphone and shortcut. Settings has a "Run setup again" button that reopens it.
 

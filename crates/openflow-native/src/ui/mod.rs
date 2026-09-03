@@ -1,10 +1,17 @@
 //! Stock AppKit controls, laid out by hand.
 //!
-//! No auto layout: every window here is a fixed size with a two-column form, so
-//! frames are shorter to read than constraints and there is nothing to solve at
-//! run time.
+//! No auto layout anywhere in this crate: frames are shorter to read than
+//! constraints and there is nothing to solve at run time. Windows that are a
+//! two-column form are a fixed size and set their frames outright; the main
+//! window's pages are handed the size of the pane they were given and spring
+//! off it with autoresizing masks. `NSSplitViewController` does use auto layout
+//! to place its own two panes, but that stops at the pane -- no view here mixes
+//! the two models.
 
+pub mod card;
+pub mod dictate;
 pub mod history;
+pub mod main_window;
 pub mod onboarding;
 pub mod plugins;
 pub mod recorder;
