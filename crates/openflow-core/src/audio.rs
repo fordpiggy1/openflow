@@ -2,6 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -22,6 +23,55 @@ pub struct AudioDevice {
 
 pub struct AudioRecorder {
     cmd_tx: mpsc::Sender<RecordCommand>,
+    /// The loudest sample of the most recent buffer, as `f32` bits.
+    ///
+    /// Written from the audio callback and read from whatever thread wants to
+    /// draw it, which is why it is an atomic and not another command round
+    /// trip: a meter asks about thirty times a second, and a channel send plus
+    /// a reply would put the UI's refresh rate in the way of the capture.
+    /// Relaxed ordering is the right one here -- there is nothing to publish
+    /// alongside it, and a reader that sees the previous buffer's peak is off
+    /// by a frame on a bar that decays anyway.
+    level: Arc<AtomicU32>,
+}
+
+/// Where the meter bottoms out, in dBFS.
+///
+/// Not -60: speech that the auto-gain will happily lift sits well below that,
+/// and a bar that spends its life in the first tenth reads as broken. The gain
+/// stage targets `TARGET_PEAK`, about -13.5 dBFS, so a normal voice lands
+/// around three quarters of the way up this scale.
+pub const METER_FLOOR_DB: f32 = -54.0;
+
+/// How much of the way a falling meter travels each frame. Rising is instant:
+/// a meter that lags the transient it is meant to show is worse than none.
+pub const METER_RELEASE: f32 = 0.22;
+
+/// Amplitude to the fraction of a meter it should fill.
+///
+/// Decibels, not the raw amplitude. Loudness is logarithmic, and a linear bar
+/// spends nearly all of its length on the top few dB -- speech at the gain
+/// stage's own target would move it a fifth of the way and look like silence.
+pub fn meter_fraction(peak: f32) -> f32 {
+    if !peak.is_finite() || peak <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * peak.min(1.0).log10();
+    ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
+}
+
+/// One frame of meter movement: jump to a louder reading, ease down to a
+/// quieter one. Pure, so both hosts fall the same way and it can be tested
+/// without a microphone.
+pub fn meter_decay(shown: f32, next: f32) -> f32 {
+    if !shown.is_finite() {
+        return next;
+    }
+    if next >= shown {
+        next
+    } else {
+        shown + (next - shown) * METER_RELEASE
+    }
 }
 
 impl AudioRecorder {
@@ -31,6 +81,8 @@ impl AudioRecorder {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RecordCommand>();
+        let level = Arc::new(AtomicU32::new(0));
+        let stream_level = Arc::clone(&level);
 
         thread::spawn(move || {
             let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -95,16 +147,29 @@ impl AudioRecorder {
                                 continue;
                             }
                         }
+                        // A stale peak outlives the stream that wrote it, so
+                        // clear it with the buffer rather than leaving the
+                        // meter showing the end of the previous take.
+                        stream_level.store(0, Ordering::Relaxed);
                         let stream = match default_config.sample_format() {
-                            SampleFormat::F32 => {
-                                build_input_stream::<f32>(&device, &config, samples.clone())
-                            }
-                            SampleFormat::I16 => {
-                                build_input_stream::<i16>(&device, &config, samples.clone())
-                            }
-                            SampleFormat::U16 => {
-                                build_input_stream::<u16>(&device, &config, samples.clone())
-                            }
+                            SampleFormat::F32 => build_input_stream::<f32>(
+                                &device,
+                                &config,
+                                samples.clone(),
+                                Arc::clone(&stream_level),
+                            ),
+                            SampleFormat::I16 => build_input_stream::<i16>(
+                                &device,
+                                &config,
+                                samples.clone(),
+                                Arc::clone(&stream_level),
+                            ),
+                            SampleFormat::U16 => build_input_stream::<u16>(
+                                &device,
+                                &config,
+                                samples.clone(),
+                                Arc::clone(&stream_level),
+                            ),
                             format => Err(format!(
                                 "Unsupported microphone sample format: {:?}",
                                 format
@@ -129,6 +194,7 @@ impl AudioRecorder {
                         }
                     }
                     RecordCommand::Stop(reply) => {
+                        stream_level.store(0, Ordering::Relaxed);
                         let Some(stream) = active_stream.take() else {
                             let _ = reply.send(Err("No recording is active".to_string()));
                             continue;
@@ -188,7 +254,7 @@ impl AudioRecorder {
             }
         });
 
-        Self { cmd_tx }
+        Self { cmd_tx, level }
     }
 
     pub fn list_devices(&self) -> Result<Vec<AudioDevice>, String> {
@@ -227,6 +293,14 @@ impl AudioRecorder {
         reply_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .map_err(|_| "Microphone snapshot timed out".to_string())?
+    }
+
+    /// The loudest sample of the most recent buffer, 0.0 to 1.0.
+    ///
+    /// Zero when nothing is recording. Never blocks and never talks to the
+    /// audio thread, so it is safe to ask on a redraw.
+    pub fn input_level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
     pub fn stop(&self) -> Result<Vec<u8>, String> {
@@ -282,6 +356,7 @@ fn build_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     samples: Arc<Mutex<Vec<f32>>>,
+    level: Arc<AtomicU32>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + Copy,
@@ -292,6 +367,16 @@ where
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
+                // Before the lock, and before the early return the lock can
+                // take: the meter is the one thing that should still move when
+                // the buffer is full or contended, and this is one pass over
+                // the samples with nothing allocated.
+                let peak = data
+                    .iter()
+                    .map(|sample| (*sample).to_sample::<f32>().abs())
+                    .fold(0.0f32, f32::max);
+                level.store(peak.to_bits(), Ordering::Relaxed);
+
                 let Ok(mut output) = samples.lock() else {
                     return;
                 };
@@ -768,6 +853,55 @@ mod tests {
             bumped_level > clean_level * 0.5,
             "one transient must not cancel the boost: clean={clean_level} bumped={bumped_level}"
         );
+    }
+
+    /// Silence is the bottom of the scale, and a full-scale sample the top.
+    /// Anything at or under the floor reads as nothing rather than as a sliver
+    /// of bar that never goes away.
+    #[test]
+    fn the_meter_scale_runs_from_silence_to_full_scale() {
+        assert_eq!(meter_fraction(0.0), 0.0);
+        assert_eq!(meter_fraction(1.0), 1.0);
+        // The floor itself, and everything under it.
+        let floor = 10f32.powf(METER_FLOOR_DB / 20.0);
+        assert!(meter_fraction(floor) < 0.001);
+        assert_eq!(meter_fraction(floor / 10.0), 0.0);
+        // Neither a negative amplitude nor a NaN can come out of `abs`, but a
+        // meter that panicked on one would be a crash in the audio path.
+        assert_eq!(meter_fraction(-0.5), 0.0);
+        assert_eq!(meter_fraction(f32::NAN), 0.0);
+        assert_eq!(meter_fraction(2.0), 1.0);
+    }
+
+    /// The scale exists to make speech visible, so the amplitude the gain stage
+    /// aims at has to land somewhere useful -- not in the first tenth, which is
+    /// what a linear bar does with it.
+    #[test]
+    fn a_voice_at_the_gain_target_fills_most_of_the_meter() {
+        let shown = meter_fraction(TARGET_PEAK);
+        assert!(shown > 0.7 && shown < 0.8, "{shown}");
+        // And well above where a linear bar would put it, which is the whole
+        // reason the scale is in decibels.
+        assert!(shown > TARGET_PEAK * 3.0, "{shown}");
+    }
+
+    /// Louder is immediate; quieter is eased into. A meter that lags the peak
+    /// it is drawing is showing the wrong thing at the only moment it matters.
+    #[test]
+    fn the_meter_jumps_up_and_eases_down() {
+        assert_eq!(meter_decay(0.2, 0.9), 0.9);
+        assert_eq!(meter_decay(0.5, 0.5), 0.5);
+
+        let eased = meter_decay(1.0, 0.0);
+        assert!(eased > 0.0 && eased < 1.0, "{eased}");
+        assert_eq!(eased, 1.0 - METER_RELEASE);
+
+        // It keeps falling towards the quiet reading rather than stalling.
+        let mut shown = 1.0;
+        for _ in 0..40 {
+            shown = meter_decay(shown, 0.0);
+        }
+        assert!(shown < 0.001, "{shown}");
     }
 
     #[test]

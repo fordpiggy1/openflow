@@ -4,6 +4,18 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### A level meter, so holding the button tells you it is hearing you
+By: Ford (with Claude)
+Impact: `crates/openflow-core/src/{audio,engine}.rs`, `crates/openflow-native/src/ui/dictate.rs`
+
+- **Holding the button looked identical whether the microphone was working or not.** The copy changed to "Listening now", and that was the whole of the feedback: a dead input, a muted device, a grant that had quietly lapsed and a perfectly good recording all drew the same screen. The first the user heard of any of it was an empty transcript, after they had finished speaking.
+- The engine publishes the loudest sample of the most recent buffer. It is an `AtomicU32` written from the audio callback and read with a plain load, not another command round trip: a meter asks about thirty times a second, and a channel send plus a reply would put the UI's refresh rate in the way of the capture. Relaxed ordering, because there is nothing to publish alongside it and a reader one buffer behind is a frame late on a bar that decays anyway.
+- The peak is taken **before** the samples lock, and before the early return that lock can take. The meter is the one thing that should still move when the buffer is full or contended, and it is one pass over the samples with nothing allocated.
+- **The scale is in decibels.** Loudness is logarithmic and a linear bar spends nearly all of its length on the top few dB -- speech at the gain stage's own `TARGET_PEAK` would move it a fifth of the way and read as silence. The floor is -54 dBFS rather than -60, because speech the auto-gain will happily lift sits below that and a bar that lives in its first tenth reads as broken. `meter_fraction` and `meter_decay` are pure functions in core, so both hosts fall the same way and neither the scale nor the decay needs a microphone to test.
+- Rising is instant and falling is eased: a meter that lags the transient it exists to show is worse than no meter.
+- The native host draws it with an `NSLevelIndicator` in the continuous-capacity style, under the button that starts it and the width of that button. A stock control, which is what this crate is made of; the style already draws the rounded capsule and clips the fill to it. It occupies its row in `BLOCK_HEIGHT` even while hidden, the way the cancel button does, so the block does not jump when recording starts.
+- The timer runs only while recording and is invalidated on the way out. A repeating timer retains its target, so one left running would keep the page alive and keep redrawing a bar nobody is looking at; `set_metering` is idempotent in both directions because `set_state` is called more than once for some transitions.
+
 ### One main window for the native host, with a sidebar instead of three windows
 By: Ford (with Claude)
 Impact: `crates/openflow-native/src/ui/{main_window,dictate,card}.rs` (new), `crates/openflow-native/src/ui/{history,plugins,mod}.rs`, `crates/openflow-native/src/{app.rs,tray.rs}`, `README.md`, `docs/native-port/PLAN.md`
