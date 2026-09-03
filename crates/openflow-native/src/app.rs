@@ -279,6 +279,9 @@ define_class!(
         /// here; the Tauri build opens its window on the same signal.
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
         fn should_handle_reopen(&self, _sender: &NSApplication, _has_visible: bool) -> bool {
+            crate::trace!("reopen");
+            // Same present path as the tray, so the reopen click brings the
+            // window to the active Space and the app forward with it.
             with_app(|app| app.show_settings(None));
             true
         }

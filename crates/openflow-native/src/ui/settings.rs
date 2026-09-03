@@ -20,9 +20,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSBackingStoreType, NSComboBox, NSControl, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSEvent, NSEventMask, NSEventModifierFlags, NSPopUpButton,
-    NSSecureTextField, NSSwitch, NSTabView, NSTabViewItem, NSTextDelegate, NSTextField, NSTextView,
-    NSTextViewDelegate, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSControlTextEditingDelegate, NSPopUpButton, NSSecureTextField, NSSwitch, NSTabView,
+    NSTabViewItem, NSTextDelegate, NSTextField, NSTextView, NSTextViewDelegate, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -34,6 +34,7 @@ use openflow_core::transcribe::ModelInfo;
 
 use crate::hotkeys;
 use crate::overlay;
+use crate::ui::recorder::ChordRecorder;
 use crate::ui::{
     button, combo, label, note, popup, secure_field, switch_control, text_field, text_view, wire,
     Form, ROW,
@@ -208,7 +209,7 @@ pub struct SettingsIvars {
     tabs: Retained<NSTabView>,
     controls: Controls,
     /// The event monitor a hotkey field installs while it is listening.
-    monitor: RefCell<Option<Retained<AnyObject>>>,
+    recorder: ChordRecorder,
     recording_action: RefCell<Option<String>>,
     /// The speech request currently previewing, for the Stop button.
     preview_request: RefCell<Option<String>>,
@@ -385,7 +386,7 @@ impl SettingsWindow {
             window,
             tabs,
             controls,
-            monitor: RefCell::new(None),
+            recorder: ChordRecorder::default(),
             recording_action: RefCell::new(None),
             preview_request: RefCell::new(None),
         });
@@ -488,11 +489,7 @@ impl SettingsWindow {
     }
 
     pub fn present(&self) {
-        let ivars = self.ivars();
-        ivars.window.makeKeyAndOrderFront(None);
-        if let Some(mtm) = MainThreadMarker::new() {
-            objc2_app_kit::NSApplication::sharedApplication(mtm).activate();
-        }
+        crate::ui::present_window(&self.ivars().window, "settings");
     }
 
     pub fn select_tab(&self, tab: &str) {
@@ -831,36 +828,16 @@ impl SettingsWindow {
         field.setTitle(&NSString::from_str("Press a shortcut..."));
 
         let this = self.retain();
-        let block = block2::RcBlock::new(move |event: core::ptr::NonNull<NSEvent>| {
-            // SAFETY: AppKit hands us a live event for the duration of the call.
-            let event = unsafe { event.as_ref() };
-            this.finish_recording_hotkey(event);
-            core::ptr::null_mut()
-        });
-        let monitor = unsafe {
-            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block)
-        };
-        *ivars.monitor.borrow_mut() = monitor;
+        ivars
+            .recorder
+            .start(move |chord| this.finish_recording_hotkey(chord));
     }
 
-    fn finish_recording_hotkey(&self, event: &NSEvent) {
+    fn finish_recording_hotkey(&self, chord: Option<String>) {
         let ivars = self.ivars();
         let Some(action) = ivars.recording_action.borrow().clone() else {
             return;
         };
-        let flags = event.modifierFlags();
-        let characters = event.charactersIgnoringModifiers().map(|s| s.to_string());
-        let Some(key) = hotkeys::key_name(event.keyCode(), characters.as_deref()) else {
-            self.stop_recording_hotkey();
-            return;
-        };
-        let chord = hotkeys::shortcut_string(
-            flags.contains(NSEventModifierFlags::Control),
-            flags.contains(NSEventModifierFlags::Option),
-            flags.contains(NSEventModifierFlags::Shift),
-            flags.contains(NSEventModifierFlags::Command),
-            &key,
-        );
         self.stop_recording_hotkey();
         let Some(chord) = chord else { return };
 
@@ -881,9 +858,7 @@ impl SettingsWindow {
 
     fn stop_recording_hotkey(&self) {
         let ivars = self.ivars();
-        if let Some(monitor) = ivars.monitor.borrow_mut().take() {
-            unsafe { NSEvent::removeMonitor(&monitor) };
-        }
+        ivars.recorder.stop();
         // Put the suspended chord back before any rebind: `rebind` releases the
         // old registration itself, and it has to be there to release.
         crate::app::with_app(|app| app.hotkeys().borrow_mut().resume());

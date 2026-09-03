@@ -173,6 +173,7 @@ fn embedded_icon() -> Result<Icon, String> {
 pub fn install_handler() {
     MenuEvent::set_event_handler(Some(|event: MenuEvent| {
         let id = event.id().as_ref().to_string();
+        crate::trace!("tray click id={}", id);
         crate::events::on_main(move || {
             crate::app::with_app(|app| match id.as_str() {
                 // No tab: the window reopens where the user left it. The
