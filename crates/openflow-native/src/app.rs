@@ -239,6 +239,13 @@ impl App {
                     window.set_voice_status_for(&error.request_id, &error.error)
                 });
             }
+            // The local runner pushes its own state; nothing here polls the
+            // supervisor. The Settings panel that draws it lands with the rest
+            // of the runner UI; until then the trace log is where it goes, so a
+            // headless install or start can still be watched.
+            EngineEvent::RunnerState(status) => {
+                crate::trace!("runner {} {}", status.phase.as_str(), status.detail);
+            }
             EngineEvent::Navigate(target) => match target.as_str() {
                 "quit" => {
                     let app = NSApplication::sharedApplication(self.mtm);
