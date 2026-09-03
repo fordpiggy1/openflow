@@ -15,12 +15,16 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSPanel, NSScreen, NSView, NSWindow,
+    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSPanel, NSScreen, NSStringDrawing, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSTimer};
+use objc2_foundation::{
+    NSDictionary, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
+};
 
 use openflow_core::engine::{Engine, RecordingState};
 
@@ -31,6 +35,8 @@ pub const OVERLAY_HEIGHT: f64 = 28.0;
 pub const WIDTH_IDLE: f64 = 28.0;
 pub const WIDTH_RECORDING: f64 = 82.0;
 pub const WIDTH_TRANSCRIBING: f64 = 72.0;
+/// Wide enough for a line of transcript while the recording is still running.
+pub const WIDTH_PREVIEW: f64 = 320.0;
 /// The corner radius `overlay.html` uses on whichever corners face the screen.
 pub const CORNER_RADIUS: f64 = 10.0;
 
@@ -58,6 +64,43 @@ pub struct Rect {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+/// What the pill shows once a dictation is over, for as long as it holds.
+///
+/// Not a [`RecordingState`]: the engine has no such state, and inventing one
+/// would put a display concern into a state machine two hosts share. It is
+/// driven by the result and error events instead, exactly as `overlay.html`
+/// drives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    Error,
+}
+
+impl Outcome {
+    /// Seconds the badge stays up. Failure holds longer because it is the one
+    /// worth catching, and the text is on the clipboard either way.
+    pub fn hold(self) -> f64 {
+        match self {
+            Self::Done => 1.2,
+            Self::Error => 2.2,
+        }
+    }
+}
+
+/// The pill's width, given everything that can widen it.
+///
+/// An outcome badge keeps the resting footprint, so nothing moves on the way
+/// out; a reading of the recording in progress needs room for a line of text.
+pub fn pill_width(state: RecordingState, outcome: Option<Outcome>, previewing: bool) -> f64 {
+    if outcome.is_some() {
+        return WIDTH_IDLE;
+    }
+    if previewing && matches!(state, RecordingState::Recording) {
+        return WIDTH_PREVIEW;
+    }
+    width_for(state)
 }
 
 pub fn width_for(state: RecordingState) -> f64 {
@@ -133,6 +176,16 @@ pub fn corner_radii(position: &str) -> [f64; 4] {
 const WAVE_DELAYS: [f64; 10] = [0.0, 0.07, 0.14, 0.1, 0.03, 0.18, 0.06, 0.12, 0.16, 0.09];
 /// `wave` runs 0.45s and alternates, so a full cycle is twice that.
 const WAVE_PERIOD: f64 = 0.9;
+const WAVE_BAR_WIDTH: f64 = 2.5;
+const WAVE_BAR_GAP: f64 = 2.0;
+/// The waveform's own width: one bar per entry in `WAVE_DELAYS`, with a gap
+/// between each pair. Derived rather than written down twice, so the text that
+/// sits after the bars cannot drift away from where they actually end.
+const WAVEFORM_WIDTH: f64 = WAVE_BAR_WIDTH * 10.0 + WAVE_BAR_GAP * 9.0;
+/// The gap either side of a run of content inside the pill.
+const PILL_PADDING: f64 = 6.0;
+/// How much of a clipped line is faded out at its leading edge.
+const FADE_WIDTH: f64 = 16.0;
 const WAVE_MIN_HEIGHT: f64 = 4.0;
 const WAVE_MAX_HEIGHT: f64 = 16.0;
 const DOT_DELAYS: [f64; 3] = [0.0, 0.15, 0.3];
@@ -174,6 +227,12 @@ pub struct PillIvars {
     elapsed: Cell<f64>,
     /// Where the pointer sat inside the window when a drag began.
     drag_offset: Cell<Option<NSPoint>>,
+    /// Set for as long as a badge is up; overrides the state's drawing.
+    outcome: Cell<Option<Outcome>>,
+    /// The latest reading of the recording in progress, replaced whole.
+    partial: RefCell<String>,
+    /// True once the readings have stopped but the line is still worth showing.
+    partial_held: Cell<bool>,
     engine: RefCell<Option<Arc<Engine>>>,
 }
 
@@ -230,6 +289,9 @@ impl PillView {
             position: RefCell::new(position),
             elapsed: Cell::new(0.0),
             drag_offset: Cell::new(None),
+            outcome: Cell::new(None),
+            partial: RefCell::new(String::new()),
+            partial_held: Cell::new(false),
             engine: RefCell::new(None),
         });
         let frame = NSRect::new(
@@ -262,6 +324,7 @@ impl PillView {
     fn draw(&self) {
         let bounds = self.bounds();
         let state = self.ivars().state.get();
+        let outcome = self.ivars().outcome.get();
         let position = self.ivars().position.borrow().clone();
         let elapsed = self.ivars().elapsed.get();
 
@@ -285,9 +348,11 @@ impl PillView {
             .set();
         }
         path.fill();
-        let (br, bg, bb, ba) = match state {
-            RecordingState::Recording => (239.0, 68.0, 68.0, 0.5),
-            RecordingState::Transcribing => (123.0, 163.0, 201.0, 0.4),
+        let (br, bg, bb, ba) = match (outcome, state) {
+            (Some(Outcome::Done), _) => (34.0, 197.0, 94.0, 0.55),
+            (Some(Outcome::Error), _) => (239.0, 68.0, 68.0, 0.6),
+            (None, RecordingState::Recording) => (239.0, 68.0, 68.0, 0.5),
+            (None, RecordingState::Transcribing) => (123.0, 163.0, 201.0, 0.4),
             _ => (255.0, 255.0, 255.0, 0.06),
         };
         {
@@ -296,6 +361,29 @@ impl PillView {
         }
         path.setLineWidth(1.0);
         path.stroke();
+
+        // A badge stands in for the logo and the animation both: the pill is
+        // back at its resting width, so there is room for one glyph and no more.
+        if let Some(outcome) = outcome {
+            let size = 14.0;
+            let frame = NSRect::new(
+                NSPoint::new(
+                    (bounds.size.width - size) / 2.0,
+                    (bounds.size.height - size) / 2.0,
+                ),
+                NSSize::new(size, size),
+            );
+            let (r, g, b) = match outcome {
+                Outcome::Done => (34.0, 197.0, 94.0),
+                Outcome::Error => (239.0, 68.0, 68.0),
+            };
+            {
+                NSColor::colorWithSRGBRed_green_blue_alpha(r / 255.0, g / 255.0, b / 255.0, 1.0)
+                    .set();
+            }
+            draw_badge(outcome, frame);
+            return;
+        }
 
         // Logo: 14x14, centred when idle, 6 px from the left edge otherwise.
         let logo_size = 14.0;
@@ -327,6 +415,23 @@ impl PillView {
             RecordingState::Transcribing => self.draw_dots(bounds, logo_x + logo_size, elapsed),
             _ => {}
         }
+
+        // The transcript, in whatever room the waveform left.
+        let partial = self.ivars().partial.borrow();
+        if !partial.is_empty() && matches!(state, RecordingState::Recording) {
+            let text_x = logo_x + logo_size + PILL_PADDING + WAVEFORM_WIDTH + PILL_PADDING;
+            draw_partial(
+                &partial,
+                NSRect::new(
+                    NSPoint::new(text_x, bounds.origin.y),
+                    NSSize::new(
+                        (bounds.size.width - text_x - PILL_PADDING).max(0.0),
+                        bounds.size.height,
+                    ),
+                ),
+                self.ivars().partial_held.get(),
+            );
+        }
     }
 
     /// Ten 2.5 px bars, 2 px apart, growing from 4 px to 16 px.
@@ -340,9 +445,9 @@ impl PillView {
             )
             .set();
         }
-        let bar_width = 2.5;
-        let gap = 2.0;
-        let mut x = after_logo + 6.0;
+        let bar_width = WAVE_BAR_WIDTH;
+        let gap = WAVE_BAR_GAP;
+        let mut x = after_logo + PILL_PADDING;
         for index in 0..WAVE_DELAYS.len() {
             let height = wave_height(index, elapsed);
             let y = (bounds.size.height - height) / 2.0;
@@ -379,6 +484,114 @@ impl PillView {
 /// The mic glyph from `overlay.html`, drawn as primitives rather than parsed
 /// from the SVG path: a capsule for the body, an arc for the pickup ring, and a
 /// stem. At 14 px the two are indistinguishable, and this needs no path parser.
+/// One line of transcript, anchored to the right of `rect` so the words being
+/// spoken now stay on screen while the beginning scrolls out of it.
+///
+/// `overlay.html` clips with `overflow: hidden` and softens the cut with a CSS
+/// mask. There is no mask here: the longest suffix that fits is measured and
+/// drawn, and a short gradient over its left edge says the same thing -- there
+/// is more text than there is pill.
+fn draw_partial(text: &str, rect: NSRect, held: bool) {
+    if text.is_empty() || rect.size.width <= 1.0 {
+        return;
+    }
+    let font = NSFont::systemFontOfSize(11.0);
+    // Held text is dimmed: a line that stopped updating and a line whose
+    // transcriber died are the same picture otherwise.
+    let alpha = if held { 0.45 } else { 0.92 };
+    let color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, alpha);
+    let attributes = NSDictionary::from_slices(
+        &[unsafe { NSFontAttributeName }, unsafe {
+            NSForegroundColorAttributeName
+        }],
+        &[&*font as &AnyObject, &*color as &AnyObject],
+    );
+    let width_of = |candidate: &str| -> f64 {
+        let string = NSString::from_str(candidate);
+        unsafe { string.sizeWithAttributes(Some(&attributes)) }.width
+    };
+
+    // Longest suffix that fits, by binary search over character boundaries. The
+    // starts are searched rather than the ends: it is the tail that must
+    // survive.
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let (mut low, mut high) = (0usize, starts.len());
+    while low < high {
+        let middle = (low + high) / 2;
+        if width_of(&text[starts[middle]..]) <= rect.size.width {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let shown = &text[starts.get(low).copied().unwrap_or(text.len())..];
+    if shown.is_empty() {
+        return;
+    }
+
+    let line_height = font.ascender() - font.descender();
+    let origin = NSPoint::new(
+        rect.origin.x,
+        rect.origin.y + (rect.size.height - line_height) / 2.0 - font.descender(),
+    );
+    let string = NSString::from_str(shown);
+    unsafe { string.drawAtPoint_withAttributes(origin, Some(&attributes)) };
+
+    // Something was dropped, so fade the edge it was dropped from. Painted as
+    // columns of the body colour rather than an `NSGradient`, which would need
+    // its own object per draw for a band this narrow.
+    if low > 0 {
+        let band = FADE_WIDTH.min(rect.size.width);
+        let columns = band.ceil() as usize;
+        for column in 0..columns {
+            let x = column as f64;
+            let opacity = 1.0 - x / band;
+            {
+                NSColor::colorWithSRGBRed_green_blue_alpha(
+                    26.0 / 255.0,
+                    19.0 / 255.0,
+                    50.0 / 255.0,
+                    opacity,
+                )
+                .set();
+            }
+            let strip = NSRect::new(
+                NSPoint::new(rect.origin.x + x, rect.origin.y),
+                NSSize::new(1.0, rect.size.height),
+            );
+            NSBezierPath::fillRect(strip);
+        }
+    }
+}
+
+/// The check and the cross from `overlay.html`, on the same 24-unit grid the
+/// microphone uses: `M4 12.5l5.5 5.5L20 7` and `M6 6l12 12M18 6L6 18`, stroked
+/// round rather than filled.
+fn draw_badge(outcome: Outcome, frame: NSRect) {
+    let unit = frame.size.width / 24.0;
+    let x = |v: f64| frame.origin.x + v * unit;
+    let y = |v: f64| frame.origin.y + (24.0 - v) * unit;
+
+    let path = NSBezierPath::new();
+    path.setLineWidth(2.6 * unit);
+    path.setLineCapStyle(objc2_app_kit::NSLineCapStyle::Round);
+    path.setLineJoinStyle(objc2_app_kit::NSLineJoinStyle::Round);
+    match outcome {
+        Outcome::Done => {
+            path.moveToPoint(NSPoint::new(x(4.0), y(12.5)));
+            path.lineToPoint(NSPoint::new(x(9.5), y(18.0)));
+            path.lineToPoint(NSPoint::new(x(20.0), y(7.0)));
+        }
+        Outcome::Error => {
+            path.moveToPoint(NSPoint::new(x(6.0), y(6.0)));
+            path.lineToPoint(NSPoint::new(x(18.0), y(18.0)));
+            path.moveToPoint(NSPoint::new(x(18.0), y(6.0)));
+            path.lineToPoint(NSPoint::new(x(6.0), y(18.0)));
+        }
+    }
+    path.stroke();
+}
+
 fn draw_microphone(frame: NSRect) {
     let unit = frame.size.width / 24.0;
     let x = |v: f64| frame.origin.x + v * unit;
@@ -488,6 +701,8 @@ pub struct Overlay {
     panel: Retained<NSPanel>,
     view: Retained<PillView>,
     timer: RefCell<Option<Retained<NSTimer>>>,
+    /// A one-shot that takes the outcome badge back down.
+    badge_timer: RefCell<Option<Retained<NSTimer>>>,
     state: Cell<RecordingState>,
     engine: Arc<Engine>,
 }
@@ -537,6 +752,7 @@ impl Overlay {
             panel,
             view,
             timer: RefCell::new(None),
+            badge_timer: RefCell::new(None),
             state: Cell::new(RecordingState::Idle),
             engine: Arc::clone(engine),
         };
@@ -571,11 +787,23 @@ impl Overlay {
         let previous = self.state.get();
         self.state.set(state);
         self.view.ivars().state.set(state);
+
+        // The result event arrives just before the `idle` that follows it. Let
+        // the badge's own timer close that out; taking the pill down here would
+        // erase the outcome in the frame it appeared.
+        if matches!(state, RecordingState::Idle) && self.view.ivars().outcome.get().is_some() {
+            return;
+        }
+        self.clear_badge();
+        if !matches!(state, RecordingState::Recording) {
+            self.clear_partial();
+        }
         if previous != state {
             self.view.ivars().elapsed.set(0.0);
         }
 
-        self.snap(width_for(state), previous != state);
+        let previewing = !self.view.ivars().partial.borrow().is_empty();
+        self.snap(pill_width(state, None, previewing), previous != state);
         self.view.setNeedsDisplay(true);
 
         match state {
@@ -583,6 +811,77 @@ impl Overlay {
             _ => self.stop_animating(),
         }
         self.apply_visibility_setting();
+    }
+
+    /// Show how the dictation ended, and hold it long enough to be read.
+    ///
+    /// Always visible, even under hide-when-idle: the badge exists precisely to
+    /// be seen without switching to the app the text was meant for.
+    pub fn show_outcome(&self, outcome: Outcome) {
+        self.clear_partial();
+        self.view.ivars().outcome.set(Some(outcome));
+        self.stop_animating();
+        // Same footprint as idle, so the pill does not jump on its way out.
+        self.snap(WIDTH_IDLE, true);
+        self.view.setNeedsDisplay(true);
+        self.panel.orderFrontRegardless();
+
+        let block = block2::RcBlock::new(move |_timer: core::ptr::NonNull<NSTimer>| {
+            crate::app::with_app(|app| app.overlay().settle_outcome());
+        });
+        let timer =
+            unsafe { NSTimer::timerWithTimeInterval_repeats_block(outcome.hold(), false, &block) };
+        unsafe {
+            NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+        }
+        *self.badge_timer.borrow_mut() = Some(timer);
+    }
+
+    /// Take the badge down and let the pill rest, or carry on if a new capture
+    /// started while it was up.
+    pub fn settle_outcome(&self) {
+        self.clear_badge();
+        let state = self.state.get();
+        let previewing = !self.view.ivars().partial.borrow().is_empty();
+        self.snap(pill_width(state, None, previewing), true);
+        self.view.setNeedsDisplay(true);
+        self.apply_visibility_setting();
+    }
+
+    /// Show the latest reading of the recording in progress.
+    ///
+    /// `held` means the readings have stopped but the line still stands; it is
+    /// drawn dimmed, because a preview that stopped tracking and one whose
+    /// transcriber died look alike otherwise.
+    pub fn set_partial(&self, text: &str, held: bool) {
+        // A reading that arrives after the key came up has nothing to say about
+        // a pill that is already transcribing or resting.
+        if !matches!(self.state.get(), RecordingState::Recording) {
+            return;
+        }
+        let widen = self.view.ivars().partial.borrow().is_empty();
+        self.view
+            .ivars()
+            .partial
+            .borrow_mut()
+            .replace_range(.., text);
+        self.view.ivars().partial_held.set(held);
+        if widen {
+            self.snap(WIDTH_PREVIEW, true);
+        }
+        self.view.setNeedsDisplay(true);
+    }
+
+    fn clear_partial(&self) {
+        self.view.ivars().partial.borrow_mut().clear();
+        self.view.ivars().partial_held.set(false);
+    }
+
+    fn clear_badge(&self) {
+        self.view.ivars().outcome.set(None);
+        if let Some(timer) = self.badge_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
     }
 
     /// Resize and re-anchor. `animated` runs it inside an `NSAnimationContext`
@@ -646,6 +945,51 @@ mod tests {
         width: 1440.0,
         height: 875.0,
     };
+
+    /// The badge keeps the resting footprint on purpose: an outcome that
+    /// resized the pill would move it at the moment the user is reading it.
+    #[test]
+    fn an_outcome_badge_never_widens_the_pill() {
+        for outcome in [Outcome::Done, Outcome::Error] {
+            for state in [
+                RecordingState::Idle,
+                RecordingState::Recording,
+                RecordingState::Transcribing,
+            ] {
+                assert_eq!(pill_width(state, Some(outcome), false), WIDTH_IDLE);
+                // Even with a reading on screen: the badge replaced it.
+                assert_eq!(pill_width(state, Some(outcome), true), WIDTH_IDLE);
+            }
+        }
+    }
+
+    /// And a reading only widens the shape that has room to show one.
+    #[test]
+    fn only_a_running_recording_widens_for_a_reading() {
+        assert_eq!(
+            pill_width(RecordingState::Recording, None, true),
+            WIDTH_PREVIEW
+        );
+        assert_eq!(
+            pill_width(RecordingState::Recording, None, false),
+            WIDTH_RECORDING
+        );
+        // Transcribing and idle keep their own widths whatever is left over:
+        // the line is cleared when the capture ends, and a wide empty pill
+        // would sit there through the whole transcription.
+        assert_eq!(
+            pill_width(RecordingState::Transcribing, None, true),
+            WIDTH_TRANSCRIBING
+        );
+        assert_eq!(pill_width(RecordingState::Idle, None, true), WIDTH_IDLE);
+    }
+
+    /// Failure holds longer than success, and both hold long enough to read.
+    #[test]
+    fn failure_stays_up_longer_than_success() {
+        assert!(Outcome::Error.hold() > Outcome::Done.hold());
+        assert!(Outcome::Done.hold() >= 1.0);
+    }
 
     /// The eight anchors have to land on the edges of the *work area*, not the
     /// screen: a pill under the menu bar or behind the Dock is unreachable.

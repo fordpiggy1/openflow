@@ -8,7 +8,7 @@
 
 use crate::audio::{wav_duration_ms, AudioDevice, AudioRecorder};
 use crate::db::{Database, Transcription};
-use crate::insert::{paste_to_clipboard, write_clipboard, ClipboardPolicy};
+use crate::insert::{paste_to_clipboard, write_clipboard, ClipboardPolicy, InsertMethod};
 use crate::plugins::{HookPayload, PluginManager};
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -48,10 +49,29 @@ impl RecordingState {
     }
 }
 
+/// A reading of a recording that is still going.
+///
+/// The text is the whole recording so far, re-transcribed from the top, not an
+/// extension of the last one -- with more audio for context the transcriber
+/// revises words it had already emitted. A host replaces what it is showing;
+/// there is nothing to append and nothing to retract.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PartialTranscript {
+    pub text: String,
+    /// True on the last reading a capture will get, when the recording has run
+    /// past the window where previewing pays for itself. The line stands, but a
+    /// host should stop presenting it as live: a preview that has stopped
+    /// tracking and one whose transcriber has died look alike otherwise.
+    pub held: bool,
+}
+
 /// Everything the engine tells its host about.
 pub enum EngineEvent {
     RecordingState(RecordingState),
     TranscriptionResult(Transcription),
+    /// A reading of the recording in progress. Never the transcript of record:
+    /// nothing is saved, formatted or typed on the strength of one.
+    TranscriptionPartial(PartialTranscript),
     TranscriptionWarning(String),
     TranscriptionError(String),
     RecopySuccess(String),
@@ -96,6 +116,24 @@ pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// `tauri::async_runtime::spawn`, so the app keeps exactly one runtime.
 pub type Spawner = Box<dyn Fn(BoxedFuture) + Send + Sync + 'static>;
 
+/// How long to wait between one reading of a recording in progress and the next.
+///
+/// Measured from the end of a reading rather than the start, so a transcriber
+/// that takes longer than this simply reads less often. That is the whole of
+/// the back-pressure: a reading is never issued while one is outstanding, so
+/// the take the user is waiting on at key-up can queue behind at most one.
+pub const PARTIAL_INTERVAL: Duration = Duration::from_millis(800);
+
+/// How long into a recording to keep previewing it.
+///
+/// A reading costs the take it is previewing, and that cost grows with the
+/// square of the recording: a reading both takes longer and is outstanding for
+/// a larger share of the interval as the audio it re-reads grows. Against a LAN
+/// 0.6B that is about 40 ms of expected delay at key-up for a 10 s recording
+/// and 220 ms for a 38 s one. Past this point the line has long since scrolled
+/// out of the pill, so the preview is buying less and less at a rising price.
+pub const PARTIAL_WINDOW: Duration = Duration::from_secs(20);
+
 /// A capture that has run this long is a stuck flag, not a real recording.
 pub const MAX_RECORDING: Duration = Duration::from_secs(300);
 
@@ -119,6 +157,10 @@ pub struct Engine {
     last_transcription: Mutex<Option<String>>,
     transcription_jobs: Mutex<HashMap<String, CancellationToken>>,
     speech_jobs: Mutex<HashMap<String, CancellationToken>>,
+    /// Bumped whenever a capture starts or ends. A preview loop reads it once
+    /// and compares before every emit, so a reading still in the air when the
+    /// key comes up cannot paint over the capture that follows it.
+    partial_generation: AtomicU64,
     events: Arc<dyn EngineEvents>,
     /// How background work is started. The *host* owns the runtime this spawns
     /// onto, and must keep it alive past the engine: a task that ends up
@@ -165,6 +207,7 @@ impl Engine {
             last_transcription: Mutex::new(last_transcription),
             transcription_jobs: Mutex::new(HashMap::new()),
             speech_jobs: Mutex::new(HashMap::new()),
+            partial_generation: AtomicU64::new(0),
             events,
             spawn,
         }))
@@ -208,24 +251,27 @@ impl Engine {
 
     // ── Recording ─────────────────────────────────────────
     /// Start capturing on request, refusing when one is already in flight.
-    pub fn start_recording(&self) -> Result<(), String> {
-        let mut recording = self
-            .recording
-            .lock()
-            .map_err(|_| "Recording state is unavailable".to_string())?;
-        if !recording_slot_free(&recording) {
-            return Err("A recording is already active".to_string());
+    pub fn start_recording(self: &Arc<Self>) -> Result<(), String> {
+        {
+            let mut recording = self
+                .recording
+                .lock()
+                .map_err(|_| "Recording state is unavailable".to_string())?;
+            if !recording_slot_free(&recording) {
+                return Err("A recording is already active".to_string());
+            }
+            let device = self.settings.microphone();
+            self.recorder.start(device)?;
+            *recording = Some(Instant::now());
+            self.emit_state(RecordingState::Recording);
         }
-        let device = self.settings.microphone();
-        self.recorder.start(device)?;
-        *recording = Some(Instant::now());
-        self.emit_state(RecordingState::Recording);
+        self.began_capturing();
         Ok(())
     }
 
     /// The hold-to-talk press. A press while a capture is already running is
     /// the auto-repeat of a held key, so it is ignored rather than refused.
-    pub fn hotkey_pressed(&self) {
+    pub fn hotkey_pressed(self: &Arc<Self>) {
         let Ok(mut recording) = self.recording.lock() else {
             self.emit(EngineEvent::TranscriptionError(
                 "Recording state is unavailable".to_string(),
@@ -242,7 +288,112 @@ impl Engine {
                 return;
             }
             self.emit_state(RecordingState::Recording);
+            // Emitted with the recording lock held, as above; everything the
+            // capture kicks off happens after it is released.
+            drop(recording);
+            self.began_capturing();
         }
+    }
+
+    /// What every capture does once it is running, whichever way it started:
+    /// pay the first keystroke's cost while there is time to spare, and begin
+    /// previewing if this endpoint is one we can afford to keep asking.
+    fn began_capturing(self: &Arc<Self>) {
+        if self.settings.insert_method() == InsertMethod::Type {
+            crate::insert::prewarm_typing();
+        }
+        self.start_partials();
+    }
+
+    /// Invalidate any preview loop still running. Called from every path that
+    /// ends a capture, before the take is transcribed for real.
+    fn ended_capturing(&self) {
+        self.partial_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Read the recording every [`PARTIAL_INTERVAL`] and report what it says.
+    ///
+    /// The loop sleeps *between* readings rather than on a fixed schedule, so a
+    /// slow transcriber reads less often instead of queueing up behind itself.
+    fn start_partials(self: &Arc<Self>) {
+        if !self.settings.live_preview() {
+            return;
+        }
+        let generation = self.partial_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let engine = Arc::clone(self);
+        (self.spawn)(Box::pin(async move {
+            let until = Instant::now() + PARTIAL_WINDOW;
+            let mut last = String::new();
+            loop {
+                tokio::time::sleep(PARTIAL_INTERVAL).await;
+                if engine.partial_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if Instant::now() >= until {
+                    if !last.is_empty() {
+                        engine.emit(EngineEvent::TranscriptionPartial(PartialTranscript {
+                            text: last,
+                            held: true,
+                        }));
+                    }
+                    return;
+                }
+                // A reading that fails is a reading skipped, never an error the
+                // user sees: too little audio yet, a capture that just ended, an
+                // endpoint that did not answer. The take at key-up is unaffected
+                // by any of them.
+                let Ok(text) = engine.read_recording_so_far().await else {
+                    continue;
+                };
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                // Checked again on the way out: the key may have come up while
+                // this reading was in the air.
+                if engine.partial_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                last.clone_from(&text);
+                engine.emit(EngineEvent::TranscriptionPartial(PartialTranscript {
+                    text,
+                    held: false,
+                }));
+            }
+        }));
+    }
+
+    /// Transcribe what has been captured so far, leaving the capture running.
+    ///
+    /// Deliberately not the pipeline: no formatting pass, no plugin hooks, no
+    /// history row and nothing typed into the focused app. One dictation reads
+    /// itself many times, and anything with a side effect would fire that many
+    /// times with it.
+    async fn read_recording_so_far(&self) -> Result<String, String> {
+        {
+            let recording = self
+                .recording
+                .lock()
+                .map_err(|_| "Recording state is unavailable".to_string())?;
+            if recording.is_none() {
+                return Err("No recording is active".to_string());
+            }
+        }
+        let wav_bytes = self.recorder.snapshot()?;
+        let key = self.settings.api_key()?.unwrap_or_default();
+        let language = self.settings.language();
+        let provider = self.settings.provider();
+        let stt_model = self.settings.stt_model();
+        let dictionary = self.settings.dictionary();
+        transcribe::transcribe_audio(
+            wav_bytes,
+            &key,
+            language.as_deref(),
+            &provider,
+            stt_model.as_deref(),
+            dictionary.as_deref(),
+        )
+        .await
     }
 
     /// Stop and transcribe, handing the transcript back to the caller. The
@@ -258,6 +409,7 @@ impl Engine {
             }
             let result = self.recorder.stop();
             *recording = None;
+            self.ended_capturing();
             result
         };
         let wav_bytes = match wav_result {
@@ -298,6 +450,7 @@ impl Engine {
             }
             let result = self.recorder.stop();
             *recording = None;
+            self.ended_capturing();
             result
         };
 

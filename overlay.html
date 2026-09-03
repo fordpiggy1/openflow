@@ -281,89 +281,37 @@
         let badgeActive = false;
         let badgeTimer = null;
 
-        // Live preview. Every tick re-transcribes the whole recording so far;
-        // the result replaces the line rather than extending it.
+        // Live preview. The engine reads the recording as it goes and sends
+        // what it heard; each reading replaces the line rather than extending
+        // it, because the transcriber revises earlier words as it gets more
+        // context. The timing, the back-pressure and the cutoff all live in the
+        // engine now, so the native host gets the same behaviour for free.
         const preview = overlay.querySelector('.preview');
-        const PARTIAL_MS = 800;
         const PREVIEW_WIDTH = 320;
-        // A preview costs the take it is previewing: the transcriber is
-        // serialized, so a key-up can land behind one still in flight. That
-        // wait grows with the square of the recording -- a partial takes longer
-        // the more audio it re-reads, and so is in flight a larger share of the
-        // time. Measured against the LAN 0.6B it is about 40ms at 10s and
-        // 220ms at 38s. Past this point the preview stops paying for itself.
-        const PREVIEW_MAX_MS = 20_000;
-        let partialTimer = null;
-        let partialInFlight = false;
         let previewWidened = false;
-        // Bumped whenever a capture ends, so a reply that was still in the air
-        // cannot paint the preview of a recording that is already over.
-        let captureId = 0;
 
-        /// Stop ticking but leave the last line up. Unlike stopPartials this
-        /// is not the end of a capture: the recording is still running and the
-        /// text on screen is still the best guess at it.
-        function holdPartials() {
-          if (partialTimer) { clearInterval(partialTimer); partialTimer = null; }
-          if (overlay.hasAttribute('data-preview')) {
-            overlay.setAttribute('data-preview', 'held');
-          }
-        }
-
-        function stopPartials() {
-          captureId++;
-          if (partialTimer) { clearInterval(partialTimer); partialTimer = null; }
+        function clearPreview() {
           preview.textContent = '';
           previewWidened = false;
           overlay.removeAttribute('data-preview');
         }
 
-        async function drawPartial() {
-          // The transcriber answers one request at a time. Skipping a tick while
-          // one is still out keeps the queue empty, so the take the user is
-          // waiting on is not stuck behind a pile of previews they never see.
-          if (partialInFlight) return;
-          partialInFlight = true;
-          const capture = captureId;
-          try {
-            const text = (await invoke('transcribe_partial') || '').trim();
-            if (capture !== captureId || !text) return;
-            preview.textContent = text;
-            overlay.setAttribute('data-preview', partialTimer ? 'on' : 'held');
-            // Re-read the status rather than trust the tick: a key-up during
-            // the request would otherwise leave the wide capsule on screen
-            // over a state that asked for a narrow one.
-            if (!previewWidened && overlay.getAttribute('data-status') === 'recording') {
-              previewWidened = true;
-              await win.setSize(new LogicalSize(PREVIEW_WIDTH, 28));
-              await snapToPosition(win, position, PREVIEW_WIDTH);
-            }
-            // Follow the newest words; the CSS fades off what scrolls past.
-            preview.scrollLeft = preview.scrollWidth;
-          } catch {
-            // A recording that ended, too little audio yet, an endpoint that did
-            // not answer: a preview is best-effort, and the real transcription
-            // at key-up is unaffected by any of it.
-          } finally {
-            partialInFlight = false;
+        await listen('transcription-partial', async (event) => {
+          // A reading that lands after the key came up has nothing to say about
+          // a pill that is already transcribing or resting.
+          if (overlay.getAttribute('data-status') !== 'recording') return;
+          const { text, held } = event.payload || {};
+          if (!text) return;
+          preview.textContent = text;
+          overlay.setAttribute('data-preview', held ? 'held' : 'on');
+          if (!previewWidened) {
+            previewWidened = true;
+            await win.setSize(new LogicalSize(PREVIEW_WIDTH, 28));
+            await snapToPosition(win, position, PREVIEW_WIDTH);
           }
-        }
-
-        async function startPartials() {
-          stopPartials();
-          const capture = captureId;
-          let allowed = false;
-          try { allowed = await invoke('live_preview_enabled'); } catch {}
-          // The recording may already be over by the time that answers.
-          if (!allowed || capture !== captureId) return;
-          const startedAt = Date.now();
-          partialTimer = setInterval(() => {
-            // Checked before firing, not after: a request sent past the cap
-            // would still be in flight to be waited on.
-            if (Date.now() - startedAt >= PREVIEW_MAX_MS) holdPartials();
-            else drawPartial();
-          }, PARTIAL_MS);
-        }
+          // Follow the newest words; the CSS fades off what scrolls past.
+          preview.scrollLeft = preview.scrollWidth;
+        });
 
         async function settleIdle() {
           overlay.setAttribute('data-status', 'idle');
@@ -393,9 +341,8 @@
         await listen('recording-state', async (event) => {
           const status = event.payload;
           // Before the badge guard below returns: whatever else this event
-          // means, a status that is not "recording" ends the preview loop.
-          if (status === 'recording') startPartials().catch(() => {});
-          else stopPartials();
+          // means, a status that is not "recording" retires the preview.
+          if (status !== 'recording') clearPreview();
           // The result event arrives just before this `idle`. Let the badge's
           // own timer close it out; clobbering it here would erase the outcome
           // in the same frame it appeared.

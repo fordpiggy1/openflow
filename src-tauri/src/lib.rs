@@ -28,6 +28,9 @@ impl EngineEvents for TauriEvents {
             EngineEvent::TranscriptionResult(transcription) => {
                 self.app.emit("transcription-result", &transcription)
             }
+            EngineEvent::TranscriptionPartial(partial) => {
+                self.app.emit("transcription-partial", &partial)
+            }
             EngineEvent::TranscriptionWarning(warning) => {
                 self.app.emit("transcription-warning", warning)
             }
