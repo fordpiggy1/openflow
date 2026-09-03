@@ -26,3 +26,53 @@ Measured 2026-09-02 on a MacBook Air M4, 16 GB, macOS 26.5, mlx 0.32.2, mlx-audi
 ## Recommendation
 
 Build the runner abstraction engine-agnostic (PLAN.md section 7) and ship the MLX Qwen sidecar as the engine: 1.7B as the default model (keeps proper nouns), 0.6B offered as "fast" in Settings, the dictionary applied as a deterministic post-pass since neither Qwen size honors a prompt, prewarm the model when recording starts so the 3 s load hides behind the user speaking, and unload after 10 minutes idle. whisper.cpp is ruled out as the primary engine on speed: it matches the cloud round trip it was meant to beat. It stays a candidate for a no-Python build later, at the cost of the 4x speed gain.
+
+## Addendum 2026-09-03: Moonshine and Cohere Transcribe
+
+Same machine, same `take.wav` clip, same method (one cold run, median of five warm runs). Reference transcript: "Um, so the entro.ly leaderboard, ah, needs the FastPay ledger fixed. Scratch that, needs the FastPay ledger checked before Thursday."
+
+### Moonshine (moonshine-voice 0.1.5, ONNX Runtime 1.23.2 on CPU, MIT for the English models)
+
+Measured with `bench_moonshine.py` (`Transcriber.transcribe_without_streaming`) and `mem_moonshine.py` (one model per fresh process, `ru_maxrss`).
+
+| Model | Params | Warm inference | Cold (first call) | Load from disk | Process max RSS | Weights on disk | "entro.ly" | "FastPay" | "before Thursday" | Fillers |
+|---|---|---|---|---|---|---|---|---|---|---|
+| tiny-en | 27M | 0.30 s (min 0.288) | 0.26 s | 0.12 s | 246 MB | 42 MB | "intro.ly" | "fast pay" | correct | keeps "Um", "uh" |
+| base-en | 62M | 0.44 s (min 0.430) | 0.40 s | 0.19 s | 562 MB | 142 MB | "intro.ly" | "fast pay" | correct | keeps "Um", "ah" |
+| tiny-streaming-en (2026) | | 0.38 s | 0.33 s | 0.03 s | 324 MB | 47 MB | "intro.ly" | "fast pay" | wrong ("4th of April") | garbles "Um" as "On" |
+| small-streaming-en (2026) | | 0.89 s | 0.79 s | 0.06 s | 722 MB | 139 MB | "intro.ly" | "fast pay" | wrong ("30 days") | keeps both |
+| medium-streaming-en (2026, catalog default) | 245M | 1.28 s | 1.22 s | 0.13 s | 1151 MB | 269 MB | "intro.ly" | "fast pay" | wrong ("30") | keeps both |
+
+Notes.
+
+- Moonshine base-en matches Qwen 0.6B on speed (0.44 s against 0.40 s) on the CPU alone, with no Metal, about half the resident memory (562 MB RSS against 1.03 GB active) and a 142 MB download against 969 MB. On this clip it is also more accurate than Qwen 0.6B: "intro.ly" instead of "intro dot lie", and the same "fast pay" that every local engine produces. The dictionary post-pass fixes both spellings.
+- tiny-en at 27M parameters is the fastest engine measured, 0.30 s, and got every content word of the clip right. It keeps filler words; the cleanup step or a filler post-pass has to drop them.
+- The 2026 streaming line is slower per clip in this offline call and all three sizes got the trailing date wrong. They are built for incremental captions, not for a hold-to-talk take. Do not pick them for the runner on the basis of the vendor WER tables.
+- Runtime shape: the package is a 9.7 MB `libmoonshine.dylib` plus a 26 MB ONNX Runtime, with a plain C API (`moonshine_load_transcriber_from_files`, `moonshine_transcribe_without_streaming`). The Python layer is ctypes glue. That means a Moonshine engine can be linked into the Rust binary directly, with no Python sidecar and no 600 MB of MLX packages. The CoreML execution provider is not compiled into this build; everything ran on CPU.
+- Load is near instant (0.03 to 0.19 s), so prewarm and idle unload matter much less than they do for Qwen (3 s reload).
+- Licensing: the English models are MIT; the non-English models are under the non-commercial Moonshine Community License, which the downloader warns about. English only is fine for OpenFlow; a multilingual local mode would need Qwen or Cohere.
+- Memory caveat: `ru_maxrss` after one transcription; the first-loaded model in a process also pays the ONNX Runtime and Python overhead (about 28 MB before load).
+
+### Cohere Transcribe 03-2026 (2B, Apache-2.0): not measured
+
+Three attempts through mlx-audio 0.5.1, which ships a `cohere_asr` model class, all produced multilingual token soup at about 3.4 s warm and 4.4 to 6.2 GB peak memory:
+
+- `mlx-community/cohere-transcribe-03-2026-mlx-8bit`: an artifact for a different runtime (`mlx-speech`), stored as 4.13 GB of bf16 tensors under a config that claims 8-bit affine quantization, so mlx-audio quantized the layers and then loaded nothing into them.
+- The same files with the quantization block removed: still garbage.
+- `beshkenadze/cohere-transcribe-03-2026-mlx-8bit`: converted for mlx-audio-swift with 128 fused qkv tensors and different key names. Loading non-strict left 662 of 2486 parameters at random init (the whole `pre_encode` conv stack among them) and ignored 797 checkpoint tensors.
+
+The loader in mlx-audio expects the canonical Hugging Face layout and converts on the fly, and the canonical repo `CohereLabs/cohere-transcribe-03-2026` is gated (HTTP 401 without an accepted-terms token). Measuring it needs a Hugging Face login that has accepted Cohere's terms; then it is one command:
+
+```
+./mlxenv/bin/python bench_qwen.py take.wav CohereLabs/cohere-transcribe-03-2026
+```
+
+Published figures for context only, not measured here: Cohere reports 5.42% average WER on the Open ASR leaderboard (Qwen3-ASR-1.7B 5.76%, Whisper large-v3 7.44%), and the community 8-bit conversion reports 2.87 GB peak memory on Apple silicon. Expect it in the Qwen 1.7B class for cost, with a 4 GB fp16 or 2.3 GB int8 download, so it competes for the "accurate" slot, not the "fast" one.
+
+## Recommendation, revised
+
+- Keep Qwen3-ASR-1.7B as the accurate tier.
+- Offer Moonshine base-en as the light tier instead of Qwen 0.6B: same speed, better on this clip, half the memory, one seventh of the download, no Metal, MIT. tiny-en is the floor for old or low-memory machines.
+- Because Moonshine is a C library, the light tier can drop the Python sidecar entirely by linking `libmoonshine` from `openflow-core` behind the existing engine abstraction. That removes the largest piece of the local-mode install for users who only dictate in English.
+- For the iPhone app, Moonshine tiny-en or base-en (42 to 142 MB, CPU ONNX) is a far better fit for the "entirely local, lightweight, background" brief than Qwen 0.6B MLX (1 GB resident, Metal toolchain). This changes `docs/mobile/PLAN.md`'s engine choice and is Titan's call.
+- Cohere Transcribe stays a candidate for the accurate tier once it can be measured through the canonical weights.
