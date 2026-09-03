@@ -54,11 +54,12 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSControlTextEditingDelegate, NSFocusRingType,
-    NSFont, NSImage, NSImageSymbolConfiguration, NSImageView, NSScrollView, NSSplitViewController,
-    NSSplitViewItem, NSTableCellView, NSTableColumn, NSTableColumnResizingOptions, NSTableView,
-    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextField, NSTitlebarSeparatorStyle, NSView, NSViewController, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSFont, NSImage, NSImageSymbolConfiguration, NSImageView, NSResponder, NSScrollView,
+    NSSplitViewController, NSSplitViewItem, NSTableCellView, NSTableColumn,
+    NSTableColumnResizingOptions, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTextField,
+    NSTitlebarSeparatorStyle, NSView, NSViewController, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSIndexSet, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -149,6 +150,28 @@ define_class!(
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             crate::ui::dismiss_window(&self.ivars().window, "main");
             false
+        }
+
+        /// Give the keyboard back to the record button, but only if nothing
+        /// else has it.
+        ///
+        /// A system alert over the window -- the microphone prompt is the one
+        /// that happens here -- leaves the window with no first responder at
+        /// all when it goes away, and Space then does nothing until the user
+        /// tabs somewhere. Restoring it unconditionally would be worse than
+        /// the problem: it would yank focus off whatever the user had
+        /// deliberately tabbed to every time they switched back to the app. A
+        /// window reports *itself* as first responder when nothing else is,
+        /// which is exactly the case worth repairing and no other.
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            let window = &self.ivars().window;
+            let vacant = window
+                .firstResponder()
+                .is_none_or(|responder| std::ptr::eq(&*responder, &**window as &NSResponder));
+            if vacant {
+                self.focus_current();
+            }
         }
     }
 
