@@ -262,6 +262,18 @@ impl Engine {
         let _ = self.events.emit(event);
     }
 
+    /// Point the network guard at the stored `local_only` value before doing
+    /// anything that makes a request.
+    ///
+    /// `Settings::set` already keeps the guard in step, so this is belt and
+    /// braces rather than the mechanism: the other host writes the same
+    /// database, and a row that changed under this process must not be able to
+    /// let a request out. The pipeline enforces the rule for cleanup and voice
+    /// the same way, since all three go through one client.
+    fn arm_local_only(&self) {
+        transcribe::set_local_only(self.settings.local_only());
+    }
+
     fn emit_state(&self, state: RecordingState) {
         self.emit(EngineEvent::RecordingState(state));
     }
@@ -358,6 +370,7 @@ impl Engine {
         if !self.settings.live_preview() {
             return;
         }
+        self.arm_local_only();
         // Resolved once, here, rather than per reading: `api_key` is a keychain
         // read, and a 20 s window is 25 of them for one dictation. The cost of
         // reading it once is that a settings change made *during* a capture does
@@ -627,6 +640,7 @@ impl Engine {
         cancellation: CancellationToken,
         wav_bytes: Vec<u8>,
     ) -> Result<(Transcription, Option<String>), String> {
+        self.arm_local_only();
         let duration_ms = wav_duration_ms(&wav_bytes);
 
         // Empty is valid for a self-hosted endpoint; transcribe_audio rejects it
@@ -833,10 +847,12 @@ impl Engine {
 
     // ── Speech ────────────────────────────────────────────
     pub async fn synthesize_speech(&self, request: &SpeechRequest) -> Result<SpeechAudio, String> {
+        self.arm_local_only();
         speech::synthesize(&self.settings, request).await
     }
 
     pub async fn stream_speech(&self, request: SpeechRequest) -> Result<SpeechResult, String> {
+        self.arm_local_only();
         speech::stream(&self.settings, &self.events, &self.speech_jobs, request).await
     }
 

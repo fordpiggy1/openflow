@@ -1,6 +1,7 @@
 use base64::Engine;
-use reqwest::{multipart, Response};
+use reqwest::{multipart, Method, Response};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -144,9 +145,12 @@ pub async fn fetch_models(api_key: &str, provider: &Provider) -> Result<Vec<Mode
             },
         ]);
     }
-    let client = client()?;
     let response = with_openrouter_headers(
-        with_auth(client.get(provider.endpoint("models")?), provider, api_key),
+        with_auth(
+            request(Method::GET, &provider.endpoint("models")?)?,
+            provider,
+            api_key,
+        ),
         provider,
     )
     .timeout(Duration::from_secs(15))
@@ -280,9 +284,11 @@ async fn transcribe_openrouter(
         body["language"] = language.into();
     }
     let response = with_openrouter_headers(
-        client()?
-            .post(format!("{OPENROUTER_URL}/audio/transcriptions"))
-            .bearer_auth(api_key),
+        request(
+            Method::POST,
+            &format!("{OPENROUTER_URL}/audio/transcriptions"),
+        )?
+        .bearer_auth(api_key),
         &Provider::OpenRouter,
     )
     .json(&body)
@@ -322,7 +328,7 @@ async fn transcribe_whisper(
     }
     let response = with_openrouter_headers(
         with_auth(
-            client()?.post(provider.endpoint("audio/transcriptions")?),
+            request(Method::POST, &provider.endpoint("audio/transcriptions")?)?,
             provider,
             api_key,
         ),
@@ -369,8 +375,7 @@ async fn transcribe_deepgram(
     if let Some(language) = normalize_language(language) {
         url.query_pairs_mut().append_pair("language", language);
     }
-    let response = client()?
-        .post(url)
+    let response = request(Method::POST, url.as_str())?
         .header("Authorization", format!("Token {}", api_key))
         .header("Content-Type", "audio/wav")
         .body(wav_bytes)
@@ -425,7 +430,7 @@ pub async fn format_text(
     }
     let endpoint = provider.endpoint("chat/completions")?;
     let response = with_openrouter_headers(
-        with_auth(client()?.post(endpoint), provider, api_key),
+        with_auth(request(Method::POST, &endpoint)?, provider, api_key),
         provider,
     )
     .json(&body)
@@ -484,7 +489,7 @@ pub async fn request_speech(
     let body = serde_json::json!({ "model": model, "input": text, "voice": voice, "response_format": response_format });
     let response = with_openrouter_headers(
         with_auth(
-            client()?.post(provider.endpoint("audio/speech")?),
+            request(Method::POST, &provider.endpoint("audio/speech")?)?,
             provider,
             api_key,
         ),
@@ -536,6 +541,77 @@ pub fn speech_mime(format: &str) -> &'static str {
         "wav" => "audio/wav",
         _ => "audio/pcm",
     }
+}
+
+// ── Local only ────────────────────────────────────────────
+
+/// Whether every request this process makes has to stay on this machine.
+///
+/// Mirrors the `local_only` setting. It is a process-wide flag rather than a
+/// parameter because it is an invariant about the *client*, not about one call:
+/// the toggle promises "no requests leave this machine", and a promise that
+/// each call site has to remember to pass along is one an added call site can
+/// quietly break. [`Settings::set`](crate::settings::Settings::set) keeps it in
+/// step with the stored value, and the pipeline re-reads it before every take.
+static LOCAL_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Point the guard at the stored setting.
+pub fn set_local_only(on: bool) {
+    LOCAL_ONLY.store(on, Ordering::SeqCst);
+}
+
+pub fn local_only() -> bool {
+    LOCAL_ONLY.load(Ordering::SeqCst)
+}
+
+/// Whether a URL names this machine.
+///
+/// Deliberately the three literal hosts and nothing else: `127.0.0.1`,
+/// `::1` (in either spelling) and `localhost`. The rest of `127.0.0.0/8` is
+/// equally local, and a hostname can resolve to a loopback address, but neither
+/// is worth widening the rule for -- the runner binds `127.0.0.1` and a
+/// privacy switch is the wrong place to be generous. A URL that does not parse
+/// is not loopback either.
+pub fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
+}
+
+/// Refuse a request that would leave this machine while `local_only` is on.
+///
+/// Called before the request is built, so nothing is connected, no DNS is
+/// resolved and no credential is attached: the refusal happens with the URL and
+/// the setting alone.
+fn guard_local_only(url: &str) -> Result<(), String> {
+    if !local_only() || is_loopback_url(url) {
+        return Ok(());
+    }
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| "another machine".to_string());
+    Err(format!(
+        "\"Local only\" is on, so OpenFlow did not send this to {}. Turn Local only off in Settings, or point this at a service on this Mac.",
+        host
+    ))
+}
+
+/// The one way to start a request in this module.
+///
+/// Every call goes through here, which is what makes the `local_only` guard an
+/// invariant rather than a habit: a new endpoint cannot be added without being
+/// checked, because there is no other way to reach the client.
+fn request(method: Method, url: &str) -> Result<reqwest::RequestBuilder, String> {
+    guard_local_only(url)?;
+    Ok(client()?.request(method, url))
 }
 
 /// One client for the life of the process. Building a `reqwest::Client`
@@ -665,7 +741,7 @@ fn validate_custom_url(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -785,6 +861,156 @@ mod tests {
             None
         );
     }
+
+    /// The rule the Local only toggle promises, on its own.
+    #[test]
+    fn only_this_machine_counts_as_loopback() {
+        for url in [
+            "http://127.0.0.1:8123/v1",
+            "http://localhost:8123/v1",
+            "http://LocalHost:8123/v1",
+            "http://[::1]:8123/v1",
+            "https://127.0.0.1/v1/audio/transcriptions",
+        ] {
+            assert!(is_loopback_url(url), "{url} names this machine");
+        }
+        for url in [
+            "https://api.groq.com/openai/v1",
+            "http://192.168.1.10:8880/v1",
+            "http://127.0.0.2:8123/v1",
+            "http://localhost.evil.example/v1",
+            "http://127.0.0.1.evil.example/v1",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url} does not name this machine");
+        }
+    }
+
+    /// The guard itself: a hosted URL is refused, with the setting named, and a
+    /// loopback URL passes. Refused *before* the request is built, so nothing
+    /// resolves, connects or attaches a credential.
+    #[test]
+    fn local_only_refuses_a_hosted_url_and_passes_a_loopback_one() {
+        let _guard = LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        set_local_only(false);
+        assert!(guard_local_only("https://api.groq.com/openai/v1").is_ok());
+
+        set_local_only(true);
+        let refused = guard_local_only("https://api.groq.com/openai/v1/audio/transcriptions")
+            .expect_err("a hosted URL must be refused while Local only is on");
+        assert!(
+            refused.contains("Local only"),
+            "the error must name the setting: {refused}"
+        );
+        assert!(
+            refused.contains("api.groq.com"),
+            "the error must name the host it refused: {refused}"
+        );
+        assert!(guard_local_only("http://127.0.0.1:8123/v1").is_ok());
+        assert!(guard_local_only("http://localhost:8123/v1").is_ok());
+        set_local_only(false);
+    }
+
+    /// ...and the guard is actually on the path every request takes, for
+    /// transcription, cleanup and voice alike. A unit test of the predicate
+    /// would pass even if nothing called it.
+    #[test]
+    fn local_only_stops_transcription_cleanup_and_voice_before_they_connect() {
+        let _guard = LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let hosted = Provider::Groq;
+        let wav = vec![0u8; 64];
+
+        set_local_only(true);
+        for error in [
+            runtime
+                .block_on(transcribe_audio(
+                    wav.clone(),
+                    "gsk-test",
+                    None,
+                    &hosted,
+                    None,
+                    None,
+                ))
+                .expect_err("transcription must be refused"),
+            runtime
+                .block_on(format_text("hi", "gsk-test", None, &hosted, None))
+                .expect_err("cleanup must be refused"),
+            runtime
+                .block_on(request_speech(
+                    "hi", "gsk-test", &hosted, "tts-1", "alloy", "mp3",
+                ))
+                .expect_err("voice must be refused"),
+            runtime
+                .block_on(fetch_models("gsk-test", &hosted))
+                .expect_err("listing models must be refused"),
+        ] {
+            assert!(
+                error.contains("Local only"),
+                "every leg must name the setting: {error}"
+            );
+        }
+
+        // Deepgram builds its URL by hand rather than through `Provider::endpoint`,
+        // so it is checked separately or it would be the one way out.
+        let deepgram_error = runtime
+            .block_on(transcribe_audio(
+                wav,
+                "token",
+                None,
+                &Provider::Deepgram,
+                None,
+                None,
+            ))
+            .expect_err("Deepgram must be refused too");
+        assert!(deepgram_error.contains("Local only"), "{deepgram_error}");
+
+        // The positive control, and it has to be a real request: a guard that
+        // refused everything would pass every assertion above. With Local only
+        // still on, a loopback endpoint is contacted and answers.
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a throwaway endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+        let capture = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the cleanup request");
+            let mut buffer = vec![0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let body = br#"{"choices":[{"message":{"content":"hi"}}]}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(body);
+            String::from_utf8_lossy(&buffer[..read]).into_owned()
+        });
+        let loopback = Provider::from_str(&format!("custom:http://127.0.0.1:{port}/v1"));
+        assert_eq!(
+            runtime.block_on(format_text("hi", "", None, &loopback, None)),
+            Ok("hi".to_string()),
+            "a loopback endpoint must still be reachable while Local only is on"
+        );
+        assert!(
+            capture
+                .join()
+                .expect("capture thread")
+                .starts_with("POST /v1/chat/completions "),
+            "the request has to have crossed the socket"
+        );
+        set_local_only(false);
+    }
+
+    /// Everything that writes the process-wide flag takes turns, including
+    /// `settings::tests`, which proves the setting arms this guard.
+    pub(crate) static LOCAL_ONLY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn explicit_output_modalities_override_generic_model_names() {

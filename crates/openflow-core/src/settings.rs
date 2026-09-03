@@ -46,7 +46,17 @@ pub fn live_preview_allowed(setting: Option<&str>, provider: &Provider) -> bool 
 
 impl Settings {
     pub fn new(db: Database, secrets: SecretStore) -> Self {
-        Self { db, secrets }
+        let settings = Self { db, secrets };
+        // The network guard is a property of the process, so it is armed the
+        // moment the stored value is readable rather than when the first
+        // request happens to be made. Only a stored value speaks: an install
+        // that has never touched the toggle leaves the guard at its default,
+        // which is the same answer and does not have a second `Settings` in the
+        // process (a test's scratch store, say) overwrite a live one.
+        if let Some(stored) = settings.db.get_setting("local_only") {
+            crate::transcribe::set_local_only(stored == "true");
+        }
+        settings
     }
 
     pub fn db(&self) -> &Database {
@@ -68,11 +78,17 @@ impl Settings {
 
     /// Write any key by name, routing the secret ones to the keychain.
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
-        if is_secret_setting(key) {
+        let written = if is_secret_setting(key) {
             self.secrets.set(key, value)
         } else {
             self.db.set_setting(key, value)
+        };
+        // Turning Local only on has to bind the next request, not the next
+        // launch, so the guard follows the write rather than being polled.
+        if written.is_ok() && key == "local_only" {
+            crate::transcribe::set_local_only(value == "true");
         }
+        written
     }
 
     /// Lift any secret still sitting in the settings table into the keychain,
@@ -262,6 +278,15 @@ impl Settings {
 
     pub fn preserve_clipboard(&self) -> bool {
         self.clipboard_policy() == ClipboardPolicy::Restore
+    }
+
+    /// Whether every request has to stay on this machine.
+    ///
+    /// The guard that enforces it lives in [`crate::transcribe`] and is armed
+    /// by [`Settings::new`] and [`Settings::set`], so the toggle binds the next
+    /// request rather than the next launch.
+    pub fn local_only(&self) -> bool {
+        self.flag_off_by_default("local_only")
     }
 
     // ── History ───────────────────────────────────────────
@@ -460,6 +485,47 @@ mod tests {
             hotkey::parse_shortcut("Option+V").expect("the default parses")
         );
         assert!(settings.shortcut("nonsense").is_err());
+    }
+
+    /// Storing the row is not the feature; arming the guard is. Writing
+    /// `local_only` has to bind the very next request, so this checks the
+    /// network guard and not just the value that comes back out of the table.
+    #[test]
+    fn turning_local_only_on_arms_the_network_guard() {
+        let _serialized = crate::transcribe::tests::LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let settings = scratch_settings();
+        assert!(!settings.local_only(), "off until the user says otherwise");
+
+        settings
+            .set("local_only", "true")
+            .expect("write the toggle");
+        assert!(settings.local_only());
+        assert!(
+            crate::transcribe::local_only(),
+            "the write must arm the guard, not only store a row"
+        );
+
+        settings
+            .set("local_only", "false")
+            .expect("write the toggle");
+        assert!(!crate::transcribe::local_only());
+
+        // ...and a launch with the row already on arms it before any request.
+        let dir =
+            std::env::temp_dir().join(format!("openflow-local-only-{}", uuid::Uuid::new_v4()));
+        let db = Database::new(dir.clone()).expect("a scratch database");
+        db.set_setting("local_only", "true").expect("seed the row");
+        let reopened = Settings::new(db, SecretStore::new(dir));
+        assert!(reopened.local_only());
+        assert!(
+            crate::transcribe::local_only(),
+            "a stored toggle must arm the guard at construction"
+        );
+        reopened
+            .set("local_only", "false")
+            .expect("leave the process as we found it");
     }
 
     /// A blank voice model or voice means "the provider's own default", not an
