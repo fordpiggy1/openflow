@@ -1,6 +1,7 @@
 use base64::Engine;
 use reqwest::{multipart, Response};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
@@ -21,6 +22,10 @@ pub enum Provider {
 }
 
 impl Provider {
+    // Public API since the move into the library crate, so clippy now compares it
+    // with `std::str::FromStr`. This one is infallible and falls back to Groq;
+    // the trait's `Result` signature would change every call site.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Self::OpenAI,
@@ -538,8 +543,7 @@ pub fn speech_mime(format: &str) -> &'static str {
 /// per request cost a fresh TCP and TLS handshake on every call and threw the
 /// pool away before the next one could reuse it.
 fn client() -> Result<reqwest::Client, String> {
-    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()

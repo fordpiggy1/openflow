@@ -8,6 +8,8 @@ use std::thread;
 enum RecordCommand {
     Start(Option<String>, mpsc::Sender<Result<(), String>>),
     Stop(mpsc::Sender<Result<Vec<u8>, String>>),
+    /// Encode what has been captured so far without disturbing the capture.
+    Snapshot(mpsc::Sender<Result<Vec<u8>, String>>),
     ListDevices(mpsc::Sender<Vec<AudioDevice>>),
 }
 
@@ -23,6 +25,10 @@ pub struct AudioRecorder {
 }
 
 impl AudioRecorder {
+    // The move into the library crate makes this constructor public API, which
+    // is the only reason clippy now asks for a `Default`. Adding one would be a
+    // new API, not a move.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RecordCommand>();
 
@@ -147,11 +153,10 @@ impl AudioRecorder {
                                         .to_string()));
                             continue;
                         }
-                        let mono_16k = downsample(&samples_data, native_sample_rate, 16_000);
-                        if mono_16k.len() < 800 {
+                        let Some(mono_16k) = prepare_take(&samples_data, native_sample_rate) else {
                             let _ = reply.send(Err("Recording too short.".to_string()));
                             continue;
-                        }
+                        };
                         if is_silent(&mono_16k) {
                             let _ = reply.send(Err(format!(
                                 "No sound reached OpenFlow from \"{}\". Pick a different microphone in Settings.",
@@ -161,6 +166,30 @@ impl AudioRecorder {
                         }
                         let result = encode_wav(&auto_gain(&mono_16k), 16_000);
                         let _ = reply.send(result);
+                    }
+                    RecordCommand::Snapshot(reply) => {
+                        if active_stream.is_none() {
+                            let _ = reply.send(Err("No recording is active".to_string()));
+                            continue;
+                        }
+                        // Copy under the lock, do the work outside it. The
+                        // capture callback takes this same lock on a realtime
+                        // thread and must never wait on a downsample.
+                        let captured = match samples.lock() {
+                            Ok(buffer) => buffer.clone(),
+                            Err(_) => {
+                                let _ = reply.send(Err("Audio buffer is unavailable".to_string()));
+                                continue;
+                            }
+                        };
+                        let Some(mono_16k) = prepare_take(&captured, native_sample_rate) else {
+                            let _ = reply.send(Err("Not enough audio yet".to_string()));
+                            continue;
+                        };
+                        // No silence gate here. A partial take is allowed to be
+                        // quiet, and rejecting it would only skip one update of
+                        // a preview, never a transcription the user asked for.
+                        let _ = reply.send(encode_wav(&auto_gain(&mono_16k), 16_000));
                     }
                 }
             }
@@ -187,6 +216,20 @@ impl AudioRecorder {
         reply_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| "Microphone start timed out".to_string())?
+    }
+
+    /// WAV for the audio captured so far, while recording continues.
+    ///
+    /// Leaves the buffer alone: the take that `stop` returns is unaffected by
+    /// however many snapshots were read along the way.
+    pub fn snapshot(&self) -> Result<Vec<u8>, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(RecordCommand::Snapshot(reply_tx))
+            .map_err(|_| "Audio thread not running".to_string())?;
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| "Microphone snapshot timed out".to_string())?
     }
 
     pub fn stop(&self) -> Result<Vec<u8>, String> {
@@ -436,6 +479,17 @@ fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     output
 }
 
+/// Resample a take to the 16 kHz the transcription API wants, or `None` when
+/// there is too little audio to be worth sending.
+///
+/// `stop` and `snapshot` share it so a preview of the first N seconds is the
+/// same audio the final pass will see for those seconds -- a preview that
+/// drifted from the take would show text the user never gets.
+fn prepare_take(captured: &[f32], native_sample_rate: u32) -> Option<Vec<f32>> {
+    let mono_16k = downsample(captured, native_sample_rate, 16_000);
+    (mono_16k.len() >= 800).then_some(mono_16k)
+}
+
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -508,6 +562,126 @@ mod tests {
         }
         let sum: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
         (sum / samples.len() as f64).sqrt() as f32
+    }
+
+    /// Record for `secs`, optionally taking a snapshot every `every`.
+    ///
+    /// Returns the final take's duration and what each snapshot cost, in ms.
+    fn record_with_snapshots(secs: f32, every: Option<u64>) -> (i64, Vec<i64>, Vec<u128>) {
+        use std::time::{Duration, Instant};
+
+        let recorder = AudioRecorder::new();
+        recorder.start(None).expect("microphone did not start");
+
+        let deadline = Instant::now() + Duration::from_secs_f32(secs);
+        let mut lengths = Vec::new();
+        let mut costs = Vec::new();
+        while Instant::now() < deadline {
+            match every {
+                Some(ms) => {
+                    thread::sleep(Duration::from_millis(ms));
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    let started = Instant::now();
+                    let partial = recorder.snapshot().expect("snapshot failed mid-recording");
+                    costs.push(started.elapsed().as_micros());
+                    lengths.push(wav_duration_ms(&partial).expect("snapshot is not valid WAV"));
+                }
+                None => thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let take = recorder.stop().expect("stop failed");
+        (
+            wav_duration_ms(&take).expect("take is not valid WAV"),
+            lengths,
+            costs,
+        )
+    }
+
+    #[test]
+    #[ignore = "needs a real microphone: cargo test -- --ignored --test-threads=1"]
+    fn snapshots_do_not_cost_the_recording_any_audio() {
+        let (control, _, _) = record_with_snapshots(4.0, None);
+        let (snapshotted, lengths, costs) = record_with_snapshots(4.0, Some(800));
+
+        let worst = costs.iter().max().copied().unwrap_or(0);
+        println!("control {control} ms, with snapshots {snapshotted} ms");
+        println!("snapshot durations {lengths:?} ms");
+        println!("snapshot cost {costs:?} us (worst {worst} us)");
+
+        assert!(
+            lengths.len() >= 3,
+            "expected several snapshots: {lengths:?}"
+        );
+        // Each snapshot sees strictly more audio than the last, and lands near
+        // where the wall clock says it should.
+        for pair in lengths.windows(2) {
+            assert!(pair[1] > pair[0], "snapshots went backwards: {lengths:?}");
+        }
+        for (i, &len) in lengths.iter().enumerate() {
+            let expected = 800 * (i as i64 + 1);
+            assert!(
+                (len - expected).abs() < 250,
+                "snapshot {i} saw {len} ms, expected about {expected} ms"
+            );
+        }
+        // The point of the test: a take that was read from mid-recording is the
+        // same length as one that was not. A snapshot that blocked the capture
+        // callback, or consumed the buffer, would show up right here.
+        assert!(
+            (snapshotted - control).abs() < 120,
+            "snapshots changed the take length: {control} ms alone, {snapshotted} ms with"
+        );
+        assert!(
+            snapshotted > 3_800,
+            "4 s of recording produced only {snapshotted} ms"
+        );
+    }
+
+    #[test]
+    fn a_partial_take_matches_the_start_of_the_full_take() {
+        // What a snapshot shows must be what the final take says for those same
+        // seconds. Only the very tail of a partial may differ: the anti-alias
+        // filter there is looking at audio that has not been captured yet.
+        let full = tone(1_000.0, 48_000, 2.0);
+        let partial = prepare_take(&full[..48_000], 48_000).expect("one second is enough");
+        let complete = prepare_take(&full, 48_000).expect("two seconds is enough");
+
+        assert_eq!(partial.len(), 16_000);
+        assert_eq!(complete.len(), 32_000);
+        // The FIR is 63 taps wide at most; stay clear of the partial's edge.
+        let settled = partial.len() - 128;
+        for i in 0..settled {
+            assert!(
+                (partial[i] - complete[i]).abs() < 1e-6,
+                "partial diverged from the full take at sample {i}: \
+                 {} vs {}",
+                partial[i],
+                complete[i]
+            );
+        }
+    }
+
+    #[test]
+    fn a_take_too_short_to_send_is_refused() {
+        // 40 ms at 48 kHz lands under the 800-sample floor once resampled.
+        assert!(prepare_take(&tone(1_000.0, 48_000, 0.04), 48_000).is_none());
+        assert!(prepare_take(&[], 48_000).is_none());
+        assert!(prepare_take(&tone(1_000.0, 48_000, 0.2), 48_000).is_some());
+    }
+
+    #[test]
+    fn a_quiet_partial_is_still_encodable() {
+        // `stop` refuses a silent take, `snapshot` must not: a preview taken in
+        // the pause before someone starts speaking is not an error.
+        let mut hush = tone(300.0, 48_000, 0.5);
+        for sample in hush.iter_mut() {
+            *sample *= 0.0005;
+        }
+        let mono = prepare_take(&hush, 48_000).expect("half a second is enough");
+        assert!(is_silent(&mono), "the fixture must be quiet enough to gate");
+        assert!(encode_wav(&auto_gain(&mono), 16_000).is_ok());
     }
 
     #[test]

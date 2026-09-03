@@ -9,29 +9,13 @@ edition = "2021"
 name = "openflow_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Synthesized keystrokes carrying a unicode payload, for the "type" insert
-# method. Only macOS is implemented; other platforms fall back to pasting.
-core-graphics = "0.24"
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# Windows, tray, shortcuts and the command surface. Everything else the app does
+# lives in openflow-core, so nothing here talks to audio, HTTP or sqlite.
 [dependencies]
+openflow-core = { workspace = true }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-cpal = "0.15"
-hound = "3.5"
-reqwest = { version = "0.13", default-features = false, features = ["multipart", "json", "stream", "rustls", "http2", "charset", "system-proxy"] }
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
-futures-util = "0.3"
-arboard = "3"
-base64 = "0.22"
-rusqlite = { version = "0.31", features = ["bundled"] }
-uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
-dirs-next = "2"

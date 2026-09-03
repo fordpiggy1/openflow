@@ -51,7 +51,7 @@ jobs:
           node-version: 22
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: . -> target
       - run: npm run check:rust
 
   desktop-build:
@@ -84,9 +84,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: . -> target
       - run: npm ci
       - name: Lint platform-specific Rust paths
         if: runner.os != 'Linux'
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: npm run tauri:build -- --no-bundle

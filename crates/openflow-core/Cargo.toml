@@ -1,0 +1,31 @@
+[package]
+name = "openflow-core"
+version = "0.1.0"
+description = "UI-free core of OpenFlow: capture, transcription, insertion, settings and storage"
+authors = ["laisyio"]
+edition = "2021"
+
+[lib]
+name = "openflow_core"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+cpal = { workspace = true }
+hound = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+dirs-next = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+arboard = { workspace = true }
+global-hotkey = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Synthesized keystrokes carrying a unicode payload, for the "type" insert
+# method. Only macOS is implemented; other platforms fall back to pasting.
+core-graphics = { workspace = true }

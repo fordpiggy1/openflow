@@ -36,6 +36,10 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
+    // The move into the library crate makes this constructor public API, which
+    // is the only reason clippy now asks for a `Default`. Adding one would be a
+    // new API, not a move.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let plugins_dir = dirs_next::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -45,6 +49,13 @@ impl PluginManager {
         let _ = std::fs::create_dir_all(&plugins_dir);
 
         Self { plugins_dir }
+    }
+
+    /// Where plugins live. A host needs this to reveal the folder and to read a
+    /// manifest out of a directory the user picked; the field itself stays
+    /// private so the path is still owned here.
+    pub fn plugins_dir(&self) -> &Path {
+        &self.plugins_dir
     }
 
     pub fn list_plugins(&self) -> Vec<PluginInfo> {
