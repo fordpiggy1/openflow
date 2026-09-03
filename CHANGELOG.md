@@ -4,6 +4,12 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Windows CI: gate the shell stand-in test to unix
+By: Titan (with Claude)
+Impact: `crates/openflow-core/src/runner.rs`
+
+- `the_install_and_model_checks_are_not_re_run_on_every_start` writes a `#!/bin/sh` stand-in for Python and sets its mode with `PermissionsExt`, which does not exist on Windows, so `openflow-core`'s test build has been red on `windows-latest` since the runner landed. The test is now `#[cfg(unix)]`, like the two hook tests in `plugins.rs` that do the same thing.
+
 ### Settings joins the main window, and the wizard becomes a sheet on it
 By: Ford (with Claude)
 Impact: `crates/openflow-native/src/ui/{settings,onboarding,card,main_window,mod}.rs`, `crates/openflow-native/src/{app.rs,tray.rs}`, `README.md`, `docs/native-port/PLAN.md`
