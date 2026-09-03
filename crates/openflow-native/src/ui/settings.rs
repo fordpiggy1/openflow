@@ -40,10 +40,17 @@ use crate::ui::{
     Form, ROW,
 };
 
-const WINDOW_WIDTH: f64 = 420.0;
-const WINDOW_HEIGHT: f64 = 560.0;
-const TAB_WIDTH: f64 = 396.0;
-const TAB_HEIGHT: f64 = 496.0;
+const WINDOW_WIDTH: f64 = 460.0;
+const WINDOW_HEIGHT: f64 = 700.0;
+const TAB_WIDTH: f64 = 436.0;
+const TAB_HEIGHT: f64 = 636.0;
+/// The height of the swappable transcription panel on the Providers tab.
+///
+/// One frame, two views, one of them hidden: the online rows and the
+/// on-this-Mac rows are alternatives, not a list, and stacking both would push
+/// the cleanup rows below either into a scroll view or off the tab. Sized for
+/// the taller of the two so nothing reflows when the choice changes.
+const BOX_HEIGHT: f64 = 300.0;
 /// The dictionary is sent to the transcriber as a spelling hint and the web
 /// settings screen caps it here.
 pub const DICTIONARY_LIMIT: usize = 800;
@@ -92,6 +99,21 @@ const LANGUAGES: &[(&str, &str)] = &[
 ];
 const THEMES: &[(&str, &str)] = &[("", "System"), ("light", "Light"), ("dark", "Dark")];
 const INSERT_METHODS: &[(&str, &str)] = &[("paste", "Paste"), ("type", "Type")];
+/// Where transcription runs. The stored values are what `transcription_backend`
+/// holds; anything else in that row reads as `remote`.
+const BACKENDS: &[(&str, &str)] = &[
+    ("remote", "An online provider"),
+    ("local", "On this Mac (private)"),
+];
+/// How long the local model may sit loaded doing nothing.
+const IDLE_MINUTES: &[(&str, &str)] = &[
+    ("1", "1 minute"),
+    ("5", "5 minutes"),
+    ("10", "10 minutes"),
+    ("30", "30 minutes"),
+    ("60", "1 hour"),
+    ("240", "4 hours"),
+];
 const TTS_FORMATS: &[(&str, &str)] = &[("mp3", "mp3"), ("wav", "wav")];
 const RETENTIONS: &[(&str, &str)] = &[
     ("", "Never"),
@@ -145,6 +167,11 @@ const TAG_FORMAT_ENABLED: isize = 27;
 const TAG_STT_MODEL: isize = 28;
 const TAG_CHAT_MODEL: isize = 29;
 const TAG_FETCH_MODELS: isize = 30;
+const TAG_BACKEND: isize = 31;
+const TAG_LOCAL_MODEL: isize = 32;
+const TAG_LOCAL_IDLE: isize = 33;
+const TAG_LOCAL_ONLY: isize = 34;
+const TAG_LIVE_PREVIEW: isize = 10;
 
 const TAG_TTS_ENABLED: isize = 40;
 const TAG_TTS_PROVIDER: isize = 41;
@@ -169,6 +196,21 @@ struct Controls {
     overlay_position: Retained<NSPopUpButton>,
     theme: Retained<NSPopUpButton>,
     language: Retained<NSPopUpButton>,
+    live_preview: Retained<NSSwitch>,
+
+    backend: Retained<NSPopUpButton>,
+    /// The online-provider rows and the on-this-Mac rows share one frame; the
+    /// backend choice decides which of the two is hidden.
+    remote_box: Retained<objc2_app_kit::NSView>,
+    local_box: Retained<objc2_app_kit::NSView>,
+    local_status: Retained<NSTextField>,
+    local_model: Retained<NSPopUpButton>,
+    local_cost: Retained<NSTextField>,
+    local_idle: Retained<NSPopUpButton>,
+    local_only: Retained<NSSwitch>,
+    local_install: Retained<objc2_app_kit::NSButton>,
+    local_download: Retained<objc2_app_kit::NSButton>,
+    local_stop: Retained<objc2_app_kit::NSButton>,
 
     provider: Retained<NSPopUpButton>,
     provider_url: Retained<NSTextField>,
@@ -316,6 +358,25 @@ define_class!(
             self.stop_preview();
         }
 
+        #[unsafe(method(installRunner:))]
+        fn install_runner(&self, _sender: &NSControl) {
+            self.run_runner_step(|runner| {
+                let _ = runner.install();
+            });
+        }
+
+        #[unsafe(method(downloadRunner:))]
+        fn download_runner(&self, _sender: &NSControl) {
+            self.run_runner_step(|runner| {
+                let _ = runner.download();
+            });
+        }
+
+        #[unsafe(method(stopRunner:))]
+        fn stop_runner(&self, _sender: &NSControl) {
+            self.run_runner_step(|runner| runner.stop());
+        }
+
         #[unsafe(method(clearHistory:))]
         fn clear_history(&self, _sender: &NSControl) {
             let message = match self.ivars().engine.clear_history() {
@@ -426,6 +487,9 @@ impl SettingsWindow {
             &controls.tts_provider,
             &controls.tts_format,
             &controls.retention,
+            &controls.backend,
+            &controls.local_model,
+            &controls.local_idle,
         ] {
             wire(control, target, changed);
         }
@@ -436,6 +500,8 @@ impl SettingsWindow {
             &controls.format_enabled,
             &controls.tts_enabled,
             &controls.save_history,
+            &controls.live_preview,
+            &controls.local_only,
         ] {
             wire(control, target, changed);
         }
@@ -581,7 +647,31 @@ impl SettingsWindow {
             settings.language().as_deref().unwrap_or(""),
         );
 
+        set_switch(&controls.live_preview, settings.live_preview());
+
         // Providers
+        select_value(
+            &controls.backend,
+            BACKENDS,
+            settings.transcription_backend().as_str(),
+        );
+        select_pairs(
+            &controls.local_model,
+            &local_model_values(),
+            &settings.local_model(),
+        );
+        select_value(
+            &controls.local_idle,
+            IDLE_MINUTES,
+            &settings.local_idle_minutes().to_string(),
+        );
+        set_switch(&controls.local_only, settings.local_only());
+        self.apply_backend_choice();
+        self.set_runner_state(&ivars.engine.runner().status());
+        // The sidecar may have unloaded its model while the window was closed;
+        // one read on open, and after that the supervisor pushes changes.
+        ivars.engine.runner().refresh_health();
+
         let (provider, provider_url) = split_provider(&settings.provider_name());
         select_value(&controls.provider, PROVIDERS, &provider);
         self.set_text(&controls.provider_url, &provider_url);
@@ -740,6 +830,45 @@ impl SettingsWindow {
                 written
             }
             TAG_LANGUAGE => settings.set("language", selected_value(&controls.language, LANGUAGES)),
+            TAG_LIVE_PREVIEW => {
+                settings.set("live_preview", bool_setting(is_on(&controls.live_preview)))
+            }
+            TAG_BACKEND => {
+                let value = selected_value(&controls.backend, BACKENDS);
+                let written = settings.set("transcription_backend", value);
+                self.apply_backend_choice();
+                written
+            }
+            TAG_LOCAL_MODEL => {
+                let options = local_model_values();
+                let index = { controls.local_model.indexOfSelectedItem() }.max(0) as usize;
+                let value = options
+                    .get(index)
+                    .map(|(value, _)| value.clone())
+                    .unwrap_or_else(|| openflow_core::settings::DEFAULT_LOCAL_MODEL.to_string());
+                let written = settings.set("local_model", &value);
+                // A different model is a different sidecar. `configure` stops
+                // the running one; the next dictation starts the new one, so
+                // switching does not pay for a load nobody asked for.
+                ivars.engine.reconfigure_runner();
+                self.apply_backend_choice();
+                written
+            }
+            TAG_LOCAL_IDLE => {
+                let written = settings.set(
+                    "local_idle_minutes",
+                    selected_value(&controls.local_idle, IDLE_MINUTES),
+                );
+                ivars.engine.reconfigure_runner();
+                written
+            }
+            TAG_LOCAL_ONLY => {
+                let written = settings.set("local_only", bool_setting(is_on(&controls.local_only)));
+                // The guard is armed by the write itself; this is the UI half
+                // of the same promise.
+                self.apply_local_only_gating();
+                written
+            }
             TAG_PROVIDER | TAG_PROVIDER_URL => settings.set(
                 "provider",
                 &join_provider(
@@ -798,6 +927,111 @@ impl SettingsWindow {
         if let Err(error) = result {
             self.set_text(&controls.models_status, &error);
         }
+        // Cheap, and it depends on three different rows (the toggle and the two
+        // provider endpoints), so it is re-evaluated after any of them.
+        self.apply_local_only_gating();
+    }
+
+    // ── The local runner ──────────────────────────────────
+
+    /// Show the half of the Providers tab that matches the backend choice, and
+    /// keep the model's cost sentence next to the model it describes.
+    fn apply_backend_choice(&self) {
+        let controls = &self.ivars().controls;
+        let local = selected_value(&controls.backend, BACKENDS) == "local";
+        controls.remote_box.setHidden(local);
+        controls.local_box.setHidden(!local);
+        let index = { controls.local_model.indexOfSelectedItem() }.max(0) as usize;
+        let model = openflow_core::runner::LOCAL_MODELS
+            .get(index)
+            .unwrap_or(&openflow_core::runner::LOCAL_MODELS[0]);
+        self.set_text(&controls.local_cost, model.cost);
+    }
+
+    /// What "Local only" turns off.
+    ///
+    /// The engine refuses a request that would leave the machine whatever this
+    /// does -- the guard is in the client, not the window. This is so the
+    /// screen does not offer a cleanup provider and a voice preview that would
+    /// be refused the moment they were used, and so the reason is on screen
+    /// rather than in an error afterwards.
+    fn apply_local_only_gating(&self) {
+        let ivars = self.ivars();
+        let controls = &ivars.controls;
+        let local_only = is_on(&controls.local_only);
+        let cleanup_local = provider_is_loopback(&join_provider(
+            selected_value(&controls.formatting_provider, FORMATTING_PROVIDERS),
+            &string_value(&controls.formatting_url),
+        ));
+        let voice_local = provider_is_loopback(&join_provider(
+            selected_value(&controls.tts_provider, TTS_PROVIDERS),
+            &string_value(&controls.tts_url),
+        ));
+        let cleanup_enabled = !local_only || cleanup_local;
+        let voice_enabled = !local_only || voice_local;
+
+        for control in [
+            controls.format_enabled.as_ref() as &NSControl,
+            &controls.chat_model,
+        ] {
+            control.setEnabled(cleanup_enabled);
+        }
+        for control in [
+            controls.tts_enabled.as_ref() as &NSControl,
+            &controls.tts_model,
+            &controls.tts_voice,
+            &controls.tts_format,
+            &controls.preview_text,
+        ] {
+            control.setEnabled(voice_enabled);
+        }
+        if local_only && !voice_enabled {
+            self.set_voice_status(
+                "Local only is on. Point the speech endpoint at this Mac to use voice.",
+            );
+        }
+    }
+
+    /// Reflect a supervisor state that was pushed to us. Never called on a
+    /// timer: [`crate::app::App::handle_event`] forwards
+    /// `EngineEvent::RunnerState`, and `reload` reads the current one once when
+    /// the window opens.
+    pub fn set_runner_state(&self, status: &openflow_core::runner::RunnerStatus) {
+        let controls = &self.ivars().controls;
+        let mut line = status.detail.clone();
+        if line.is_empty() {
+            line = "Not running.".to_string();
+        }
+        if let Some(bytes) = status.resident_bytes {
+            if status.phase == openflow_core::runner::RunnerPhase::Ready {
+                line = format!("{} Holding {}.", line, human_bytes(bytes));
+            }
+        }
+        self.set_text(&controls.local_status, &line);
+        // One thing at a time: an install and a download both drive the same
+        // Python and the same directory.
+        let busy = status.phase.is_busy();
+        controls.local_install.setEnabled(!busy);
+        controls.local_download.setEnabled(!busy);
+        controls
+            .local_stop
+            .setEnabled(status.port.is_some() || busy);
+    }
+
+    /// Run a blocking supervisor step on its own thread.
+    ///
+    /// Not the tokio runtime: an install is minutes of subprocess and would
+    /// hold a runtime worker for all of it. Progress comes back as
+    /// `EngineEvent::RunnerState`, so nothing here waits for the result.
+    fn run_runner_step(
+        &self,
+        step: impl FnOnce(&Arc<openflow_core::runner::LocalRunner>) + Send + 'static,
+    ) {
+        let runner = Arc::clone(self.ivars().engine.runner());
+        std::thread::Builder::new()
+            .name("openflow-settings-runner".into())
+            .spawn(move || step(&runner))
+            .ok();
     }
 
     fn write_dictionary(&self) {
@@ -1087,6 +1321,39 @@ pub fn split_provider(stored: &str) -> (String, String) {
     }
 }
 
+/// Whether a stored provider value points at this machine. Only a custom
+/// endpoint can: every named provider is somewhere else by definition.
+pub fn provider_is_loopback(stored: &str) -> bool {
+    stored
+        .strip_prefix("custom:")
+        .map(openflow_core::transcribe::is_loopback_url)
+        .unwrap_or(false)
+}
+
+/// Memory, for a label. Whole numbers under a gigabyte, one decimal above.
+pub fn human_bytes(bytes: u64) -> String {
+    const GB: f64 = 1_073_741_824.0;
+    const MB: f64 = 1_048_576.0;
+    if bytes as f64 >= GB {
+        format!("{:.1} GB", bytes as f64 / GB)
+    } else {
+        format!("{} MB", (bytes as f64 / MB).round() as u64)
+    }
+}
+
+/// The local model options as (stored value, menu title) pairs.
+fn local_model_values() -> Vec<(String, String)> {
+    openflow_core::runner::LOCAL_MODELS
+        .iter()
+        .map(|model| {
+            (
+                model.key.to_string(),
+                format!("{} — {}", model.label, model.short_cost),
+            )
+        })
+        .collect()
+}
+
 pub fn join_provider(kind: &str, url: &str) -> String {
     if kind == "custom" {
         format!("custom:{}", url.trim().trim_end_matches('/'))
@@ -1171,32 +1438,47 @@ fn build_tabs(
     form.add(&label(mtm, "Language", l));
     let language = popup(mtm, c, TAG_LANGUAGE, &titles(LANGUAGES));
     form.add(&language);
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Live preview while recording", l));
+    let live_preview = switch_control(mtm, switch_rect(c), TAG_LIVE_PREVIEW);
+    form.add(&live_preview);
+    let n = form.control_only(26.0);
+    form.add(&note(
+        mtm,
+        "Shows words in the pill as you speak. On a machine on your network it is free; on a paid provider it re-sends the recording every 0.8 s and bills for each one.",
+        n,
+    ));
     let general = form.view.clone();
 
     // Providers
     let mut form = Form::new(mtm, TAB_WIDTH, TAB_HEIGHT);
     let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Transcription", l));
-    let provider = popup(mtm, c, TAG_PROVIDER, &titles(PROVIDERS));
-    form.add(&provider);
+    form.add(&label(mtm, "Transcription runs", l));
+    let backend = popup(mtm, c, TAG_BACKEND, &titles(BACKENDS));
+    form.add(&backend);
 
-    let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Endpoint URL", l));
-    let provider_url = text_field(mtm, c, TAG_PROVIDER_URL);
-    form.add(&provider_url);
-    let n = form.control_only(14.0);
-    form.add(&note(mtm, "Only used by Custom endpoint.", n));
+    // The two alternatives, in one frame. Only one is ever visible.
+    let box_frame = form.full(BOX_HEIGHT);
 
-    let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "API key", l));
-    let api_key = secure_field(mtm, c, TAG_API_KEY);
-    form.add(&api_key);
-    let n = form.control_only(14.0);
-    form.add(&note(
-        mtm,
-        "Stored in the macOS keychain, never in the database.",
-        n,
-    ));
+    let (remote_box, provider, provider_url, api_key, stt_model, fetch, models_status) =
+        build_remote_panel(mtm);
+    remote_box.setFrame(box_frame);
+    form.add(&remote_box);
+
+    let (
+        local_box,
+        local_status,
+        local_model,
+        local_cost,
+        local_idle,
+        local_only,
+        local_install,
+        local_download,
+        local_stop,
+    ) = build_local_panel(mtm);
+    local_box.setFrame(box_frame);
+    form.add(&local_box);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Same for cleanup", l));
@@ -1229,36 +1511,18 @@ fn build_tabs(
     form.add(&format_enabled);
 
     let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Speech-to-text model", l));
-    let stt_model = combo(mtm, c, TAG_STT_MODEL);
-    form.add(&stt_model);
-
-    let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Cleanup model", l));
     let chat_model = combo(mtm, c, TAG_CHAT_MODEL);
     form.add(&chat_model);
 
     let c = form.control_only(ROW);
-    let fetch = button(
-        mtm,
-        NSRect::new(c.origin, NSSize::new(130.0, c.size.height)),
-        "Fetch models",
-        TAG_FETCH_MODELS,
-    );
-    form.add(&fetch);
     let setup = button(
         mtm,
-        NSRect::new(
-            NSPoint::new(c.origin.x + 138.0, c.origin.y),
-            NSSize::new(130.0, c.size.height),
-        ),
+        NSRect::new(c.origin, NSSize::new(140.0, c.size.height)),
         "Run setup again",
         0,
     );
     form.add(&setup);
-    let n = form.control_only(28.0);
-    let models_status = note(mtm, "", n);
-    form.add(&models_status);
     let providers = form.view.clone();
 
     // Voice
@@ -1348,7 +1612,7 @@ fn build_tabs(
     let n = form.full(28.0);
     form.add(&note(
         mtm,
-        "Names and terms to spell correctly, comma separated. Sent to Whisper as a spelling hint.",
+        "Names and terms to spell correctly, comma separated. Sent to Whisper as a hint, and applied to every transcript afterwards. Write `heard -> Correct` to fix a mishearing.",
         n,
     ));
 
@@ -1386,6 +1650,18 @@ fn build_tabs(
         overlay_position,
         theme,
         language,
+        live_preview,
+        backend,
+        remote_box,
+        local_box,
+        local_status,
+        local_model,
+        local_cost,
+        local_idle,
+        local_only,
+        local_install: local_install.clone(),
+        local_download: local_download.clone(),
+        local_stop: local_stop.clone(),
         provider,
         provider_url,
         api_key,
@@ -1411,18 +1687,194 @@ fn build_tabs(
         save_history,
         retention,
         history_status,
-        actions: vec![fetch, setup, play, stop, clear],
+        actions: vec![
+            fetch,
+            setup,
+            play,
+            stop,
+            clear,
+            local_install,
+            local_download,
+            local_stop,
+        ],
     };
     (general, providers, voice, privacy, controls)
 }
 
-/// The action buttons, in the order `build_tabs` creates them.
-const ACTION_SELECTORS: [fn() -> Sel; 5] = [
+/// The online-provider half of the Providers tab: which service, its endpoint,
+/// its key, its model, and the button that lists models from it.
+#[allow(clippy::type_complexity)]
+fn build_remote_panel(
+    mtm: MainThreadMarker,
+) -> (
+    Retained<objc2_app_kit::NSView>,
+    Retained<NSPopUpButton>,
+    Retained<NSTextField>,
+    Retained<NSSecureTextField>,
+    Retained<NSComboBox>,
+    Retained<objc2_app_kit::NSButton>,
+    Retained<NSTextField>,
+) {
+    let mut form = Form::new(mtm, TAB_WIDTH, BOX_HEIGHT);
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Provider", l));
+    let provider = popup(mtm, c, TAG_PROVIDER, &titles(PROVIDERS));
+    form.add(&provider);
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Endpoint URL", l));
+    let provider_url = text_field(mtm, c, TAG_PROVIDER_URL);
+    form.add(&provider_url);
+    let n = form.control_only(14.0);
+    form.add(&note(mtm, "Only used by Custom endpoint.", n));
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "API key", l));
+    let api_key = secure_field(mtm, c, TAG_API_KEY);
+    form.add(&api_key);
+    let n = form.control_only(14.0);
+    form.add(&note(
+        mtm,
+        "Stored in the macOS keychain, never in the database.",
+        n,
+    ));
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Speech-to-text model", l));
+    let stt_model = combo(mtm, c, TAG_STT_MODEL);
+    form.add(&stt_model);
+
+    let c = form.control_only(ROW);
+    let fetch = button(
+        mtm,
+        NSRect::new(c.origin, NSSize::new(130.0, c.size.height)),
+        "Fetch models",
+        TAG_FETCH_MODELS,
+    );
+    form.add(&fetch);
+    let n = form.control_only(28.0);
+    let models_status = note(mtm, "", n);
+    form.add(&models_status);
+
+    (
+        form.view.clone(),
+        provider,
+        provider_url,
+        api_key,
+        stt_model,
+        fetch,
+        models_status,
+    )
+}
+
+/// The on-this-Mac half: what the runner is doing, which model, the two
+/// one-time setup steps, how long the model may stay loaded, and the toggle
+/// that stops anything leaving the machine.
+#[allow(clippy::type_complexity)]
+fn build_local_panel(
+    mtm: MainThreadMarker,
+) -> (
+    Retained<objc2_app_kit::NSView>,
+    Retained<NSTextField>,
+    Retained<NSPopUpButton>,
+    Retained<NSTextField>,
+    Retained<NSPopUpButton>,
+    Retained<NSSwitch>,
+    Retained<objc2_app_kit::NSButton>,
+    Retained<objc2_app_kit::NSButton>,
+    Retained<objc2_app_kit::NSButton>,
+) {
+    let mut form = Form::new(mtm, TAB_WIDTH, BOX_HEIGHT);
+    let n = form.full(28.0);
+    let local_status = note(mtm, "", n);
+    form.add(&local_status);
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Model", l));
+    let model_titles = local_model_titles();
+    let model_titles: Vec<&str> = model_titles.iter().map(String::as_str).collect();
+    let local_model = popup(mtm, c, TAG_LOCAL_MODEL, &model_titles);
+    form.add(&local_model);
+    let n = form.control_only(26.0);
+    let local_cost = note(mtm, "", n);
+    form.add(&local_cost);
+
+    let c = form.control_only(ROW);
+    let local_install = button(
+        mtm,
+        NSRect::new(c.origin, NSSize::new(92.0, c.size.height)),
+        "Install",
+        0,
+    );
+    form.add(&local_install);
+    let local_download = button(
+        mtm,
+        NSRect::new(
+            NSPoint::new(c.origin.x + 96.0, c.origin.y),
+            NSSize::new(110.0, c.size.height),
+        ),
+        "Download",
+        0,
+    );
+    form.add(&local_download);
+    let local_stop = button(
+        mtm,
+        NSRect::new(
+            NSPoint::new(c.origin.x + 210.0, c.origin.y),
+            NSSize::new(80.0, c.size.height),
+        ),
+        "Stop",
+        0,
+    );
+    form.add(&local_stop);
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Unload after", l));
+    let local_idle = popup(mtm, c, TAG_LOCAL_IDLE, &titles(IDLE_MINUTES));
+    form.add(&local_idle);
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Local only", l));
+    let local_only = switch_control(mtm, switch_rect(c), TAG_LOCAL_ONLY);
+    form.add(&local_only);
+    let n = form.control_only(26.0);
+    form.add(&note(
+        mtm,
+        "Refuses any request that would leave this Mac, which turns off cleanup and voice unless they point at a service running here.",
+        n,
+    ));
+
+    (
+        form.view.clone(),
+        local_status,
+        local_model,
+        local_cost,
+        local_idle,
+        local_only,
+        local_install,
+        local_download,
+        local_stop,
+    )
+}
+
+/// The model menu, with each option's measured cost beside its name.
+fn local_model_titles() -> Vec<String> {
+    local_model_values()
+        .into_iter()
+        .map(|(_, title)| title)
+        .collect()
+}
+
+/// The action buttons, in the order `build_tabs` puts them in `actions`.
+const ACTION_SELECTORS: [fn() -> Sel; 8] = [
     || sel!(fetchModels:),
     || sel!(runSetup:),
     || sel!(previewVoice:),
     || sel!(stopVoice:),
     || sel!(clearHistory:),
+    || sel!(installRunner:),
+    || sel!(downloadRunner:),
+    || sel!(stopRunner:),
 ];
 
 /// A switch is 38 px wide whatever the column is; left-align it in the column.
@@ -1528,6 +1980,69 @@ mod tests {
         ] {
             assert!(!writes_on_end_editing(tag), "tag {tag} should be live");
         }
+    }
+
+    /// Every popup maps a selected index to a stored value by table position,
+    /// so the runner's tables have to hold exactly the values the settings
+    /// accessors return -- including their defaults, which is what an unset key
+    /// reads back as.
+    #[test]
+    fn the_local_runner_tables_hold_what_the_settings_return() {
+        assert_eq!(
+            BACKENDS[0].0,
+            openflow_core::settings::TranscriptionBackend::Remote.as_str(),
+            "an unset backend means remote, and index 0 is the fallback"
+        );
+        assert!(BACKENDS.iter().any(|(value, _)| *value == "local"));
+
+        let models = local_model_values();
+        assert_eq!(models.len(), openflow_core::runner::LOCAL_MODELS.len());
+        for (index, model) in openflow_core::runner::LOCAL_MODELS.iter().enumerate() {
+            assert_eq!(models[index].0, model.key);
+            assert!(
+                models[index].1.contains(model.short_cost),
+                "the menu has to carry the measured cost: {}",
+                models[index].1
+            );
+        }
+        assert_eq!(
+            models[0].0,
+            openflow_core::settings::DEFAULT_LOCAL_MODEL,
+            "the shipped default has to be first, since index 0 is the fallback"
+        );
+        assert!(
+            IDLE_MINUTES.iter().any(|(value, _)| value
+                == &openflow_core::settings::DEFAULT_LOCAL_IDLE_MINUTES.to_string()),
+            "the default idle window has to be offerable, or opening Settings changes it"
+        );
+    }
+
+    /// What the Local only toggle disables in the UI. The engine refuses these
+    /// requests whatever the window does; this is about not offering a control
+    /// that would be refused the moment it was used.
+    #[test]
+    fn only_a_loopback_endpoint_survives_local_only() {
+        assert!(provider_is_loopback("custom:http://127.0.0.1:8123/v1"));
+        assert!(provider_is_loopback("custom:http://localhost:8880/v1"));
+        assert!(!provider_is_loopback("custom:http://192.168.1.10:8880/v1"));
+        assert!(!provider_is_loopback("groq"));
+        assert!(!provider_is_loopback("openrouter"));
+        assert!(!provider_is_loopback(""));
+        // The joined form the window writes is the form this reads.
+        assert!(provider_is_loopback(&join_provider(
+            "custom",
+            "http://127.0.0.1:9000/v1/"
+        )));
+    }
+
+    /// The memory figure sits in a one-line label, and the two model sizes have
+    /// to read as the benchmark's numbers rather than as raw bytes.
+    #[test]
+    fn memory_reads_as_the_measured_numbers() {
+        assert_eq!(human_bytes(1_305_085_572), "1.2 GB");
+        assert_eq!(human_bytes(2_792_422_202), "2.6 GB");
+        assert_eq!(human_bytes(142_442_496), "136 MB");
+        assert_eq!(human_bytes(0), "0 MB");
     }
 
     /// The two boolean spellings the settings table understands.

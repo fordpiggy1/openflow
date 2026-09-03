@@ -95,7 +95,9 @@ pub struct LocalModel {
     pub repo: &'static str,
     /// The menu title.
     pub label: &'static str,
-    /// The sentence under it.
+    /// The cost, short enough to sit in the menu item beside the label.
+    pub short_cost: &'static str,
+    /// The sentence under the picker.
     pub cost: &'static str,
 }
 
@@ -106,14 +108,16 @@ pub const LOCAL_MODELS: &[LocalModel] = &[
     LocalModel {
         key: "accurate",
         repo: "mlx-community/Qwen3-ASR-1.7B-8bit",
-        label: "Accurate (Qwen3-ASR 1.7B)",
+        label: "Accurate (1.7B)",
+        short_cost: "2.5 GB, 1.0 s",
         cost:
             "About 2.5 GB of memory while loaded, 1.0 s for a 10 s dictation. Keeps product names.",
     },
     LocalModel {
         key: "fast",
         repo: "mlx-community/Qwen3-ASR-0.6B-8bit",
-        label: "Fast (Qwen3-ASR 0.6B)",
+        label: "Fast (0.6B)",
+        short_cost: "1.0 GB, 0.4 s",
         cost: "About 1.0 GB of memory while loaded, 0.4 s for a 10 s dictation. Weaker on names.",
     },
 ];
@@ -1475,6 +1479,11 @@ ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler).serve_forever()
         for model in LOCAL_MODELS {
             assert!(model.repo.starts_with("mlx-community/"));
             assert!(!model.cost.is_empty(), "{} needs its cost", model.key);
+            assert!(
+                !model.short_cost.is_empty(),
+                "{} needs a cost short enough for the menu",
+                model.key
+            );
         }
     }
 
