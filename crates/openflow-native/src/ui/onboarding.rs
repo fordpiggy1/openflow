@@ -46,14 +46,29 @@ use openflow_core::transcribe::ModelInfo;
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::settings::{join_provider, split_provider};
 use crate::ui::{
-    button, combo, label, note, popup, radio, secure_field, switch_control, text_field, wire, Form,
-    ROW,
+    button, combo, label, note, popup, radio, secure_field, switch_control, text_field, wire, wrap,
+    Form, ROW,
 };
 
 const WINDOW_WIDTH: f64 = 520.0;
-const WINDOW_HEIGHT: f64 = 520.0;
+/// The panel area, and the window that has to hold the tallest panel.
+///
+/// `Form` lays out downward from the height it was given and does not stop at
+/// zero, and an `NSView` does not clip its subviews, so a panel that outgrows
+/// [`STEP_HEIGHT`] is not cropped -- it keeps going past the bottom of the tab
+/// view and draws on top of the error line and the Back/Continue row. That is
+/// what the provider panel was doing: measured at build time the five panels
+/// come to 170, **461**, 257, 205 and 150pt, and the provider one was being
+/// laid out into 380.
+///
+/// So this is the tallest panel, not a guess, and the window is that plus the
+/// 140pt of chrome around it (68 above for the kicker and heading, 72 below for
+/// the error line and the buttons). A panel that grows past it goes back to
+/// drawing over the buttons, so re-measure when one does: the number is the
+/// lowest subview origin in each panel view, subtracted from `STEP_HEIGHT`.
+const WINDOW_HEIGHT: f64 = STEP_HEIGHT + 140.0;
 const STEP_WIDTH: f64 = 488.0;
-const STEP_HEIGHT: f64 = 380.0;
+const STEP_HEIGHT: f64 = 461.0;
 
 // ── The step machine ──────────────────────────────────────
 
@@ -1254,15 +1269,22 @@ fn build_provider(
         TAG_LOCAL_CARD,
     );
     form.add(&local_card);
-    let frame = form.full(28.0);
-    form.add(&note(
+    // The sentence under the card is 607pt of text in a 468pt column, in a row
+    // that was tall enough for two lines but never had wrapping turned on. So
+    // it drew as one line and was cut mid-word: "...No key, no network, and no
+    // audio leaves the machine. Needs Pyth". Wrapped, it is 26pt -- which is
+    // what the 28 was guessing at -- so the row is measured rather than guessed.
+    let note_x = frame.origin.x + 20.0;
+    let note_width = STEP_WIDTH - 20.0 - frame.origin.x;
+    let local_note = note(
         mtm,
         LOCAL_CARD_DESCRIPTION,
-        NSRect::new(
-            NSPoint::new(frame.origin.x + 20.0, frame.origin.y),
-            NSSize::new(STEP_WIDTH - 20.0 - frame.origin.x, 28.0),
-        ),
-    ));
+        NSRect::new(NSPoint::new(note_x, 0.0), NSSize::new(note_width, 14.0)),
+    );
+    wrap(&local_note, note_width);
+    let frame = form.full(local_note.frame().size.height);
+    local_note.setFrameOrigin(NSPoint::new(note_x, frame.origin.y));
+    form.add(&local_note);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Same for cleanup", l));
