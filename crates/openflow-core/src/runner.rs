@@ -1909,6 +1909,7 @@ server.serve_forever()
     /// the key-up path of any dictation whose sidecar is not already up. They
     /// are proved once and remembered, and forgotten again when the thing they
     /// proved could have changed.
+    #[cfg(unix)]
     #[test]
     fn the_install_and_model_checks_are_not_re_run_on_every_start() {
         use std::os::unix::fs::PermissionsExt;
