@@ -92,6 +92,32 @@ pub fn dismiss_window(window: &NSWindow, name: &str) {
     crate::app::refresh_dock_presence(false);
 }
 
+/// Present `sheet` on `parent`, which has to be on screen already.
+///
+/// The sheet counterpart of [`present_window`], and deliberately shorter: a
+/// sheet does not activate anything or join a Space on its own -- it goes
+/// wherever its parent is -- and the Dock rule belongs to the parent, which is
+/// already accounted for. Presenting a second sheet on a window that has one is
+/// a no-op rather than a queue, because the only sheet here is the wizard and
+/// asking for it twice means the user clicked twice.
+pub fn present_sheet(parent: &NSWindow, sheet: &NSWindow, name: &str) {
+    crate::trace!("show sheet={}", name);
+    if parent.attachedSheet().is_some() {
+        return;
+    }
+    parent.beginSheet_completionHandler(sheet, None);
+}
+
+/// End `sheet`, whoever its parent is. Falls back to ordering out so a sheet
+/// that was somehow presented on nothing can still be got rid of.
+pub fn dismiss_sheet(sheet: &NSWindow, name: &str) {
+    crate::trace!("hide sheet={}", name);
+    match sheet.sheetParent() {
+        Some(parent) => parent.endSheet(sheet),
+        None => sheet.orderOut(None),
+    }
+}
+
 /// Run `body` inside an animation group of `duration` seconds. Unlike
 /// `setFrame:display:animate:` this does not block the main thread, which
 /// matters because the hotkey path runs on it.
@@ -109,6 +135,7 @@ pub struct Form {
     pub view: Retained<NSView>,
     y: f64,
     width: f64,
+    height: f64,
 }
 
 impl Form {
@@ -123,7 +150,34 @@ impl Form {
             view,
             y: height - 18.0,
             width,
+            height,
         }
+    }
+
+    /// Shrink the view to the height the rows actually used, and hand it back.
+    ///
+    /// Rows are placed downwards from the top of a view built at a generous
+    /// height, so the leftover is at the bottom -- but the coordinate system
+    /// grows upwards, and simply shortening the frame would push the rows out
+    /// through the top. Everything moves down by the slack first. Cards need
+    /// this: a card is only the right shape if it is as tall as what is in it,
+    /// and only the form knows how far down it got.
+    pub fn fit(&mut self) -> Retained<NSView> {
+        let used = (self.height - self.y).min(self.height);
+        let slack = self.height - used;
+        if slack > 0.0 {
+            for subview in self.view.subviews().iter() {
+                let mut frame = subview.frame();
+                frame.origin.y -= slack;
+                subview.setFrame(frame);
+            }
+            let origin = self.view.frame().origin;
+            self.view
+                .setFrame(NSRect::new(origin, NSSize::new(self.width, used)));
+            self.height = used;
+            self.y = 0.0;
+        }
+        self.view.clone()
     }
 
     /// A labelled row: the label frame and the control frame beside it.

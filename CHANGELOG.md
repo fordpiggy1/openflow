@@ -4,6 +4,19 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Settings joins the main window, and the wizard becomes a sheet on it
+By: Ford (with Claude)
+Impact: `crates/openflow-native/src/ui/{settings,onboarding,card,main_window,mod}.rs`, `crates/openflow-native/src/{app.rs,tray.rs}`, `README.md`, `docs/native-port/PLAN.md`
+
+- Finishes what the previous entry started. The native host is one window: Dictate, History, Plugins and Settings are its four pages, and the setup wizard is a sheet on it. `App` keeps two window slots instead of five, and `has_visible_window` asks two windows instead of four.
+- **Settings is a scrolling column of headed cards, not an `NSTabView`.** The four groups are stacked with their names above them on the window's background, which is where System Settings puts a group's name and why the card under it can be a plain rounded rectangle with nothing written on its edge. `Form::fit` is what makes a card the height of its own contents: rows are laid out downwards into a generous view, and only the form knows how far down it got, so it takes the slack back and moves its rows to match.
+- The column is capped and centred rather than stretched. A two-column form stops reading as one past a certain width -- the label on the far left, the control stretched to the far right, a hotkey button four hundred points wide announcing nothing.
+- Naming a group still works. The tray, the wizard and `Navigate` have always been able to ask for "voice" or "privacy" and those used to select a tab; they scroll the group to the top of the column now. Scrolling is the version of "select" a single column has, and it leaves the other groups where the user can see them.
+- Leaving the Settings page does what closing its window did: it commits a key or a URL that was typed and never tabbed out of, and it takes down a hotkey recorder that would otherwise go on swallowing every keystroke in the app.
+- **Settings no longer reads the keychain at launch.** The four pages are built together with the window, and `SettingsPage::new` used to `reload()` -- which reads three keychain items and enumerates the audio devices. That charged every launch for a screen the user may never open. Reloading happens on the way into the page instead. The rule the pages now follow is written down in `main_window.rs`: a page that is built is not a page that was asked for.
+- **The wizard is a sheet on the main window**, so setup happens over the workspace it is setting up rather than beside it. It stays an `NSWindow`, because a sheet is one, and the first launch presents the main window first so there is something to hang it from.
+- Finishing setup lands on Dictate. The web wizard's last button says "Open my workspace" and goes to its main screen; this one handed the user to Settings, because until the main window existed there was no workspace to open.
+- **A sheet needs a way out, and Cmd+W is not one.** `performClose:` is refused on a sheet -- AppKit disables its close button -- so a wizard presented this way with no cancel is a room with no door. "Do this later" sits next to Back, carries the Escape key equivalent that a sheet is supposed to answer, and writes nothing on the way out: the wizard only writes on Finish.
 ### The pill's waveform is the microphone, not a clock
 By: Ford (with Claude)
 Impact: `crates/openflow-core/src/{audio,engine}.rs`, `crates/openflow-native/src/overlay.rs`
