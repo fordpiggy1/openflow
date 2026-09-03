@@ -287,6 +287,14 @@ impl App {
                     window.set_voice_status_for(&error.request_id, &error.error)
                 });
             }
+            // The local runner pushes its own state; nothing here polls the
+            // supervisor. The window may not be built, in which case there is
+            // nothing to draw and `reload` reads the current state when it
+            // opens.
+            EngineEvent::RunnerState(status) => {
+                crate::trace!("runner {} {}", status.phase.as_str(), status.detail);
+                self.with_settings(|window| window.set_runner_state(&status));
+            }
             EngineEvent::Navigate(target) => match target.as_str() {
                 "quit" => {
                     let app = NSApplication::sharedApplication(self.mtm);
@@ -335,7 +343,14 @@ pub fn apply_theme(theme: Option<&str>, mtm: MainThreadMarker) {
 
 /// `~/Library/Application Support/io.laisy.openflow`, the exact directory
 /// Tauri's `app_data_dir()` resolves to, so the two builds share one database.
+///
+/// `OPENFLOW_APP_DIR` overrides it. That exists for `--transcribe`: measuring
+/// the local runner should not have to point at the settings, history and
+/// keychain of the person running the measurement.
 pub fn default_app_dir() -> Result<PathBuf, String> {
+    if let Some(override_dir) = std::env::var_os("OPENFLOW_APP_DIR") {
+        return Ok(PathBuf::from(override_dir));
+    }
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     Ok(PathBuf::from(home)
         .join("Library")
@@ -345,6 +360,19 @@ pub fn default_app_dir() -> Result<PathBuf, String> {
 
 /// Build the engine on the process-wide runtime.
 pub fn build_engine(app_dir: PathBuf) -> Result<(Arc<Engine>, Arc<PreviewGate>), String> {
+    let preview = Arc::new(PreviewGate::default());
+    let events: Arc<dyn EngineEvents> = Arc::new(NativeEvents::new(Arc::clone(&preview)));
+    let engine = build_engine_with(app_dir, events)?;
+    Ok((engine, preview))
+}
+
+/// The same, with a caller-supplied sink. `--transcribe` uses it to print
+/// runner progress to stderr instead of hopping to a main thread that has no
+/// windows on it.
+pub fn build_engine_with(
+    app_dir: PathBuf,
+    events: Arc<dyn EngineEvents>,
+) -> Result<Arc<Engine>, String> {
     let runtime = match RUNTIME.get() {
         Some(runtime) => runtime,
         None => {
@@ -360,10 +388,7 @@ pub fn build_engine(app_dir: PathBuf) -> Result<(Arc<Engine>, Arc<PreviewGate>),
         handle.spawn(future);
     });
 
-    let preview = Arc::new(PreviewGate::default());
-    let events: Arc<dyn EngineEvents> = Arc::new(NativeEvents::new(Arc::clone(&preview)));
-    let engine = Engine::new(app_dir, events, spawn)?;
-    Ok((engine, preview))
+    Engine::new(app_dir, events, spawn)
 }
 
 // ── App delegate ──────────────────────────────────────────
@@ -392,6 +417,17 @@ define_class!(
                 eprintln!("OpenFlow could not start: {}", error);
                 NSApplication::sharedApplication(mtm).terminate(None);
             }
+        }
+
+        /// The quit path. A local runner holding 2.5 GB of model weights must
+        /// not survive the app that started it, and `Drop` on the engine is not
+        /// a promise anyone can keep here: the engine is an `Arc` a tokio task
+        /// may still hold when the run loop ends. So the sidecar is killed
+        /// explicitly, on the one callback AppKit guarantees before exit.
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _notification: &NSNotification) {
+            crate::trace!("terminate");
+            with_app(|app| app.engine().runner().stop());
         }
 
         /// Clicking the app in the Dock or Launchpad on an accessory app lands
@@ -499,9 +535,84 @@ fn self_check() -> i32 {
     }
 }
 
+/// Transcribe one wav with the saved settings, print the text and the time it
+/// took, and exit. No window, no hotkey, no tray.
+///
+/// This is how the local runner gets measured: the GUI cannot be launched from
+/// a shell without breaking its TCC grants, and a dictation cannot be timed
+/// from the outside. Only the transcription leg runs -- no cleanup pass, no
+/// history row, and nothing put on the clipboard or typed into whatever is
+/// focused when a measurement happens to run.
+fn transcribe_file(path: &str) -> i32 {
+    /// Runner progress on stderr, so a `--transcribe` that has to install or
+    /// load a model says what it is doing instead of sitting silent.
+    struct StderrEvents;
+    impl EngineEvents for StderrEvents {
+        fn emit(&self, event: EngineEvent) -> Result<(), String> {
+            if let EngineEvent::RunnerState(status) = event {
+                // The port is part of the line because it arrives *after* the
+                // spawn -- the child picks it and prints it -- so a start
+                // reports twice, and without the port the second line reads
+                // like a second sidecar.
+                match status.port {
+                    Some(port) => eprintln!(
+                        "runner {} :{}: {}",
+                        status.phase.as_str(),
+                        port,
+                        status.detail
+                    ),
+                    None => eprintln!("runner {}: {}", status.phase.as_str(), status.detail),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let wav = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("Could not read {}: {}", path, error);
+            return 1;
+        }
+    };
+    let result = default_app_dir()
+        .and_then(|dir| {
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("Could not create {}: {}", dir.display(), error))?;
+            build_engine_with(dir, Arc::new(StderrEvents))
+        })
+        .and_then(|engine| {
+            let runtime = RUNTIME.get().ok_or("The runtime did not start")?;
+            let outcome = runtime.block_on(engine.transcribe_wav(wav));
+            // Kill the sidecar before the process leaves, since there is no
+            // AppKit termination callback on this path.
+            engine.runner().stop();
+            outcome
+        });
+    match result {
+        Ok((text, elapsed)) => {
+            println!("{}", text);
+            eprintln!("{} ms", elapsed.as_millis());
+            0
+        }
+        Err(error) => {
+            eprintln!("transcribe failed: {}", error);
+            1
+        }
+    }
+}
+
 pub fn main() {
     if std::env::args().any(|argument| argument == "--self-check") {
         std::process::exit(self_check());
+    }
+    let arguments: Vec<String> = std::env::args().collect();
+    if let Some(index) = arguments.iter().position(|a| a == "--transcribe") {
+        let Some(path) = arguments.get(index + 1) else {
+            eprintln!("--transcribe needs the path to a .wav file");
+            std::process::exit(2);
+        };
+        std::process::exit(transcribe_file(path));
     }
 
     let app_dir = match default_app_dir() {

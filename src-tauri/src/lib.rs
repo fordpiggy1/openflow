@@ -45,6 +45,10 @@ impl EngineEvents for TauriEvents {
             EngineEvent::TtsChunk(payload) => self.app.emit("tts-audio-chunk", payload),
             EngineEvent::TtsFinished(payload) => self.app.emit("tts-finished", &payload),
             EngineEvent::TtsError(payload) => self.app.emit("tts-error", payload),
+            // The webview has no local-runner UI (Milestone C retires this
+            // host), but the event is forwarded rather than dropped so a
+            // console or a future screen can see it without a new plumbing pass.
+            EngineEvent::RunnerState(payload) => self.app.emit("runner-state", &payload),
             EngineEvent::Navigate(target) => self.app.emit("navigate", target),
         };
         sent.map_err(|error| error.to_string())

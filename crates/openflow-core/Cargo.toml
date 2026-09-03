@@ -25,6 +25,12 @@ futures-util = { workspace = true }
 arboard = { workspace = true }
 global-hotkey = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Signalling the local runner's sidecar. The monitor thread owns the `Child` and
+# blocks in `wait`, so stopping it is a signal rather than a `Child::kill` that
+# would need the same `&mut` the monitor is holding.
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Synthesized keystrokes carrying a unicode payload, for the "type" insert
 # method. Only macOS is implemented; other platforms fall back to pasting.
