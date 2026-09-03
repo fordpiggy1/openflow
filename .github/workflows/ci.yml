@@ -90,3 +90,11 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: npm run tauri:build -- --no-bundle
+      # The runner has no signing keychain, so this is the ad hoc fallback being
+      # exercised on purpose: the branch a contributor hits before they have run
+      # scripts/local-signing-identity.sh is the one most likely to rot unnoticed.
+      - name: Bundle and verify the native app
+        if: runner.os == 'macOS'
+        run: |
+          bash scripts/bundle-native.sh
+          codesign --verify --strict --verbose=2 target/OpenFlow.app

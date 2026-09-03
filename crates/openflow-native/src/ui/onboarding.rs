@@ -119,6 +119,11 @@ impl Step {
 /// may only be empty for a custom endpoint, and a custom endpoint needs a whole
 /// URL.
 pub fn validate_provider(kind: &str, url: &str, key: &str) -> Result<(), String> {
+    // The on-this-Mac card has no credential to validate: that is the point of
+    // it. Setup for it finishes on the provider panel.
+    if is_local_card(kind) {
+        return Ok(());
+    }
     if key.trim().is_empty() && kind != "custom" {
         return Err("Enter an API key to continue.".to_string());
     }
@@ -145,6 +150,9 @@ pub fn can_advance(
     key: &str,
     connected: bool,
 ) -> Result<(), String> {
+    if is_local_card(kind) {
+        return Ok(());
+    }
     match step {
         Step::Credentials => {
             validate_provider(kind, url, key)?;
@@ -245,6 +253,21 @@ pub const PROVIDER_OPTIONS: &[ProviderOption] = &[
     },
 ];
 
+/// The stored value the on-this-Mac card stands for. Not a member of
+/// [`PROVIDER_OPTIONS`]: it is a *backend*, not a provider -- it has no key, no
+/// endpoint and no model list to test -- so it sits beside the grid as its own
+/// radio and short-circuits the rest of the wizard.
+pub const LOCAL_CARD: &str = "local";
+/// The card's title and the sentence under it.
+pub const LOCAL_CARD_LABEL: &str = "On this Mac (private)";
+pub const LOCAL_CARD_DESCRIPTION: &str =
+    "Runs Qwen3-ASR on this Mac. No key, no network, and no audio leaves the machine. Needs Python and a one-time download.";
+
+/// Whether a wizard selection is the on-this-Mac card rather than a provider.
+pub fn is_local_card(kind: &str) -> bool {
+    kind == LOCAL_CARD
+}
+
 pub fn option_for(kind: &str) -> &'static ProviderOption {
     PROVIDER_OPTIONS
         .iter()
@@ -278,6 +301,7 @@ pub fn summary_line(kind: &str, model: &str, microphone: &str, shortcut: &str) -
 // ── Control tags ──────────────────────────────────────────
 
 const TAG_PROVIDER_BASE: isize = 100;
+const TAG_LOCAL_CARD: isize = 99;
 const TAG_SAME_PROVIDER: isize = 10;
 const TAG_FORMATTING_PROVIDER: isize = 11;
 
@@ -289,6 +313,10 @@ struct Controls {
     primary: Retained<NSButton>,
 
     providers: Vec<Retained<NSButton>>,
+    /// The on-this-Mac card. In the same radio group as `providers` (AppKit
+    /// groups by superview and action) but not in that list, because it stands
+    /// for a backend rather than an entry in `PROVIDER_OPTIONS`.
+    local_card: Retained<NSButton>,
     same_provider: Retained<NSSwitch>,
     formatting_provider: Retained<NSPopUpButton>,
 
@@ -448,6 +476,9 @@ impl OnboardingWindow {
         for option in &controls.providers {
             wire(option, target, sel!(providerChanged:));
         }
+        // Same action as the provider radios, which is also what puts it in
+        // their radio group.
+        wire(&controls.local_card, target, sel!(providerChanged:));
         wire(&controls.same_provider, target, sel!(providerChanged:));
         wire(
             &controls.formatting_provider,
@@ -492,7 +523,11 @@ impl OnboardingWindow {
         let controls = &ivars.controls;
 
         let (kind, url) = split_provider(&settings.provider_name());
-        self.select_provider(&kind);
+        self.select_provider(if settings.is_local_backend() {
+            LOCAL_CARD
+        } else {
+            &kind
+        });
         self.set_text(&controls.provider_url, &url);
         self.set_text(
             &controls.api_key,
@@ -588,6 +623,11 @@ impl OnboardingWindow {
         // switched off as well, or "same" would mean "clean up with a provider
         // that cannot".
         let kind = self.selected_provider();
+        if step == Step::Provider && is_local_card(&kind) {
+            controls
+                .primary
+                .setTitle(&NSString::from_str("Set up on this Mac"));
+        }
         let deepgram = kind == "deepgram";
         if deepgram && is_on(&controls.same_provider) {
             set_switch(&controls.same_provider, false);
@@ -611,6 +651,18 @@ impl OnboardingWindow {
         let step = ivars.step.get();
         if step == Step::Done {
             self.finish();
+            return;
+        }
+        // The on-this-Mac card has nothing left to ask: no key to test, no
+        // endpoint to type, no model list to fetch. Save the choice and hand
+        // the user to the panel where the install and the download live.
+        if step == Step::Provider && is_local_card(&self.selected_provider()) {
+            if let Err(error) = self.save_local() {
+                self.set_text(&ivars.controls.error, &error);
+                return;
+            }
+            self.ivars().window.orderOut(None);
+            crate::app::with_app(|app| app.show_settings(Some("Providers")));
             return;
         }
         let (kind, url, key) = self.provider_fields();
@@ -640,6 +692,9 @@ impl OnboardingWindow {
 
     fn selected_provider(&self) -> String {
         let controls = &self.ivars().controls;
+        if controls.local_card.state() == NSControlStateValueOn {
+            return LOCAL_CARD.to_string();
+        }
         for (index, option) in controls.providers.iter().enumerate() {
             if option.state() == NSControlStateValueOn {
                 return PROVIDER_OPTIONS[index].value.to_string();
@@ -650,12 +705,18 @@ impl OnboardingWindow {
 
     fn select_provider(&self, kind: &str) {
         let controls = &self.ivars().controls;
+        let local = is_local_card(kind);
+        controls.local_card.setState(if local {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
         let selected = PROVIDER_OPTIONS
             .iter()
             .position(|option| option.value == kind)
             .unwrap_or(0);
         for (index, button) in controls.providers.iter().enumerate() {
-            button.setState(if index == selected {
+            button.setState(if index == selected && !local {
                 NSControlStateValueOn
             } else {
                 NSControlStateValueOff
@@ -709,6 +770,10 @@ impl OnboardingWindow {
         let (kind, url, key) = self.provider_fields();
         validate_provider(&kind, &url, &key)?;
 
+        // Finishing the wizard on a provider is also how a user leaves the
+        // local backend; without this the rows below would be saved and
+        // ignored, because the engine would still be transcribing on-device.
+        settings.set("transcription_backend", "remote")?;
         settings.set("provider", &join_provider(&kind, &url))?;
         settings.set("api_key", key.trim())?;
         settings.set(
@@ -745,6 +810,27 @@ impl OnboardingWindow {
         settings.set("formatting_provider", &join_provider(formatting, &url))?;
         settings.set("stt_model", string_value(&controls.stt_model).trim())?;
         settings.set("chat_model", string_value(&controls.chat_model).trim())?;
+        let index = controls.microphone.indexOfSelectedItem().max(0) as usize;
+        let ids = controls.microphone_ids.borrow();
+        settings.set(
+            "microphone",
+            ids.get(index).map(String::as_str).unwrap_or(""),
+        )?;
+        Ok(())
+    }
+
+    /// What the on-this-Mac card saves: the backend, and nothing else.
+    ///
+    /// No provider row is written, deliberately. The user has not chosen an
+    /// online provider, and inventing one would put a service they never picked
+    /// in front of any later switch back to online transcription. Setup still
+    /// counts as complete, because `Settings::onboarding_complete` treats the
+    /// local backend as an answer in its own right.
+    fn save_local(&self) -> Result<(), String> {
+        let ivars = self.ivars();
+        let settings = ivars.engine.settings();
+        settings.set("transcription_backend", "local")?;
+        let controls = &ivars.controls;
         let index = controls.microphone.indexOfSelectedItem().max(0) as usize;
         let ids = controls.microphone_ids.borrow();
         settings.set(
@@ -955,7 +1041,8 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
     panels.setTabViewType(NSTabViewType::NoTabsNoBorder);
 
     let welcome_view = build_welcome(mtm);
-    let (provider_view, providers, same_provider, formatting_provider) = build_provider(mtm);
+    let (provider_view, providers, local_card, same_provider, formatting_provider) =
+        build_provider(mtm);
     let (credentials_view, provider_url, api_key, connection_status, test) = build_credentials(mtm);
     let (preferences_view, stt_model, chat_model, microphone, refresh, hotkey) =
         build_preferences(mtm);
@@ -1025,6 +1112,7 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
         back,
         primary,
         providers,
+        local_card,
         same_provider,
         formatting_provider,
         provider_url,
@@ -1071,6 +1159,7 @@ fn build_provider(
 ) -> (
     Retained<NSView>,
     Vec<Retained<NSButton>>,
+    Retained<NSButton>,
     Retained<NSSwitch>,
     Retained<NSPopUpButton>,
 ) {
@@ -1111,6 +1200,27 @@ fn build_provider(
         ));
     }
 
+    // The on-this-Mac card: last, and in the same radio group, because it is an
+    // answer to the same question. It carries no key and no endpoint, so
+    // choosing it ends setup on this panel.
+    let frame = form.full(18.0);
+    let local_card = radio(
+        mtm,
+        NSRect::new(frame.origin, NSSize::new(STEP_WIDTH - 110.0, 18.0)),
+        LOCAL_CARD_LABEL,
+        TAG_LOCAL_CARD,
+    );
+    form.add(&local_card);
+    let frame = form.full(28.0);
+    form.add(&note(
+        mtm,
+        LOCAL_CARD_DESCRIPTION,
+        NSRect::new(
+            NSPoint::new(frame.origin.x + 20.0, frame.origin.y),
+            NSSize::new(STEP_WIDTH - 20.0 - frame.origin.x, 28.0),
+        ),
+    ));
+
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Same for cleanup", l));
     let same_provider = switch_control(
@@ -1136,6 +1246,7 @@ fn build_provider(
     (
         form.view.clone(),
         providers,
+        local_card,
         same_provider,
         formatting_provider,
     )
@@ -1418,6 +1529,33 @@ mod tests {
             option_for("nonesuch").value,
             openflow_core::settings::DEFAULT_PROVIDER
         );
+    }
+
+    /// The on-this-Mac card answers the same question as the provider grid but
+    /// has no credential to prove, so every gate that exists to protect a key
+    /// has to let it through. Without this, choosing it would stall on "Enter
+    /// an API key to continue" for a backend that has no key.
+    #[test]
+    fn the_on_this_mac_card_needs_no_key_and_no_endpoint() {
+        assert!(is_local_card(LOCAL_CARD));
+        assert!(!is_local_card("groq"));
+        assert!(!is_local_card("custom"));
+        assert!(
+            !PROVIDER_OPTIONS
+                .iter()
+                .any(|option| option.value == LOCAL_CARD),
+            "the card is a backend, not a provider, and must not be in the grid"
+        );
+
+        assert!(validate_provider(LOCAL_CARD, "", "").is_ok());
+        for step in Step::ORDER {
+            assert!(
+                can_advance(step, LOCAL_CARD, "", "", false).is_ok(),
+                "{step:?} must not hold the on-this-Mac card on an untested key"
+            );
+        }
+        // ...and the gates still hold for everything else.
+        assert!(can_advance(Step::Credentials, "groq", "", "", false).is_err());
     }
 
     /// The defaults the web wizard shows as placeholders, per provider.

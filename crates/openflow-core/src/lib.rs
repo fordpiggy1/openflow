@@ -10,6 +10,8 @@ pub mod engine;
 pub mod hotkey;
 pub mod insert;
 pub mod plugins;
+pub mod postpass;
+pub mod runner;
 pub mod secrets;
 pub mod settings;
 pub mod speech;

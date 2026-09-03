@@ -16,6 +16,7 @@ The project is currently an early source build. There are no official pre-built 
 - Optional LLM cleanup for punctuation, paragraphs, and spoken editing commands
 - OpenRouter Gemini 3.1 Flash TTS Preview with selectable voices and cancellable response streaming
 - Self-hosted speech-to-text and speech synthesis on your own network, with no API key required
+- On-device transcription on Apple silicon (native macOS build), faster than the cloud round trip and with a Local only switch that refuses anything leaving the machine
 - Local executable hooks after transcription and formatting
 
 ### Streaming scope
@@ -41,6 +42,68 @@ Model availability and billing are controlled by the provider. OpenFlow does not
 - Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory. You control it from Settings: delete individual entries, clear everything, turn saving off entirely, or set an auto-delete window (1/7/30/90 days) that is applied at launch and after each transcription.
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.
+
+## Local transcription (private)
+
+The native macOS build can transcribe on the Mac itself, with no provider, no
+key and no network. Settings -> Providers -> **Transcription runs: On this Mac**,
+or pick the "On this Mac (private)" card during setup.
+
+It runs [Qwen3-ASR](https://huggingface.co/mlx-community) through
+[`mlx-audio`](https://github.com/Blaizzy/mlx-audio) as a supervised sidecar on
+`127.0.0.1`, and it is faster than the cloud round trip it replaces: 0.40 s for
+an 8.7 s dictation against 1.7 s through Groq, with no network variance.
+
+**It needs a Python 3.10 or newer that you install yourself.** OpenFlow does not
+bundle one -- MLX plus its packages is about 600 MB, and tripling the download
+for everyone to serve the people who want this is the wrong trade. Homebrew
+(`brew install python@3.12`) or a python.org installer both work; the 3.9 that
+ships with macOS does not. Settings says so plainly when it cannot find one.
+
+Two one-time steps, both in that panel, both resumable:
+
+| Step | What it does | Size |
+|------|--------------|------|
+| **Install** | Creates a virtualenv beside the database and installs `mlx-audio` into it | about 600 MB on disk |
+| **Download** | Fetches the model into the standard Hugging Face cache | 1.0 GB (fast) or 1.7 GB (accurate) |
+
+Two models, measured on an M4 Air with the same 8.7 s clip:
+
+| Model | Wait for a 10 s dictation | Memory while loaded | Notes |
+|-------|---------------------------|---------------------|-------|
+| **Accurate** (Qwen3-ASR 1.7B) | about 1.0 s | about 2.5 GB | The default. Keeps product names. |
+| **Fast** (Qwen3-ASR 0.6B) | about 0.4 s | about 1.0 GB | Weaker on proper nouns. |
+
+That memory is real, so the model is unloaded after an idle window (10 minutes
+by default, configurable from 1 minute to 4 hours). The reload costs about 3 s,
+and OpenFlow starts it the moment you press the record shortcut, so it happens
+while you are still speaking.
+
+Neither Qwen size honours the Whisper `prompt`, so the **Dictionary** setting is
+applied to the finished transcript instead: whole-word, longest entry first,
+your capitalisation, one pass. Write `ENTRO.LY` to fix the spelling of a word
+the model heard correctly, and `intro dot lie -> ENTRO.LY` to fix one it did
+not. The same field still goes to Whisper as a prompt on the online providers,
+so one dictionary works everywhere.
+
+**Local only** (same panel) refuses any request that would leave this Mac,
+checked against the URL before a connection is opened, and again on every
+redirect. It turns off cleanup and voice unless those are also pointed at
+something running here. The runner itself binds loopback and nothing else, so it
+is not reachable from another machine.
+
+Two things it does not cover, both by design. **Install and Download** contact
+PyPI and Hugging Face -- they are one-time steps you press a button for.
+And **enabled plugins are separate programs**: OpenFlow hands them your
+transcript over standard input and has no say in what they do with it, so a
+plugin can reach the network whatever this toggle says. Only enable plugins you
+trust.
+
+To measure it without opening a window:
+
+```bash
+./target/release/openflow-native --transcribe /path/to/clip.wav
+```
 
 ## Self-hosting on your LAN
 
@@ -132,7 +195,7 @@ CI runs these checks from a clean install and compiles the desktop app on macOS,
 
 ## Native build (experimental, macOS only)
 
-`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, a setup wizard, a main window whose sidebar holds Dictate, History and Plugins, a Settings window, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. The plan is `docs/native-port/PLAN.md`; the local transcription runner is what is left of Milestone B.
+`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, a setup wizard, Settings, History and Plugins windows, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. It can also transcribe on-device (see [Local transcription](#local-transcription-private)). The plan is `docs/native-port/PLAN.md`; streaming TTS is what is left of Milestone B.
 
 A launch with no provider saved opens the setup wizard instead of Settings: provider, key, a connection test, then microphone and shortcut. Settings has a "Run setup again" button that reopens it.
 
@@ -142,6 +205,9 @@ cargo build -p openflow-native --release
 
 # Prove the engine comes up without opening a window
 ./target/release/openflow-native --self-check
+
+# Transcribe one file with the saved settings and print the text and timing
+./target/release/openflow-native --transcribe clip.wav
 
 # Assemble target/OpenFlow.app, ad hoc signed; add --dmg for a disk image
 bash scripts/bundle-native.sh
@@ -158,7 +224,22 @@ launchctl setenv OPENFLOW_TRACE 1     # then open the app
 launchctl unsetenv OPENFLOW_TRACE     # back to silent, the default
 ```
 
-Launch it with `open -a target/OpenFlow.app`, not from a shell. macOS binds microphone and accessibility grants to the *code signature* of whatever asked, and a binary started from a terminal inherits the terminal's identity, so the grant lands on the terminal and the app appears to have been refused. The ad hoc signature the bundle script applies also changes on every rebuild, so expect to grant microphone access again after each one until a stable signing identity lands in Milestone C.
+Launch it with `open -a target/OpenFlow.app`, not from a shell. macOS binds microphone and accessibility grants to the *code signature* of whatever asked, and a binary started from a terminal inherits the terminal's identity, so the grant lands on the terminal and the app appears to have been refused.
+
+Grant those permissions once, not once per build:
+
+```bash
+bash scripts/local-signing-identity.sh     # once per machine
+```
+
+That installs a self-signed code signing certificate in a keychain of its own and `scripts/bundle-native.sh` picks it up from then on. It matters because macOS matches a TCC grant against the signature's *designated requirement*, and an ad hoc signature has nothing durable to name itself by, so its requirement is the code hash -- which changes with the code. Signed with a certificate the requirement names the certificate, and every later build still satisfies it. The bundle script prints which of the two it produced:
+
+```
+signed: identifier "io.laisy.openflow" and certificate root = H"..."   # survives rebuilds
+signed: cdhash H"..."                                                  # does not
+```
+
+The certificate is self-signed and never leaves this machine; it proves nothing to anyone else and is not a step towards distribution, which still wants a Developer ID. Set `OPENFLOW_SIGN_IDENTITY` to sign with something else, and expect to answer the microphone and accessibility prompts one last time on the first build after switching identities. `scripts/local-signing-identity.sh --remove` puts things back.
 
 ## How dictation works
 
@@ -181,7 +262,7 @@ Plugin entrypoints run with the user's operating-system permissions. There is cu
 
 ## Current limitations
 
-- No live partial transcription or meeting mode
+- No meeting mode
 - No context capture from the active window or screen
 - Auto-paste depends on platform permissions and helpers, and targets whichever app is focused when processing completes
 - Linux auto-paste requires `xdotool` or `ydotool`; Wayland compositor support varies

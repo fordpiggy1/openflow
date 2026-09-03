@@ -2925,6 +2925,7 @@ dependencies = [
  "futures-util",
  "global-hotkey",
  "hound",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",
