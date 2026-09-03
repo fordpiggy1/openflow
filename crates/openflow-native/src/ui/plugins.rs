@@ -123,14 +123,32 @@ pub fn read_manifest(folder: &Path) -> Result<String, String> {
 /// `install_plugin` writes the manifest and nothing else
 /// (crates/openflow-core/src/plugins.rs:121-141), so the entrypoint the manifest
 /// names has to be carried over separately or the plugin fails the first time a
-/// hook runs it. That copy is the only place in this app that writes a file
-/// whose name came from outside, so the name is checked rather than trusted: a
-/// single plain component, landing as a direct child of the plugin directory.
-/// The plugin directory itself is already safe, because `validate_manifest`
-/// rejects an id that could traverse.
+/// hook runs it. This is the one gate that copy goes through, and it answers
+/// two questions at once because splitting them across two functions is how
+/// such rules drift apart.
+///
+/// Safety: the name came from outside, so it is checked rather than trusted. It
+/// has to be a single plain component landing as a direct child of the plugin
+/// directory. (The directory itself is already safe: `validate_manifest`
+/// rejects an id that could traverse.)
+///
+/// Policy, and the reason this is not a bare path check:
+///
+/// - Any dot-file is refused, `.enabled` above all. That name is core's enable
+///   marker (crates/openflow-core/src/plugins.rs:90 reads it, :112 writes it),
+///   so copying it out of another `~/.openflow/plugins/<id>` would install a
+///   plugin already switched on: the status line would say to enable it, the
+///   `PluginInfo` core just returned would say `enabled: false`, and an
+///   executable nobody enabled would run on the next dictation.
+/// - `manifest.json` is refused because core owns it. It was written moments
+///   ago from the text this install validated, and copying the folder's copy
+///   over it would replace a checked manifest with whatever is on disk now.
 pub fn copy_destination(plugin_dir: &Path, file_name: &OsStr) -> Option<PathBuf> {
     let text = file_name.to_str()?;
     if text.is_empty() || text == "." || text == ".." || text.contains('/') || text.contains('\\') {
+        return None;
+    }
+    if text.starts_with('.') || text == "manifest.json" {
         return None;
     }
     let name = Path::new(text);
@@ -161,7 +179,9 @@ fn same_directory(one: &Path, other: &Path) -> bool {
 /// larger promise. Symlinks are skipped rather than followed, so a link cannot
 /// pull a file in from outside the folder that was chosen. `fs::copy` carries
 /// the permission bits across on Unix, which is what keeps an executable
-/// entrypoint executable.
+/// entrypoint executable. Which names are carried at all is
+/// [`copy_destination`]'s decision, including the dot-files and the manifest it
+/// refuses.
 pub fn copy_plugin_files(source: &Path, plugin_dir: &Path) -> Result<usize, String> {
     if same_directory(source, plugin_dir) {
         return Err(format!(
@@ -197,13 +217,26 @@ pub fn copy_plugin_files(source: &Path, plugin_dir: &Path) -> Result<usize, Stri
 }
 
 /// What the status line says after a successful install.
+///
+/// The count excludes the manifest, which core wrote itself, so zero is a real
+/// answer and worth saying plainly: a plugin whose manifest names an entrypoint
+/// that was not in the folder will fail at hook time, and this is the only
+/// moment the user can still see why.
 pub fn installed_line(name: &str, files: usize) -> String {
-    format!(
-        "Installed {} ({} file{}). Enable it to let it run.",
-        name,
-        files,
-        if files == 1 { "" } else { "s" }
-    )
+    match files {
+        0 => format!(
+            "Installed {}. Nothing was beside its manifest, so it will fail if it names an entrypoint.",
+            name
+        ),
+        1 => format!(
+            "Installed {} and 1 file beside it. Enable it to let it run.",
+            name
+        ),
+        files => format!(
+            "Installed {} and {} files beside it. Enable it to let it run.",
+            name, files
+        ),
+    }
 }
 
 // ── The window ────────────────────────────────────────────
@@ -629,7 +662,20 @@ mod tests {
             copy_destination(plugin_dir, OsStr::new("run.sh")),
             Some(plugin_dir.join("run.sh"))
         );
-        for refused in ["..", ".", "", "../evil", "sub/run.sh", "/etc/passwd"] {
+        for refused in [
+            "..",
+            ".",
+            "",
+            "../evil",
+            "sub/run.sh",
+            "/etc/passwd",
+            // Core's enable marker: carrying it installs a plugin already
+            // switched on.
+            ".enabled",
+            ".hidden",
+            // Core wrote this one, from the manifest this install validated.
+            "manifest.json",
+        ] {
             assert_eq!(
                 copy_destination(plugin_dir, OsStr::new(refused)),
                 None,
@@ -638,7 +684,7 @@ mod tests {
         }
         // Every accepted name is a direct child, which is the property the
         // rules exist to guarantee.
-        for accepted in ["run.sh", "manifest.json", ".enabled", "a.b.c"] {
+        for accepted in ["run.sh", "hook.py", "a.b.c"] {
             let destination = copy_destination(plugin_dir, OsStr::new(accepted)).unwrap();
             assert_eq!(destination.parent(), Some(plugin_dir));
         }
@@ -656,15 +702,34 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::create_dir_all(source.join("nested")).unwrap();
-        std::fs::write(source.join("manifest.json"), "{}").unwrap();
         std::fs::write(source.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
         std::fs::write(source.join("nested/ignored.txt"), "no").unwrap();
+        // What a folder copied out of another installed plugin carries: the
+        // enable marker, and a manifest that is not the one core validated.
+        std::fs::write(source.join(".enabled"), "").unwrap();
+        std::fs::write(source.join("manifest.json"), "{\"tampered\":true}").unwrap();
+        std::fs::write(plugin_dir.join("manifest.json"), "{\"checked\":true}").unwrap();
 
         let copied = copy_plugin_files(&source, &plugin_dir).unwrap();
-        assert_eq!(copied, 2, "the two regular files, not the directory");
+        assert_eq!(
+            copied, 1,
+            "run.sh only: not the directory, not the marker, not the manifest"
+        );
         assert!(plugin_dir.join("run.sh").exists());
-        assert!(plugin_dir.join("manifest.json").exists());
         assert!(!plugin_dir.join("nested").exists());
+
+        // `list_plugins` decides `enabled` by whether this file is there
+        // (crates/openflow-core/src/plugins.rs:90), so a plugin installed from
+        // a folder has to report enabled == false.
+        assert!(
+            !plugin_dir.join(".enabled").exists(),
+            "an installed plugin must not arrive switched on"
+        );
+        // And the manifest core wrote is still the one on disk.
+        assert_eq!(
+            std::fs::read_to_string(plugin_dir.join("manifest.json")).unwrap(),
+            "{\"checked\":true}"
+        );
 
         let error = copy_plugin_files(&plugin_dir, &plugin_dir).unwrap_err();
         assert!(
@@ -679,11 +744,17 @@ mod tests {
     fn the_installed_line_counts_the_files_it_carried() {
         assert_eq!(
             installed_line("Word count", 1),
-            "Installed Word count (1 file). Enable it to let it run."
+            "Installed Word count and 1 file beside it. Enable it to let it run."
         );
         assert_eq!(
             installed_line("Word count", 2),
-            "Installed Word count (2 files). Enable it to let it run."
+            "Installed Word count and 2 files beside it. Enable it to let it run."
+        );
+        // The manifest is not counted, so zero is reachable and has to say
+        // something a user can act on.
+        assert_eq!(
+            installed_line("Word count", 0),
+            "Installed Word count. Nothing was beside its manifest, so it will fail if it names an entrypoint."
         );
     }
 

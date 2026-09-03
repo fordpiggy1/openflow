@@ -710,12 +710,21 @@ impl OnboardingWindow {
             "same_provider",
             bool_setting(is_on(&controls.same_provider)),
         )?;
-        // Written every time, never conditionally.
-        // `Settings::formatting_provider` (crates/openflow-core/src/settings.rs:136)
-        // reads this row whenever it exists and never consults `same_provider`,
-        // so a stale row left behind would clean text up with a provider the
-        // wizard no longer shows. With "same for cleanup" on, the row carries
-        // the transcription provider, which is what the disabled popup shows.
+        // Written every time, never conditionally, and the earlier note here
+        // was wrong about why. The pipeline does not read this row while "same
+        // for cleanup" is on: `run_pipeline` takes the transcription provider
+        // in that branch and only reaches `formatting_provider_name` in the
+        // else (crates/openflow-core/src/engine.rs:438-445). Nothing was
+        // unsafe. It is written anyway so the row describes the provider the
+        // engine would actually use, which is what Settings reads back and what
+        // a later flip of "same" starts from; a stale row means the Settings
+        // window shows a cleanup provider that is not the one cleaning up.
+        //
+        // One divergence from the web build, deliberate: App.tsx:654-660 leaves
+        // this row alone while "same" is on, so turning "same" off later
+        // restores the cleanup provider chosen before. Here the row carries the
+        // transcription provider, which is what the disabled popup shows, so
+        // that earlier choice is not preserved.
         let index = controls.formatting_provider.indexOfSelectedItem().max(0) as usize;
         let formatting = if is_on(&controls.same_provider) {
             kind.as_str()
