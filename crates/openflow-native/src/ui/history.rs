@@ -27,8 +27,9 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAutoresizingMaskOptions, NSButton,
-    NSControl, NSScrollView, NSSearchField, NSTableColumn, NSTableView, NSTableViewDataSource,
-    NSTableViewStyle, NSTextField, NSView,
+    NSControl, NSScrollView, NSSearchField, NSTableColumn, NSTableColumnResizingOptions,
+    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewStyle,
+    NSTextField, NSView,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -36,7 +37,7 @@ use openflow_core::db::Transcription;
 use openflow_core::engine::Engine;
 
 use crate::ui::card::{Card, GAP, MARGIN};
-use crate::ui::{button, note};
+use crate::ui::{button, empty_state, note};
 
 /// Gap between a table card's edge and the table inside it. Smaller than a
 /// form card's [`crate::ui::card::PADDING`]: a table brings its own row inset,
@@ -94,14 +95,21 @@ pub fn preview_of(text: &str) -> String {
     }
 }
 
-/// The provider column. A custom endpoint is stored as `custom:<url>`; the web
-/// screen strips the prefix and shows the URL, and so does this.
+/// The provider column. A custom endpoint is stored as `custom:<url>`.
+///
+/// The prefix goes, and so does the rest of the URL around the host. A hosted
+/// provider is already one word -- "groq" -- and next to those a full endpoint
+/// is mostly the parts every endpoint shares: the scheme at the front and the
+/// `/v1` at the back. Those are what a column narrow enough to sit beside the
+/// transcript has room for, which left the host -- the only part that says
+/// which box answered -- truncated off the right-hand edge. So the host, and
+/// the port when there is one, is what the column shows.
 pub fn provider_label(provider: &str) -> String {
-    provider
-        .strip_prefix("custom:")
-        .unwrap_or(provider)
-        .trim()
-        .to_string()
+    let provider = provider.strip_prefix("custom:").unwrap_or(provider).trim();
+    match provider.split_once("://") {
+        Some((_, rest)) => rest.split('/').next().unwrap_or(rest).to_string(),
+        None => provider.to_string(),
+    }
 }
 
 /// What one row shows, in column order.
@@ -132,6 +140,8 @@ pub fn status_line(rows: usize, query: &str) -> String {
 struct Controls {
     search: Retained<NSSearchField>,
     table: Retained<NSTableView>,
+    /// Shown in the card in place of the list when there is nothing to list.
+    empty: crate::ui::EmptyState,
     status: Retained<NSTextField>,
     copy: Retained<NSButton>,
     paste: Retained<NSButton>,
@@ -313,11 +323,31 @@ impl HistoryPage {
                 let count = rows.len();
                 *ivars.rows.borrow_mut() = rows;
                 ivars.controls.table.reloadData();
-                self.say(&status_line(count, &query));
+                if count == 0 {
+                    match query.trim() {
+                        "" => ivars.controls.empty.say(
+                            "Nothing here yet",
+                            "Your first transcription will appear here.",
+                        ),
+                        search => ivars.controls.empty.say(
+                            "No matches",
+                            &format!("Nothing in your history matches \"{search}\"."),
+                        ),
+                    }
+                    // The empty state says it in the card; the line under it
+                    // would only say it again.
+                    self.say("");
+                } else {
+                    self.say(&status_line(count, &query));
+                }
+                self.show_rows(count > 0);
             }
             Err(error) => {
                 ivars.rows.borrow_mut().clear();
                 ivars.controls.table.reloadData();
+                // An error is not an empty list: the card stays a table, and
+                // the line under it carries what went wrong.
+                self.show_rows(true);
                 self.say(&error);
             }
         }
@@ -358,6 +388,16 @@ impl HistoryPage {
         alert.addButtonWithTitle(&NSString::from_str("Cancel"));
         // The first button added is `NSAlertFirstButtonReturn`, 1000.
         alert.runModal() == NSAlertFirstButtonReturn
+    }
+
+    /// Swap the list for the empty state, or back.
+    fn show_rows(&self, any: bool) {
+        let controls = &self.ivars().controls;
+        controls.empty.set_hidden(any);
+        controls
+            .table
+            .enclosingScrollView()
+            .inspect(|scroll| scroll.setHidden(!any));
     }
 
     fn say(&self, message: &str) {
@@ -470,19 +510,46 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
         NSTableView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
     );
-    for (identifier, title, width) in [
-        (COLUMN_TIME, "When", 150.0),
-        (COLUMN_TEXT, "What you said", 330.0),
-        (COLUMN_PROVIDER, "Provider", 110.0),
+    // Only the transcript stretches. A timestamp and a host are both as wide
+    // as they are wide, so handing them a share of a wider window buys nothing
+    // and takes it from the one column whose content is unbounded. Widths are
+    // resting sizes; `elastic` is what decides where slack goes.
+    // The resting widths add up to less than the table is ever given, on
+    // purpose. Column autoresizing grows the elastic one into the slack, but it
+    // will not shrink a set of columns that starts out wider than the view --
+    // and the Inset style reserves padding outside them, so "as wide as the
+    // table" is already too wide. Starting under and growing is what keeps the
+    // last column's text from being cut off against the right-hand edge.
+    for (identifier, title, width, elastic) in [
+        (COLUMN_TIME, "When", 180.0, false),
+        (COLUMN_TEXT, "What you said", 200.0, true),
+        (COLUMN_PROVIDER, "Provider", 170.0, false),
     ] {
         let column = NSTableColumn::initWithIdentifier(
             NSTableColumn::alloc(mtm),
             &NSString::from_str(identifier),
         );
         column.setWidth(width);
+        // A fixed column is pinned at both ends. That is what confines both
+        // the initial fit and every later resize to the one elastic column:
+        // uniform autoresizing shares slack among the columns that *can* take
+        // it, and these cannot.
+        column.setMinWidth(if elastic { 200.0 } else { width });
+        if !elastic {
+            column.setMaxWidth(width);
+        }
         column.setTitle(&NSString::from_str(title));
+        column.setResizingMask(if elastic {
+            NSTableColumnResizingOptions::AutoresizingMask
+                | NSTableColumnResizingOptions::UserResizingMask
+        } else {
+            NSTableColumnResizingOptions::UserResizingMask
+        });
         table.addTableColumn(&column);
     }
+    table.setColumnAutoresizingStyle(
+        NSTableViewColumnAutoresizingStyle::UniformColumnAutoresizingStyle,
+    );
     // Inset rows and no alternating stripes: the card already separates the
     // list from the window, and a bezel plus stripes inside it is the framed
     // look this window was rebuilt to stop drawing.
@@ -493,10 +560,28 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
     scroll.setDrawsBackground(false);
     scroll.setDocumentView(Some(&table));
+    // Hand the slack out once at build time. Autoresizing only runs when the
+    // table's frame changes, so without this the columns keep their resting
+    // widths until the window is first resized -- the transcript truncated
+    // with empty table to the right of it, which is what it looked like.
+    table.sizeToFit();
     scroll.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     card.addSubview(&scroll);
+
+    // Over the table, in the card, taking its place when there are no rows.
+    // The text is rewritten on every load: a history with nothing in it and a
+    // search that matched nothing are both empty, and the difference between
+    // them is the whole reason the line exists.
+    let empty = empty_state(
+        mtm,
+        table_frame,
+        "text.bubble",
+        "Nothing here yet",
+        "Your first transcription will appear here.",
+    );
+    card.addSubview(&empty.view);
 
     view.addSubview(&search);
     view.addSubview(&clear);
@@ -511,6 +596,7 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
         Controls {
             search,
             table,
+            empty,
             status,
             copy,
             paste,
@@ -564,15 +650,21 @@ mod tests {
         assert_eq!(preview_of(&wide).chars().count(), PREVIEW_CHARS + 3);
     }
 
-    /// `custom:<url>` is one string holding a kind and an endpoint; the column
-    /// shows the endpoint, the way the web screen does.
+    /// `custom:<url>` is one string holding a kind and an endpoint. The column
+    /// shows the host out of it: a hosted provider is already one word, and
+    /// beside those the scheme and the `/v1` are the parts every endpoint has
+    /// in common and the host is the part that differs.
     #[test]
-    fn the_provider_column_drops_the_custom_prefix() {
+    fn the_provider_column_shows_the_host_of_a_custom_endpoint() {
         assert_eq!(provider_label("groq"), "groq");
         assert_eq!(
             provider_label("custom:http://192.168.1.10:8880/v1"),
-            "http://192.168.1.10:8880/v1"
+            "192.168.1.10:8880"
         );
+        // Two boxes on the same port stay apart, and one endpoint with no path
+        // does not lose its host to the empty segment after it.
+        assert_eq!(provider_label("custom:https://box.lan/v1"), "box.lan");
+        assert_eq!(provider_label("custom:http://box.lan:8881"), "box.lan:8881");
         assert_eq!(provider_label(""), "");
     }
 
@@ -611,7 +703,7 @@ mod tests {
         };
         let (_, text, provider) = row_columns(&item);
         assert_eq!(text, "Cleaned words.");
-        assert_eq!(provider, "http://box.lan/v1");
+        assert_eq!(provider, "box.lan");
 
         item.formatted_text = None;
         let (_, text, _) = row_columns(&item);

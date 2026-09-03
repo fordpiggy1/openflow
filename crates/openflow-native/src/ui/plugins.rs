@@ -30,7 +30,7 @@ use openflow_core::engine::Engine;
 use openflow_core::plugins::PluginInfo;
 
 use crate::ui::card::{Card, GAP, MARGIN};
-use crate::ui::{button, note};
+use crate::ui::{button, empty_state, note};
 
 /// Gap between the card's edge and the table inside it, matching History's.
 const TABLE_INSET: f64 = 10.0;
@@ -248,6 +248,8 @@ pub fn installed_line(name: &str, files: usize) -> String {
 
 struct Controls {
     table: Retained<NSTableView>,
+    /// Shown in the card in place of the list when there is nothing to list.
+    empty: crate::ui::EmptyState,
     status: Retained<NSTextField>,
     toggle: Retained<NSButton>,
     install: Retained<NSButton>,
@@ -430,7 +432,22 @@ impl PluginsPage {
         *ivars.rows.borrow_mut() = plugins;
         ivars.controls.table.reloadData();
         self.update_toggle();
-        self.say(&status_line(count));
+        // The empty state carries the sentence when there is nothing to list,
+        // so the line under the card would only repeat it.
+        ivars.controls.empty.set_hidden(count > 0);
+        ivars
+            .controls
+            .table
+            .enclosingScrollView()
+            .inspect(|scroll| {
+                scroll.setHidden(count == 0);
+            });
+        let line = if count == 0 {
+            String::new()
+        } else {
+            status_line(count)
+        };
+        self.say(&line);
     }
 
     fn update_toggle(&self) {
@@ -582,6 +599,18 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     );
     card.addSubview(&scroll);
 
+    // Sits over the table, in the card, and takes its place when the list is
+    // empty. The status line below then says nothing rather than saying the
+    // same sentence twice.
+    let empty = empty_state(
+        mtm,
+        table_frame,
+        "puzzlepiece.extension",
+        "No plugins yet",
+        "Install one from a folder holding a manifest.json.",
+    );
+    card.addSubview(&empty.view);
+
     view.addSubview(&card);
     view.addSubview(&toggle);
     view.addSubview(&install);
@@ -592,6 +621,7 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
         view,
         Controls {
             table,
+            empty,
             status,
             toggle,
             install,

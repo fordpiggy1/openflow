@@ -50,9 +50,12 @@ use crate::ui::{allow_wrapping, note};
 const BLOCK_HEIGHT: f64 =
     56.0 + 18.0 + 14.0 + 6.0 + 30.0 + 8.0 + 34.0 + 20.0 + 40.0 + 10.0 + 24.0 + 14.0 + 14.0;
 
-/// Height of the card that shows the last result. Two lines of text and a
-/// caption, which is what the web screen's `last-result` button holds.
-const RESULT_HEIGHT: f64 = 96.0;
+/// The transcript's own height inside the result card: three lines at the
+/// system font. The preview is cut at `RESULT_CHARS`, which is about that.
+const RESULT_LINES: f64 = 54.0;
+/// Height of the card that shows the last result: a caption, the gap under it,
+/// the three lines, and the padding round all of it.
+const RESULT_HEIGHT: f64 = PADDING + 14.0 + 6.0 + RESULT_LINES + PADDING;
 /// Where the last result is cut. The full text is one click away, on the
 /// clipboard, so the card only has to be recognisable.
 const RESULT_CHARS: usize = 220;
@@ -438,15 +441,19 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     let result = NSButton::initWithFrame(
         NSButton::alloc(mtm),
         NSRect::new(
-            NSPoint::new(PADDING, PADDING),
-            NSSize::new(result_width, RESULT_HEIGHT - PADDING * 2.0 - 20.0),
+            // Directly under the caption, not filling what the card has left.
+            // A button centres its title in whatever frame it is given, so a
+            // frame the height of the card leaves two lines of transcript
+            // floating in the middle of it with air above and below.
+            NSPoint::new(PADDING, RESULT_HEIGHT - PADDING - 14.0 - 6.0 - RESULT_LINES),
+            NSSize::new(result_width, RESULT_LINES),
         ),
     );
     result.setBordered(false);
     result.setAlignment(NSTextAlignment::Left);
     result.setFont(Some(&NSFont::systemFontOfSize(NSFont::systemFontSize())));
     result.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
     // The cell wraps rather than truncating to one line: the preview is two
     // lines of the transcription and the point is to recognise it.

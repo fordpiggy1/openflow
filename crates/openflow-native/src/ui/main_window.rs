@@ -61,6 +61,7 @@ use openflow_core::engine::RecordingState;
 
 use crate::ui::dictate::DictatePage;
 use crate::ui::history::HistoryPage;
+use crate::ui::note;
 use crate::ui::plugins::PluginsPage;
 
 /// The window's content size on first launch. Wide enough that the sidebar
@@ -95,10 +96,17 @@ const ROW_HEIGHT: f64 = 30.0;
 const ICON_SIZE: f64 = 16.0;
 const ICON_LEFT: f64 = 6.0;
 const TITLE_LEFT: f64 = 30.0;
+/// The footer under the rows: a caption and the endpoint under it.
+const FOOTER_HEIGHT: f64 = 48.0;
+const FOOTER_INSET: f64 = 14.0;
 
 pub struct MainIvars {
+    /// Held for the footer, which re-reads the endpoint on every present.
+    engine: std::sync::Arc<openflow_core::engine::Engine>,
     window: Retained<NSWindow>,
     sidebar: Retained<NSTableView>,
+    /// The line at the foot of the sidebar naming what will transcribe.
+    endpoint: Retained<NSTextField>,
     /// The pane a page's view is installed into. Exactly one subview at a time.
     container: Retained<NSView>,
     dictate: Retained<DictatePage>,
@@ -261,7 +269,7 @@ impl MainWindow {
         window.center();
 
         // ── The two panes ──
-        let (sidebar, sidebar_view) = build_sidebar(mtm);
+        let (sidebar, sidebar_view, endpoint) = build_sidebar(mtm);
         let sidebar_controller = NSViewController::new(mtm);
         sidebar_controller.setView(&sidebar_view);
 
@@ -309,7 +317,9 @@ impl MainWindow {
 
         let this = Self::alloc(mtm).set_ivars(MainIvars {
             window,
+            engine: std::sync::Arc::clone(app.engine()),
             sidebar,
+            endpoint,
             container,
             dictate,
             history,
@@ -404,6 +414,7 @@ impl MainWindow {
     }
 
     pub fn present(&self) {
+        self.refresh_endpoint();
         crate::ui::present_window(&self.ivars().window, "main");
         // After presenting, not before. A window assigns its first responder
         // when it first becomes key, from its own key view loop, and that
@@ -411,6 +422,17 @@ impl MainWindow {
         // off screen -- which is where the focus set during `show_page` went
         // on the very first open.
         self.focus_current();
+    }
+
+    /// Re-read which endpoint will be asked to transcribe. A settings read, so
+    /// it happens here rather than once at build time: Settings can change it
+    /// while the window is open, and this is the line that would go on lying.
+    fn refresh_endpoint(&self) {
+        let name = self.ivars().engine.settings().provider_name();
+        let shown = crate::ui::history::provider_label(&name);
+        self.ivars()
+            .endpoint
+            .setStringValue(&NSString::from_str(&shown));
     }
 
     /// Give the keyboard to whatever the current page wants it on. Only
@@ -494,14 +516,28 @@ fn page_index(name: &str) -> Option<usize> {
 /// behind it -- a visible box round the sidebar, in the window built to stop
 /// drawing boxes. A plain container with the scroll view pinned inside it is
 /// what a sidebar is normally made of, and it lies flat.
-fn build_sidebar(mtm: MainThreadMarker) -> (Retained<NSTableView>, Retained<NSView>) {
+fn build_sidebar(
+    mtm: MainThreadMarker,
+) -> (
+    Retained<NSTableView>,
+    Retained<NSView>,
+    Retained<NSTextField>,
+) {
     let frame = NSRect::new(
         NSPoint::new(0.0, 0.0),
         NSSize::new(SIDEBAR_WIDTH, WINDOW_HEIGHT),
     );
     let container = NSView::initWithFrame(NSView::alloc(mtm), frame);
-    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
-    let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), frame);
+    // The list stops above the footer rather than running under it.
+    let list_frame = NSRect::new(
+        NSPoint::new(0.0, FOOTER_HEIGHT),
+        NSSize::new(
+            frame.size.width,
+            (frame.size.height - FOOTER_HEIGHT).max(0.0),
+        ),
+    );
+    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), list_frame);
+    let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), list_frame);
 
     let column = NSTableColumn::initWithIdentifier(
         NSTableColumn::alloc(mtm),
@@ -555,7 +591,46 @@ fn build_sidebar(mtm: MainThreadMarker) -> (Retained<NSTableView>, Retained<NSVi
     );
 
     container.addSubview(&scroll);
-    (table, container)
+
+    // ── The footer ──
+    //
+    // Four rows leave most of a sidebar empty, and the one piece of state the
+    // main window never showed anywhere is the one that decides whether
+    // dictation works at all: which endpoint is going to be asked. It is a
+    // settings read, so it happens on the way in rather than in a constructor
+    // -- the rule the pages follow, and the same reason Settings stopped
+    // reading the keychain at launch.
+    let caption = note(
+        mtm,
+        "Transcribing with",
+        NSRect::new(
+            NSPoint::new(FOOTER_INSET, FOOTER_HEIGHT - 15.0),
+            NSSize::new((frame.size.width - FOOTER_INSET * 2.0).max(0.0), 13.0),
+        ),
+    );
+    caption.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    let endpoint = note(
+        mtm,
+        "",
+        NSRect::new(
+            NSPoint::new(FOOTER_INSET, FOOTER_HEIGHT - 30.0),
+            NSSize::new((frame.size.width - FOOTER_INSET * 2.0).max(0.0), 14.0),
+        ),
+    );
+    endpoint.setFont(Some(&NSFont::systemFontOfSize(
+        NSFont::smallSystemFontSize(),
+    )));
+    endpoint.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+    endpoint.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingMiddle);
+    endpoint.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    container.addSubview(&caption);
+    container.addSubview(&endpoint);
+
+    (table, container, endpoint)
 }
 
 #[cfg(test)]
