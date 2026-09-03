@@ -1128,12 +1128,10 @@ fn build_provider(
         .collect();
     let formatting_provider = popup(mtm, c, TAG_FORMATTING_PROVIDER, &titles);
     form.add(&formatting_provider);
-    let frame = form.control_only(14.0);
-    form.add(&note(
+    form.note_row(
         mtm,
         "Deepgram handles speech only; it cannot clean text up.",
-        frame,
-    ));
+    );
 
     (
         form.view.clone(),
@@ -1165,23 +1163,13 @@ fn build_credentials(
     form.add(&label(mtm, "Endpoint URL", l));
     let provider_url = text_field(mtm, c, 0);
     form.add(&provider_url);
-    let frame = form.control_only(14.0);
-    form.add(&note(
-        mtm,
-        "Only used by Self-hosted / LAN, and required for it.",
-        frame,
-    ));
+    form.note_row(mtm, "Only used by Self-hosted / LAN, and required for it.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "API key", l));
     let api_key = secure_field(mtm, c, 0);
     form.add(&api_key);
-    let frame = form.control_only(26.0);
-    form.add(&note(
-        mtm,
-        "Stored in the macOS keychain, never in the database. A self-hosted endpoint may leave this empty.",
-        frame,
-    ));
+    form.note_row(mtm, "Stored in the macOS keychain, never in the database. A self-hosted endpoint may leave this empty.");
 
     let frame = form.control_only(ROW);
     let test = button(
@@ -1257,12 +1245,10 @@ fn build_preferences(
     form.add(&label(mtm, "Record shortcut", l));
     let hotkey = button(mtm, c, "Option+V", 0);
     form.add(&hotkey);
-    let frame = form.control_only(26.0);
-    form.add(&note(
+    form.note_row(
         mtm,
         "Click, then press the chord. Hold it to record, release it to transcribe.",
-        frame,
-    ));
+    );
 
     (
         form.view.clone(),
