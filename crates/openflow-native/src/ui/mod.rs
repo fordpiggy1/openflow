@@ -237,6 +237,27 @@ impl Form {
         field
     }
 
+    /// A wrapping note across the whole width, for a caption under a control
+    /// that spans the form rather than sitting in the control column.
+    ///
+    /// The same shape as `note_row`: laid out at the real width, wrapped, and
+    /// then asked how tall it turned out. A fixed height here is what cut
+    /// "...Sent to Whisper as a hint, and ap" off mid-word.
+    pub fn note_full(&mut self, mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+        let field = note(
+            mtm,
+            text,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(self.width, 14.0)),
+        );
+        wrap(&field, self.width);
+        let height = field.frame().size.height;
+        self.y -= height;
+        field.setFrameOrigin(NSPoint::new(0.0, self.y));
+        self.y -= GAP;
+        self.add(&field);
+        field
+    }
+
     pub fn add(&self, view: &NSView) {
         self.view.addSubview(view);
     }

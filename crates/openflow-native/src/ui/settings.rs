@@ -1409,7 +1409,7 @@ fn build_sections(
     form.add(&language);
 
     let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Live preview while recording", l));
+    form.add(&label(mtm, "Live preview", l));
     let live_preview = switch_control(mtm, switch_rect(c), TAG_LIVE_PREVIEW);
     form.add(&live_preview);
     form.note_row(
@@ -1569,12 +1569,10 @@ fn build_sections(
     let n = form.full(14.0);
     let dictionary_count = note(mtm, "0/800", n);
     form.add(&dictionary_count);
-    let n = form.full(28.0);
-    form.add(&note(
+    form.note_full(
         mtm,
         "Names and terms to spell correctly, comma separated. Sent to Whisper as a hint, and applied to every transcript afterwards. Write `heard -> Correct` to fix a mishearing.",
-        n,
-    ));
+    );
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Save history", l));
