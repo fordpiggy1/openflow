@@ -36,13 +36,17 @@ use crate::hotkeys;
 use crate::overlay;
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::{
-    button, combo, label, note, popup, secure_field, switch_control, text_field, text_view, wire,
-    Form, ROW,
+    allow_wrapping, button, combo, label, note, popup, secure_field, switch_control, text_field,
+    text_view, wire, Form, ROW,
 };
 
 const WINDOW_WIDTH: f64 = 420.0;
 const WINDOW_HEIGHT: f64 = 560.0;
-const TAB_WIDTH: f64 = 396.0;
+/// Fallback size of one tab's form, used only if `NSTabView` declines to say
+/// what its content rect is. The real size is asked for at build time: the
+/// inset a tab view keeps for its own frame and tab strip is AppKit's to
+/// choose, and guessing it low is what clipped the right-hand column.
+const TAB_WIDTH: f64 = 386.0;
 const TAB_HEIGHT: f64 = 496.0;
 /// The dictionary is sent to the transcriber as a spelling hint and the web
 /// settings screen caps it here.
@@ -346,12 +350,17 @@ impl SettingsWindow {
                 ),
                 NSWindowStyleMask::Titled
                     | NSWindowStyleMask::Closable
-                    | NSWindowStyleMask::Miniaturizable,
+                    | NSWindowStyleMask::Miniaturizable
+                    | NSWindowStyleMask::Resizable,
                 NSBackingStoreType::Buffered,
                 false,
             )
         };
         window.setTitle(&NSString::from_str("OpenFlow Settings"));
+        // Resizable like History and Plugins already are, but never smaller
+        // than the form was laid out for: the rows are positioned absolutely,
+        // so shrinking past this would clip them with no way to get them back.
+        window.setContentMinSize(NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         unsafe { window.setReleasedWhenClosed(false) };
         window.center();
 
@@ -365,7 +374,25 @@ impl SettingsWindow {
             )
         };
 
-        let (general, providers, voice, privacy, controls) = build_tabs(mtm);
+        // Ask the tab view how much room a tab actually gets rather than
+        // assuming: everything inside is laid out at absolute coordinates, so a
+        // form built even a few points too wide loses its right-hand column
+        // off the edge of the window.
+        let content = tabs.contentRect();
+        let (tab_width, tab_height) = if content.size.width > 1.0 && content.size.height > 1.0 {
+            (content.size.width, content.size.height)
+        } else {
+            (TAB_WIDTH, TAB_HEIGHT)
+        };
+        // The tabs follow the window. Their forms keep the width they were
+        // laid out at, so growing the window adds margin rather than reflowing
+        // the rows -- but the box, the tab strip and the scrollable area all
+        // track the frame instead of stranding themselves in a corner.
+        tabs.setAutoresizingMask(
+            objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+                | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        let (general, providers, voice, privacy, controls) = build_tabs(mtm, tab_width, tab_height);
         for (title, view) in [
             ("General", &general),
             ("Providers", &providers),
@@ -1105,6 +1132,8 @@ pub fn join_provider(kind: &str, url: &str) -> String {
 #[allow(clippy::type_complexity)]
 fn build_tabs(
     mtm: MainThreadMarker,
+    width: f64,
+    height: f64,
 ) -> (
     Retained<objc2_app_kit::NSView>,
     Retained<objc2_app_kit::NSView>,
@@ -1113,7 +1142,7 @@ fn build_tabs(
     Controls,
 ) {
     // General
-    let mut form = Form::new(mtm, TAB_WIDTH, TAB_HEIGHT);
+    let mut form = Form::new(mtm, width, height);
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Microphone", l));
     let microphone = popup(mtm, c, TAG_MICROPHONE, &[]);
@@ -1123,8 +1152,7 @@ fn build_tabs(
     form.add(&label(mtm, "Record shortcut", l));
     let hotkey_record = button(mtm, c, "Option+V", TAG_HOTKEY_RECORD);
     form.add(&hotkey_record);
-    let n = form.control_only(14.0);
-    form.add(&note(mtm, "Hold to record, release to transcribe.", n));
+    form.note_row(mtm, "Hold to record, release to transcribe.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Re-copy shortcut", l));
@@ -1135,23 +1163,16 @@ fn build_tabs(
     form.add(&label(mtm, "Insert text by", l));
     let insert_method = popup(mtm, c, TAG_INSERT_METHOD, &titles(INSERT_METHODS));
     form.add(&insert_method);
-    let n = form.control_only(26.0);
-    form.add(&note(
-        mtm,
-        "Paste sends Cmd+V and works everywhere. Type sends the characters and never touches the clipboard.",
-        n,
-    ));
+    form.note_row(mtm, "Paste sends Cmd+V and works everywhere. Type sends the characters and never touches the clipboard.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Keep my clipboard", l));
     let preserve_clipboard = switch_control(mtm, switch_rect(c), TAG_PRESERVE_CLIPBOARD);
     form.add(&preserve_clipboard);
-    let n = form.control_only(26.0);
-    form.add(&note(
+    form.note_row(
         mtm,
         "Puts back whatever you had copied once a dictation lands. Text and images only.",
-        n,
-    ));
+    );
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Hide overlay when idle", l));
@@ -1164,8 +1185,7 @@ fn build_tabs(
     let position_titles: Vec<&str> = positions.iter().map(|(_, title)| title.as_str()).collect();
     let overlay_position = popup(mtm, c, TAG_OVERLAY_POSITION, &position_titles);
     form.add(&overlay_position);
-    let n = form.control_only(14.0);
-    form.add(&note(mtm, "You can also drag the pill to move it.", n));
+    form.note_row(mtm, "You can also drag the pill to move it.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Appearance", l));
@@ -1179,7 +1199,7 @@ fn build_tabs(
     let general = form.view.clone();
 
     // Providers
-    let mut form = Form::new(mtm, TAB_WIDTH, TAB_HEIGHT);
+    let mut form = Form::new(mtm, width, height);
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Transcription", l));
     let provider = popup(mtm, c, TAG_PROVIDER, &titles(PROVIDERS));
@@ -1189,19 +1209,13 @@ fn build_tabs(
     form.add(&label(mtm, "Endpoint URL", l));
     let provider_url = text_field(mtm, c, TAG_PROVIDER_URL);
     form.add(&provider_url);
-    let n = form.control_only(14.0);
-    form.add(&note(mtm, "Only used by Custom endpoint.", n));
+    form.note_row(mtm, "Only used by Custom endpoint.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "API key", l));
     let api_key = secure_field(mtm, c, TAG_API_KEY);
     form.add(&api_key);
-    let n = form.control_only(14.0);
-    form.add(&note(
-        mtm,
-        "Stored in the macOS keychain, never in the database.",
-        n,
-    ));
+    form.note_row(mtm, "Stored in the macOS keychain, never in the database.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Same for cleanup", l));
@@ -1263,11 +1277,12 @@ fn build_tabs(
     form.add(&setup);
     let n = form.control_only(28.0);
     let models_status = note(mtm, "", n);
+    allow_wrapping(&models_status, n.size.width);
     form.add(&models_status);
     let providers = form.view.clone();
 
     // Voice
-    let mut form = Form::new(mtm, TAB_WIDTH, TAB_HEIGHT);
+    let mut form = Form::new(mtm, width, height);
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Voice features", l));
     let tts_enabled = switch_control(mtm, switch_rect(c), TAG_TTS_ENABLED);
@@ -1282,23 +1297,16 @@ fn build_tabs(
     form.add(&label(mtm, "Endpoint URL", l));
     let tts_url = text_field(mtm, c, TAG_TTS_URL);
     form.add(&tts_url);
-    let n = form.control_only(26.0);
-    form.add(&note(
+    form.note_row(
         mtm,
         "Point this at a machine on your network to keep audio off the internet.",
-        n,
-    ));
+    );
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Voice key", l));
     let tts_key = secure_field(mtm, c, TAG_TTS_KEY);
     form.add(&tts_key);
-    let n = form.control_only(26.0);
-    form.add(&note(
-        mtm,
-        "Optional. Left blank, the transcription key is reused only when the endpoint is the same one.",
-        n,
-    ));
+    form.note_row(mtm, "Optional. Left blank, the transcription key is reused only when the endpoint is the same one.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Voice model", l));
@@ -1314,8 +1322,7 @@ fn build_tabs(
     form.add(&label(mtm, "Audio format", l));
     let tts_format = popup(mtm, c, TAG_TTS_FORMAT, &titles(TTS_FORMATS));
     form.add(&tts_format);
-    let n = form.control_only(14.0);
-    form.add(&note(mtm, "Groq's Orpheus answers only in WAV.", n));
+    form.note_row(mtm, "Groq's Orpheus answers only in WAV.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Preview text", l));
@@ -1337,11 +1344,12 @@ fn build_tabs(
     form.add(&stop);
     let n = form.control_only(28.0);
     let voice_status = note(mtm, "", n);
+    allow_wrapping(&voice_status, n.size.width);
     form.add(&voice_status);
     let voice = form.view.clone();
 
     // Privacy
-    let mut form = Form::new(mtm, TAB_WIDTH, TAB_HEIGHT);
+    let mut form = Form::new(mtm, width, height);
     let (l, _) = form.row(ROW);
     form.add(&label(mtm, "Dictionary", l));
     let area = form.full(96.0);
@@ -1377,6 +1385,7 @@ fn build_tabs(
     form.add(&clear);
     let n = form.control_only(28.0);
     let history_status = note(mtm, "", n);
+    allow_wrapping(&history_status, n.size.width);
     form.add(&history_status);
     let privacy = form.view.clone();
 

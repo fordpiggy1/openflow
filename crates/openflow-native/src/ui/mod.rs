@@ -153,6 +153,28 @@ impl Form {
         frame
     }
 
+    /// A wrapped hint under the row above it, as tall as its text needs.
+    ///
+    /// The fixed-height variant truncated: these sentences are longer than the
+    /// control column is wide, and a label that cannot wrap simply loses its
+    /// tail -- off the right of a window that, until now, could not even be
+    /// widened to read it.
+    pub fn note_row(&mut self, mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+        let width = self.width - CONTROL_X;
+        let field = note(
+            mtm,
+            text,
+            NSRect::new(NSPoint::new(CONTROL_X, 0.0), NSSize::new(width, 14.0)),
+        );
+        wrap(&field, width);
+        let height = field.frame().size.height;
+        self.y -= height;
+        field.setFrameOrigin(NSPoint::new(CONTROL_X, self.y));
+        self.y -= GAP;
+        self.add(&field);
+        field
+    }
+
     pub fn add(&self, view: &NSView) {
         self.view.addSubview(view);
     }
@@ -171,6 +193,30 @@ pub fn label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTex
 }
 
 /// A muted line of explanatory text under a control.
+/// Let a label wrap inside `width`, and grow it to whatever height that needs.
+///
+/// `labelWithString:` gives a single line that truncates. Wrapping has to be
+/// asked for on the cell, and the frame resized afterwards, or the extra lines
+/// are laid out underneath the visible one and clipped.
+pub fn wrap(field: &NSTextField, width: f64) {
+    allow_wrapping(field, width);
+    let fitted = field.sizeThatFits(NSSize::new(width, f64::MAX));
+    let origin = field.frame().origin;
+    field.setFrame(NSRect::new(
+        origin,
+        NSSize::new(width, fitted.height.ceil()),
+    ));
+}
+
+/// Wrapping without the resize, for a label whose text arrives later and whose
+/// frame was reserved for it. Growing that one to fit an empty string would
+/// leave nothing to write into.
+pub fn allow_wrapping(field: &NSTextField, width: f64) {
+    field.setUsesSingleLineMode(false);
+    field.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
+    field.setPreferredMaxLayoutWidth(width);
+}
+
 pub fn note(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
     let field = { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
     {
