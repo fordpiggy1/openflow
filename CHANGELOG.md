@@ -4,6 +4,14 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Benchmark addendum: Moonshine and Cohere Transcribe
+By: Titan (with Claude)
+Impact: `docs/native-port/local-runner-benchmark.md`
+
+- Moonshine tiny-en and base-en measured on the reference clip: base-en matches Qwen 0.6B on speed at half the memory and one seventh of the download, on CPU alone, and spells the product names as well as Qwen 1.7B. The 2026 streaming models are slower offline and misheard the trailing date.
+- Cohere Transcribe could not be measured: both community MLX checkpoints load into mlx-audio with a third of the parameters missing, and the canonical weights are gated. The rerun command is recorded.
+- Revised recommendation: Moonshine base-en as the light tier, Qwen 1.7B stays accurate, and a direct `libmoonshine` link as the route to a local mode without Python.
+
 ### The pill's waveform is the microphone, not a clock
 By: Ford (with Claude)
 Impact: `crates/openflow-core/src/{audio,engine}.rs`, `crates/openflow-native/src/overlay.rs`
