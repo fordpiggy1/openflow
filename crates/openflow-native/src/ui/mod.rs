@@ -55,6 +55,10 @@ pub const CONTROL_X: f64 = LABEL_WIDTH + 10.0;
 ///   `msg_send!` rather than the deprecated binding.
 pub fn present_window(window: &NSWindow, name: &str) {
     crate::trace!("show window={}", name);
+    // The Dock icon first, then the window. An accessory app cannot take focus
+    // the way a regular one can, so activating before the switch leaves the
+    // window on screen but behind whatever the user was already in.
+    crate::app::refresh_dock_presence(true);
     window.setCollectionBehavior(
         NSWindowCollectionBehavior::MoveToActiveSpace
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
@@ -67,6 +71,17 @@ pub fn present_window(window: &NSWindow, name: &str) {
         // on the main thread.
         let _: () = unsafe { msg_send![&*app, activateIgnoringOtherApps: true] };
     }
+}
+
+/// Order a window out and give the Dock icon back if it was the last one.
+///
+/// Windows here are hidden rather than closed, so this is what closing means.
+/// It is the counterpart to [`present_window`], and both sides have to run
+/// through the pair, or the app keeps a Dock icon for a window nobody can see.
+pub fn dismiss_window(window: &NSWindow, name: &str) {
+    crate::trace!("hide window={}", name);
+    window.orderOut(None);
+    crate::app::refresh_dock_presence(false);
 }
 
 /// Run `body` inside an animation group of `duration` seconds. Unlike

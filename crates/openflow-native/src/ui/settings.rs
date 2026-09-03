@@ -234,7 +234,7 @@ define_class!(
             // Resigning first responder ends editing, which is what commits a
             // key or a URL the user typed and never tabbed out of.
             self.ivars().window.makeFirstResponder(None);
-            self.ivars().window.orderOut(None);
+            crate::ui::dismiss_window(&self.ivars().window, "settings");
             false
         }
     }
@@ -493,6 +493,11 @@ impl SettingsWindow {
         controls
             .dictionary
             .setDelegate(Some(ProtocolObject::from_ref(self)));
+    }
+
+    /// On screen, as the Dock-icon rule reads it.
+    pub fn is_visible(&self) -> bool {
+        self.ivars().window.isVisible()
     }
 
     pub fn present(&self) {
