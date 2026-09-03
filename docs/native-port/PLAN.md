@@ -125,7 +125,7 @@ New setting `transcription_backend = remote | local` plus `local_only = true|fal
 
 **Milestone B:** onboarding wizard, History window (list, search, delete, clear), Plugins window (list, enable, disable, install from folder), local runner (section 7), streaming TTS.
 
-**Milestone C:** retire `src-tauri`, `src/`, Vite and npm from CI; native build job on `macos-latest`; DMG in release workflow; stable local signing identity so TCC grants survive rebuilds.
+**Milestone C:** retire `src-tauri`, `src/`, Vite and npm from CI; native build job on `macos-latest`; DMG in release workflow; ~~stable local signing identity so TCC grants survive rebuilds~~ (done: `scripts/local-signing-identity.sh`).
 
 Gates for every milestone, run from the repo root:
 ```

@@ -7,9 +7,12 @@
 #   bash scripts/bundle-native.sh --skip-build
 #
 # The signature matters more than it looks: macOS binds microphone and
-# accessibility grants to a code signature, so an unsigned rebuild asks for both
-# permissions again. Ad hoc signing at least keeps one build's grants stable;
-# Milestone C swaps in a real identity so they survive rebuilds.
+# accessibility grants to the signature's designated requirement, and an ad hoc
+# one can only name itself by code hash, so every rebuild that changes a byte
+# asks for both permissions again. Signed with a certificate the requirement
+# names the certificate instead and the grants survive. Run
+# scripts/local-signing-identity.sh once to install a local one; set
+# OPENFLOW_SIGN_IDENTITY to sign with something else.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,10 +89,33 @@ PLIST
 
 /usr/bin/plutil -lint "$APP/Contents/Info.plist" > /dev/null
 
-codesign --force --deep --sign - \
+# An explicit override first, then the local identity, then ad hoc -- which
+# still produces a working bundle, just one whose permissions expire with the
+# build. Note the ordering: this never *creates* an identity, because a build
+# quietly minting a signing certificate is worse than a build that says why it
+# could not.
+IDENTITY_NAME="${OPENFLOW_SIGN_IDENTITY-}"
+if [ -z "$IDENTITY_NAME" ]; then
+  IDENTITY_NAME="$(bash "$ROOT/scripts/local-signing-identity.sh" --check 2>/dev/null || true)"
+fi
+if [ -z "$IDENTITY_NAME" ]; then
+  IDENTITY_NAME="-"
+  echo "warning: no signing identity, falling back to ad hoc. Microphone and" >&2
+  echo "         accessibility will have to be granted again after this build." >&2
+  echo "         Run: bash scripts/local-signing-identity.sh" >&2
+fi
+
+codesign --force --deep --sign "$IDENTITY_NAME" \
   --entitlements "$ROOT/src-tauri/entitlements.plist" \
   --options runtime \
-  "$APP" 2>/dev/null
+  "$APP"
+
+# The requirement is the whole point of the exercise, so say what came out:
+# `certificate root` keeps its grants across rebuilds, `cdhash` does not. An ad
+# hoc signature has no stored requirement, only the one codesign derives, which
+# it marks with a leading "# " -- hence the optional prefix in the match.
+codesign --display --requirements - "$APP" 2>/dev/null \
+  | sed -n 's/^#\{0,1\} *designated => /signed: /p' >&2
 
 if [ "$DMG" = "1" ]; then
   STAGE="$(mktemp -d)"
