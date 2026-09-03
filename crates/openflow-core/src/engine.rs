@@ -453,7 +453,7 @@ impl Engine {
             }
         }
         let wav_bytes = self.recorder.snapshot()?;
-        transcribe::transcribe_audio(
+        let text = transcribe::transcribe_audio(
             wav_bytes,
             &config.key,
             config.language.as_deref(),
@@ -461,7 +461,10 @@ impl Engine {
             config.stt_model.as_deref(),
             config.dictionary.as_deref(),
         )
-        .await
+        .await?;
+        // The same post-pass the take gets, so a preview does not show one
+        // spelling and the transcript another.
+        Ok(crate::postpass::apply(&text, config.dictionary.as_deref()))
     }
 
     /// Stop and transcribe, handing the transcript back to the caller. The
@@ -642,6 +645,14 @@ impl Engine {
             _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
             result = transcribe::transcribe_audio(wav_bytes, &transcription_key, language.as_deref(), &transcription_provider, stt_model.as_deref(), dictionary.as_deref()) => result?,
         };
+        // The dictionary as a deterministic replacement, once, before anything
+        // else reads the text. The local runner needs it because Qwen ignores
+        // the prompt; a hosted Whisper that already honoured the prompt is
+        // unaffected, since correcting text that is already correct is a no-op
+        // (see `postpass`'s idempotence note). Running it here rather than
+        // after cleanup means plugins and the formatting model both see the
+        // spellings the user asked for.
+        let raw_text = crate::postpass::apply(&raw_text, dictionary.as_deref());
         let raw_text = self
             .plugin_manager
             .run_hook(
