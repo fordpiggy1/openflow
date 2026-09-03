@@ -1,6 +1,7 @@
 use base64::Engine;
 use reqwest::{multipart, Response};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
@@ -542,8 +543,7 @@ pub fn speech_mime(format: &str) -> &'static str {
 /// per request cost a fresh TCP and TLS handshake on every call and threw the
 /// pool away before the next one could reuse it.
 fn client() -> Result<reqwest::Client, String> {
-    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()

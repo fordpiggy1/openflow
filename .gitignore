@@ -5,3 +5,9 @@ src-tauri/target/
 *.log
 .DS_Store
 .gstack/
+
+# iOS app (apps/ios)
+*.xcodeproj
+xcuserdata/
+.build/
+DerivedData/
