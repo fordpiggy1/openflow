@@ -47,10 +47,11 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSControlTextEditingDelegate, NSFocusRingType,
-    NSScrollView, NSSplitViewController, NSSplitViewItem, NSTableColumn,
-    NSTableColumnResizingOptions, NSTableView, NSTableViewColumnAutoresizingStyle,
-    NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTitlebarSeparatorStyle, NSView,
-    NSViewController, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSFont, NSImage, NSImageSymbolConfiguration, NSImageView, NSScrollView, NSSplitViewController,
+    NSSplitViewItem, NSTableCellView, NSTableColumn, NSTableColumnResizingOptions, NSTableView,
+    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewStyle, NSTextField, NSTitlebarSeparatorStyle, NSView, NSViewController, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSIndexSet, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -77,13 +78,23 @@ const MIN_HEIGHT: f64 = 440.0;
 
 const SIDEBAR_COLUMN: &str = "page";
 
-/// The pages, in sidebar order. Settings is not here yet: it is still its own
-/// window, and moving it is the next change rather than this one.
-const PAGES: &[(&str, &str)] = &[
-    ("Dictate", "OpenFlow"),
-    ("History", "OpenFlow History"),
-    ("Plugins", "OpenFlow Plugins"),
+/// The pages, in sidebar order: title, window title, and the SF Symbol the
+/// sidebar row carries. Settings is not here yet: it is still its own window,
+/// and moving it is the next change rather than this one.
+const PAGES: &[(&str, &str, &str)] = &[
+    ("Dictate", "OpenFlow", "mic.fill"),
+    ("History", "OpenFlow History", "clock.arrow.circlepath"),
+    ("Plugins", "OpenFlow Plugins", "puzzlepiece.extension.fill"),
 ];
+
+/// Row metrics. The icon column is the width of the largest symbol plus the
+/// gap after it, so the titles line up whatever glyph sits beside them -- a
+/// sidebar whose text starts at a different x on each row is the thing that
+/// reads as hand-made.
+const ROW_HEIGHT: f64 = 30.0;
+const ICON_SIZE: f64 = 16.0;
+const ICON_LEFT: f64 = 6.0;
+const TITLE_LEFT: f64 = 30.0;
 
 pub struct MainIvars {
     window: Retained<NSWindow>,
@@ -126,24 +137,6 @@ define_class!(
         fn number_of_rows(&self, _table: &NSTableView) -> isize {
             PAGES.len() as isize
         }
-
-        #[unsafe(method_id(tableView:objectValueForTableColumn:row:))]
-        fn object_value(
-            &self,
-            _table: &NSTableView,
-            _column: Option<&NSTableColumn>,
-            row: isize,
-        ) -> Option<Retained<objc2::runtime::AnyObject>> {
-            usize::try_from(row)
-                .ok()
-                .and_then(|row| PAGES.get(row))
-                .map(|(title, _)| {
-                    let string: Retained<NSString> = NSString::from_str(title);
-                    // SAFETY: every object is an `id` as far as the table is
-                    // concerned, and an `NSString` is what a text cell wants.
-                    unsafe { Retained::cast_unchecked(string) }
-                })
-        }
     }
 
     // `NSTableViewDelegate` inherits from this one; the table never edits a
@@ -151,6 +144,82 @@ define_class!(
     unsafe impl NSControlTextEditingDelegate for MainWindow {}
 
     unsafe impl NSTableViewDelegate for MainWindow {
+        /// One row: a symbol and its title, in an `NSTableCellView` so the
+        /// source-list style has the two things it dresses -- it tints the
+        /// image and inverts the text when the row is selected, which a text
+        /// cell drawing its own string cannot be asked to do.
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn view_for_row(
+            &self,
+            _table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: isize,
+        ) -> Option<Retained<NSView>> {
+            let mtm = MainThreadMarker::from(self);
+            // One expression, no `?` and no early `return`: `define_class!`
+            // rewrites the body into a method that does not return this Option
+            // itself, and neither reaches past the rewrite.
+            usize::try_from(row)
+                .ok()
+                .and_then(|row| PAGES.get(row))
+                .map(|(title, _, symbol)| {
+                    let cell = NSTableCellView::initWithFrame(
+                        NSTableCellView::alloc(mtm),
+                        NSRect::new(
+                            NSPoint::new(0.0, 0.0),
+                            NSSize::new(SIDEBAR_WIDTH, ROW_HEIGHT),
+                        ),
+                    );
+
+                    let icon = NSImageView::initWithFrame(
+                        NSImageView::alloc(mtm),
+                        NSRect::new(
+                            NSPoint::new(ICON_LEFT, (ROW_HEIGHT - ICON_SIZE) / 2.0),
+                            NSSize::new(ICON_SIZE, ICON_SIZE),
+                        ),
+                    );
+                    if let Some(image) =
+                        NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                            &NSString::from_str(symbol),
+                            Some(&NSString::from_str(title)),
+                        )
+                    {
+                        icon.setImage(Some(&image));
+                        // `NSFontWeight` is a bare `CGFloat`; 0.0 is regular.
+                        icon.setSymbolConfiguration(Some(
+                            &NSImageSymbolConfiguration::configurationWithPointSize_weight(
+                                ICON_SIZE - 2.0,
+                                0.0,
+                            ),
+                        ));
+                    }
+                    cell.addSubview(&icon);
+                    // SAFETY: both outlets are plain weak references the cell
+                    // uses to find what to tint and what to invert on
+                    // selection; the views are already its subviews.
+                    unsafe { cell.setImageView(Some(&icon)) };
+
+                    let text = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+                    text.setFont(Some(&NSFont::systemFontOfSize(NSFont::systemFontSize())));
+                    // A label draws its line at the top of its frame, not down
+                    // the middle of it, so a field given the whole row height
+                    // puts the title above the icon beside it. Give it the
+                    // height of its own line and centre that instead.
+                    let line = text.sizeThatFits(NSSize::new(f64::MAX, f64::MAX)).height;
+                    text.setFrame(NSRect::new(
+                        NSPoint::new(TITLE_LEFT, ((ROW_HEIGHT - line) / 2.0).floor()),
+                        NSSize::new(SIDEBAR_WIDTH - TITLE_LEFT - ICON_LEFT, line),
+                    ));
+                    // The title follows the row when the divider is dragged;
+                    // the icon stays where it is.
+                    text.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                    cell.addSubview(&text);
+                    unsafe { cell.setTextField(Some(&text)) };
+
+                    Retained::into_super(cell)
+                })
+        }
+
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn selection_did_change(&self, _notification: &NSNotification) {
             let row = self.ivars().sidebar.selectedRow();
@@ -275,7 +344,7 @@ impl MainWindow {
         if ivars.current.get() == index {
             return;
         }
-        let Some((_, title)) = PAGES.get(index) else {
+        let Some((_, title, _)) = PAGES.get(index) else {
             return;
         };
         let view = match index {
@@ -410,13 +479,14 @@ fn page_frame(container: &NSView) -> NSRect {
 fn page_index(name: &str) -> Option<usize> {
     PAGES
         .iter()
-        .position(|(title, _)| title.eq_ignore_ascii_case(name))
+        .position(|(title, _, _)| title.eq_ignore_ascii_case(name))
 }
 
-/// The source list. Cell-based, like the two tables that came before it and for
-/// the same reason: the rows are one string each, so a view-based table would
-/// be a recycling delegate and an `NSTextField` per row to render what a text
-/// cell already renders.
+/// The source list. View-based, unlike the two tables that came before it: a
+/// row here is a symbol beside a title rather than one string, and an
+/// `NSTableCellView` is what the source-list style knows how to dress -- it
+/// tints the `imageView` and inverts the `textField` on selection, neither of
+/// which a text cell drawing its own string can be asked to do.
 ///
 /// Returns the container the sidebar item is given, not the scroll view itself.
 /// A scroll view handed straight to `NSViewController::setView` is the root of
@@ -437,16 +507,22 @@ fn build_sidebar(mtm: MainThreadMarker) -> (Retained<NSTableView>, Retained<NSVi
         NSTableColumn::alloc(mtm),
         &NSString::from_str(SIDEBAR_COLUMN),
     );
-    column.setWidth(SIDEBAR_WIDTH);
-    // The column follows the pane, and the table follows the scroll view.
-    // Without this the row -- and so the selection pill drawn across it --
-    // keeps the width it was created at, and the pill is cut off square
-    // against the divider instead of being inset from it.
+    // Not `SIDEBAR_WIDTH`. The source-list style reserves horizontal padding
+    // outside the column, so a column as wide as the pane makes a table wider
+    // than the pane -- measured at 230pt inside a 196pt clip view -- and the
+    // right-hand end of the selection pill is simply scrolled out of sight.
+    // That is what "the highlight runs off the edge and never closes" is: not
+    // a pill drawn square, a rounded one whose end is off screen. Starting
+    // narrow and letting the autoresizing mask grow the column to whatever is
+    // left inside the padding gets both ends back, at every divider position.
+    column.setMinWidth(40.0);
+    column.setWidth(40.0);
     column.setResizingMask(NSTableColumnResizingOptions::AutoresizingMask);
     table.setColumnAutoresizingStyle(
         NSTableViewColumnAutoresizingStyle::UniformColumnAutoresizingStyle,
     );
     table.addTableColumn(&column);
+    table.setRowHeight(ROW_HEIGHT);
     // No header, no stripes, and the source-list style: that style is what
     // supplies the inset rows and the system's own selection highlight, which
     // is the one thing a hand-drawn sidebar can never quite match.
@@ -455,7 +531,6 @@ fn build_sidebar(mtm: MainThreadMarker) -> (Retained<NSTableView>, Retained<NSVi
     table.setUsesAlternatingRowBackgroundColors(false);
     table.setAllowsMultipleSelection(false);
     table.setAllowsEmptySelection(false);
-    table.setRowSizeStyle(objc2_app_kit::NSTableViewRowSizeStyle::Medium);
 
     // No focus ring. A source list is always the thing being pointed at, and
     // AppKit's default draws a rounded blue rectangle round the whole sidebar
@@ -464,6 +539,11 @@ fn build_sidebar(mtm: MainThreadMarker) -> (Retained<NSTableView>, Retained<NSVi
     table.setFocusRingType(NSFocusRingType::None);
 
     scroll.setDocumentView(Some(&table));
+    // The document view of a scroll view keeps the frame it was created with
+    // unless it is told to follow; `sizeToFit` then hands the column whatever
+    // the style's padding leaves of that width.
+    table.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    table.sizeToFit();
     scroll.setHasVerticalScroller(false);
     scroll.setDrawsBackground(false);
     scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
@@ -494,7 +574,7 @@ mod tests {
     /// The sidebar's own titles resolve too, and to their own rows.
     #[test]
     fn every_sidebar_title_resolves_to_its_own_row() {
-        for (index, (title, _)) in PAGES.iter().enumerate() {
+        for (index, (title, _, _)) in PAGES.iter().enumerate() {
             assert_eq!(page_index(title), Some(index), "{}", title);
         }
     }
