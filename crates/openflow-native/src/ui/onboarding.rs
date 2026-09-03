@@ -44,9 +44,24 @@ use crate::ui::{
 };
 
 const WINDOW_WIDTH: f64 = 520.0;
-const WINDOW_HEIGHT: f64 = 520.0;
+/// The panel area, and the window that has to hold the tallest panel.
+///
+/// `Form` lays out downward from the height it was given and does not stop at
+/// zero, and an `NSView` does not clip its subviews, so a panel that outgrows
+/// [`STEP_HEIGHT`] is not cropped -- it keeps going past the bottom of the tab
+/// view and draws on top of the error line and the Back/Continue row. That is
+/// what the provider panel was doing: measured at build time the five panels
+/// come to 170, **461**, 257, 205 and 150pt, and the provider one was being
+/// laid out into 380.
+///
+/// So this is the tallest panel, not a guess, and the window is that plus the
+/// 140pt of chrome around it (68 above for the kicker and heading, 72 below for
+/// the error line and the buttons). A panel that grows past it goes back to
+/// drawing over the buttons, so re-measure when one does: the number is the
+/// lowest subview origin in each panel view, subtracted from `STEP_HEIGHT`.
+const WINDOW_HEIGHT: f64 = STEP_HEIGHT + 140.0;
 const STEP_WIDTH: f64 = 488.0;
-const STEP_HEIGHT: f64 = 380.0;
+const STEP_HEIGHT: f64 = 461.0;
 
 // ── The step machine ──────────────────────────────────────
 
