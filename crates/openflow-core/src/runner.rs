@@ -698,7 +698,10 @@ impl LocalRunner {
             inner.generation += 1;
             inner.generation
         };
-        self.launch(generation)?;
+        if let Err(error) = self.launch(generation) {
+            self.set_phase(RunnerPhase::Failed, &error);
+            return Err(error);
+        }
         self.await_ready(timeout)
     }
 
@@ -733,6 +736,17 @@ impl LocalRunner {
             status.resident_bytes = None;
         });
 
+        // The spawn and the pid are recorded under one lock, and the
+        // generation is re-checked inside it. `stop` takes the same lock, so it
+        // either runs entirely before this (and the check below refuses to
+        // spawn) or entirely after (and it sees the pid). There is no window in
+        // between, which is what orphaned a sidecar on a test machine when the
+        // check was outside: `stop` found no pid to kill because there was not
+        // one yet, and the spawn stored it a moment later.
+        let mut inner = self.lock();
+        if inner.generation != generation {
+            return Err("The local runner was stopped while starting".to_string());
+        }
         let mut child = Command::new(&python)
             .arg(&script)
             .arg("--port")
@@ -752,17 +766,13 @@ impl LocalRunner {
             // multi-gigabyte download starting mid-dictation.
             .env("HF_HUB_OFFLINE", "1")
             .spawn()
-            .map_err(|error| {
-                let message = format!("Could not start the local runner: {}", error);
-                self.set_phase(RunnerPhase::Failed, &message);
-                message
-            })?;
+            // No `set_phase` here: the lock is held, and taking it twice is a
+            // deadlock. The caller reports the failure.
+            .map_err(|error| format!("Could not start the local runner: {}", error))?;
 
         let pid = child.id();
-        {
-            let mut inner = self.lock();
-            inner.pid = Some(pid);
-        }
+        inner.pid = Some(pid);
+        drop(inner);
         // Both of the supervisor's own threads hold a *weak* reference. A
         // monitor blocked in `wait` for the life of the sidecar would otherwise
         // be holding the supervisor alive, `Drop` would never run, and the
@@ -1462,6 +1472,54 @@ ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler).serve_forever()
             wait_for(Duration::from_secs(10), || !alive(pid)),
             "the sidecar must not outlive its supervisor"
         );
+        let _ = std::fs::remove_dir_all(&fixture.directory);
+    }
+
+    /// A stop that lands while a spawn is in flight must not leave the child
+    /// behind.
+    ///
+    /// This is a bug that happened rather than one imagined: `stop` bumps the
+    /// generation and kills whatever pid is recorded, and the launch used to
+    /// check the generation just *before* spawning, so a stop in the window
+    /// between that check and the pid being recorded killed nothing and the
+    /// child was orphaned. A test run left a sidecar running on this machine.
+    ///
+    /// The fix is structural -- `launch` now spawns and records the pid under
+    /// the same lock `stop` takes, so the window does not exist -- which is
+    /// what this test can and cannot say. It is a stress check, not a proof:
+    /// it can only observe that repeated stops during a spawn leave nothing
+    /// running, and it would catch a regression over runs rather than
+    /// certainly on the next one.
+    #[test]
+    fn a_stop_during_a_spawn_leaves_no_orphan() {
+        let Some(fixture) = fixture() else {
+            eprintln!("skipped: no python3 on this machine");
+            return;
+        };
+        for _ in 0..6 {
+            let (runner, _recorder) = build(&fixture, &[]);
+            let starting = Arc::clone(&runner);
+            let attempt = std::thread::spawn(move || {
+                let _ = starting.start(Duration::from_secs(10));
+            });
+            // Stop as soon as the launch is under way, so the generation was
+            // certainly bumped by `start` before `stop` bumps it again: any
+            // process spawned from here belongs to a generation nobody wants.
+            wait_for(Duration::from_secs(5), || {
+                runner.status().phase != RunnerPhase::Stopped
+            });
+            runner.stop();
+            let _ = attempt.join();
+
+            // Deliberately no second `stop` before the assertion: that would
+            // kill the orphan and hide exactly what this test is looking for.
+            if let Some(pid) = runner.pid() {
+                assert!(
+                    wait_for(Duration::from_secs(5), || !alive(pid)),
+                    "stop left {pid} running"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&fixture.directory);
     }
 
