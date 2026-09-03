@@ -188,6 +188,41 @@ pub fn type_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Pay the first CGEvent post's cost now, while the user is still talking.
+///
+/// A process pays ~40ms for its first post -- 32-44ms measured here -- and
+/// `type_text` was paying it immediately before the real keystroke, which is
+/// the worst possible moment: the transcript is already back and the user is
+/// waiting on the text. Posting one inert event when the capture starts moves
+/// that cost into the seconds spent speaking, and the next post takes ~16us.
+///
+/// Keycode 255 is not a key any keyboard reports and no unicode payload is set,
+/// so nothing reaches the focused app. Two alternatives were measured and
+/// rejected: a modifier leaves 12-16ms on the next post, and `Fn` can be bound
+/// to the emoji picker or an input-source switch.
+///
+/// Additive, never load-bearing. The warm-up inside `type_text` stays exactly
+/// where it is, so a capture that never prewarmed -- a different insert method,
+/// a failure here -- still pays the cost itself and nothing regresses.
+#[cfg(target_os = "macos")]
+pub fn prewarm_typing() {
+    use core_graphics::event::{CGEvent, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    std::thread::spawn(|| {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            return;
+        };
+        let Ok(event) = CGEvent::new_keyboard_event(source, 255, true) else {
+            return;
+        };
+        event.post(CGEventTapLocation::HID);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn prewarm_typing() {}
+
 /// Only macOS has a verified implementation. Everywhere else `Type` behaves as
 /// `Paste` rather than shipping a guess about how synthesized input behaves on
 /// a platform nobody tested.

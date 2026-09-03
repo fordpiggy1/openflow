@@ -15,6 +15,17 @@ Impact: `crates/openflow-native/src/ui/*`, `crates/openflow-native/src/{app.rs,t
 - **Tray.** The History item is live and a Plugins item joins it. An application main menu goes in too: an accessory app never draws one, but AppKit routes key equivalents through it, so without it there was no Cmd+W on any window and no Cmd+V in the field where a user pastes an API key.
 - **`OPENFLOW_TRACE=1`** logs tray click ids and window activations to stderr, silent by default, so a GUI-only launch can be diagnosed with `launchctl setenv`.
 - Still Milestone B: the local transcription runner and streaming TTS beyond the settings preview.
+### Outcome badge and live preview on the native pill
+By: Ford (with Claude)
+Impact: `crates/openflow-core/src/engine.rs`, `crates/openflow-core/src/settings.rs`, `crates/openflow-core/src/insert.rs`, `crates/openflow-native/src/overlay.rs`, `crates/openflow-native/src/app.rs`, `overlay.html`, `src-tauri/src/lib.rs`
+
+- Brings the four merged overlay and perf changes into the native host, which branched before them and so drew neither the outcome badge nor a live preview. Milestone A ships both hosts, so the native pill going quiet where the Tauri one speaks would have been a regression on arrival.
+- Reading a recording that is still running moved into the engine. `Engine::start_partials` re-transcribes the capture every `PARTIAL_INTERVAL` (800 ms) and emits `EngineEvent::TranscriptionPartial`; both hosts render it and neither owns the timing. The loop sleeps between readings rather than on a schedule, so a reading is never issued while one is outstanding -- the transcriber is serialized, and the take the user waits on at key-up can queue behind at most one. A generation counter, bumped whenever a capture starts or ends, drops a reading that was still in the air when the key came up.
+- `PARTIAL_WINDOW` retires previews after 20 s. A reading costs the take it previews, and the cost grows with the square of the recording: about 40 ms of expected delay at key-up for a 10 s dictation against 220 ms for a 38 s one, measured against a LAN 0.6B. The last reading is marked `held` and drawn dimmed, because a preview that has stopped tracking and one whose transcriber has died look alike otherwise.
+- `Outcome` is a view concern in `overlay.rs`, not a fifth `RecordingState`: the engine has no "done", and a display detail does not belong in a state machine two hosts share. Driven by the result and error events as `overlay.html` drives it, holding 1.2 s for success and 2.2 s for failure, at the resting width so the pill does not move while it is read. The `idle` that follows a result is ignored while a badge is up; the badge's own timer settles the pill.
+- The pill draws text for the first time. `draw_partial` measures the longest suffix that fits, so the words being spoken now stay on screen while the beginning scrolls out, and fades the leading edge with columns of the body colour in place of the CSS mask. The waveform's width is now derived from its bar metrics rather than written twice, since the text starts where the bars end.
+- `prewarm_typing` lands in `insert.rs` and runs from `began_capturing`, so both hosts pay the first CGEvent's ~40 ms while the user is still speaking rather than after the transcript arrives. The `live_preview` gate is a `Settings` accessor: unset means on for a self-hosted endpoint and off for a hosted one, since a request every 800 ms multiplies what one dictation bills.
+- `transcribe_partial` and `live_preview_enabled` are gone as Tauri commands; the webview overlay listens for `transcription-partial` instead of polling. One implementation, in the crate both hosts share.
 
 ### Native macOS app: Rust + AppKit, no webview (Milestone A)
 By: Titan (with Claude)
@@ -37,6 +48,17 @@ Impact: `Cargo.toml`, `crates/openflow-core/*`, `src-tauri/src/lib.rs`, `src-tau
 - `src-tauri` now depends on `openflow-core`, `tauri` and two plugins, and on nothing that touches audio, HTTP or sqlite. `lib.rs` went from 1711 lines to 469.
 - No behaviour changed. The watchdog window, the silence gate naming the device, the dictionary prompt, plugin hooks, history save and retention, and the clipboard policy per call site all work as before, and the 36 existing tests moved to the modules that now own them. Seven tests were added for the settings defaults, the hotkey table and the recording-state names.
 
+### OpenFlow for iPhone: local-only dictation, Milestone M1
+By: Titan (with Claude)
+Impact: `apps/ios/`, `docs/mobile/PLAN.md`, `CHANGELOG.md`
+
+- `apps/ios/Packages/OpenFlowMobileCore` is the whole brain of the phone app in one dependency-free Swift 6 package: it builds and tests with the Command Line Tools alone, which is the M1 gate. 53 tests pass.
+- `ModelManager` is the load/unload state machine from PLAN.md section 2, as one actor. It prewarms while the user is still speaking, refuses to prewarm in Low Power Mode or at serious thermal pressure, and unloads on the idle timer, on a memory warning, on heat and 20 s after backgrounding — except that a background unload waits for an in-flight transcription to deliver its text first. Conditions and the clock are injected, so every trigger is tested on a hand-cranked clock instead of waited out.
+- `SilenceGate` and `AudioResampler` port `speech_level`, `is_silent`, `auto_gain` and the FIR anti-alias `downsample` from `src-tauri/src/audio.rs` with the same constants and the same test vectors, so the desktop and the phone can be cross-checked. The anti-alias test is paired with one proving that plain decimation fails it.
+- `DictionaryPostPass` turns the desktop's 800-character dictionary into a deterministic post-pass, because Qwen ignores prompts. Whole-word match, longest entry first, dictionary casing wins, sentence-initial capitalisation preserved, no chaining — each rule documented and tested. A `heard -> Correct` form catches mishearings a prompt cannot express.
+- The app, keyboard and widget targets are real Swift behind a hand-written `project.yml`; no `.xcodeproj` is committed. `FakeEngine` is wired behind `-D OPENFLOW_FAKE_ENGINE` so the whole product runs in the Simulator before any weights exist.
+- The keyboard extension has no microphone, no model and no networking code, and reads one small JSON file from the App Group. `RequestsOpenAccess` is on only because iOS otherwise walls it off from that container; the reason is in the plist and in the README.
+- `ModelDownloader` is the only file that touches the network, with a pinned URL and SHA-256 marked TODO until M2. A reviewer can check the offline claim with one grep: `grep -rn "URLSession|https://" apps/ios --include='*.swift'` returns that file and nothing else.
 ### Resource sweep: idle footprint and stop-path cost
 By: Titan (with Claude)
 Impact: `src-tauri/src/audio.rs`, `src-tauri/src/transcribe.rs`, `overlay.html`

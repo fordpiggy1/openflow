@@ -34,7 +34,7 @@ use openflow_core::engine::{Engine, EngineEvent, EngineEvents, Spawner};
 use crate::events::{NativeEvents, PreviewGate};
 use crate::hotkeys::Hotkeys;
 use crate::instance::InstanceLock;
-use crate::overlay::Overlay;
+use crate::overlay::{Outcome, Overlay};
 use crate::tray::Tray;
 use crate::tts_player::TtsPlayer;
 use crate::ui::history::HistoryWindow;
@@ -189,6 +189,12 @@ impl App {
                     .as_deref()
                     .unwrap_or(&transcription.raw_text);
                 self.notify("OpenFlow", &first_line(text));
+                self.overlay.show_outcome(Outcome::Done);
+            }
+            // The pill owns this one entirely: a reading of a recording still
+            // in progress is never notified, saved or typed.
+            EngineEvent::TranscriptionPartial(partial) => {
+                self.overlay.set_partial(&partial.text, partial.held)
             }
             EngineEvent::TranscriptionWarning(warning) => self.notify("OpenFlow", &warning),
             // Report it and stop there. The engine decides when the pill rests,
@@ -197,7 +203,8 @@ impl App {
             // blank the pill mid-recording whenever a previous take failed
             // while the user was already holding the key down again.
             EngineEvent::TranscriptionError(error) => {
-                self.notify("OpenFlow could not finish", &error)
+                self.notify("OpenFlow could not finish", &error);
+                self.overlay.show_outcome(Outcome::Error);
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
             // The recents menu and the History window are the two surfaces

@@ -54,7 +54,7 @@
 
       /* Transcribing */
       .overlay[data-status="transcribing"] {
-        width: 72px;
+        width: 100px;
         justify-content: flex-start;
         border-color: rgba(123, 163, 201, 0.4);
         box-shadow: 0 0 16px rgba(123, 163, 201, 0.15);
@@ -140,6 +140,58 @@
         letter-spacing: 0.03em;
       }
       .overlay[data-status="transcribing"] .status-label { display: block; }
+
+      /* Live preview: what has been heard so far, re-transcribed every tick.
+         Replaced whole each time -- with more audio for context the model
+         revises words it had already emitted, so an append-only view would
+         show text that is no longer what it heard. */
+      .preview {
+        display: none;
+        flex: 1;
+        min-width: 0;
+        margin-left: 6px;
+        font-family: -apple-system, system-ui, sans-serif;
+        font-size: 11px;
+        line-height: 1.2;
+        color: rgba(255,255,255,0.92);
+        white-space: nowrap;
+        overflow-x: hidden;
+        /* The tail is what is being spoken now, so the start is what gets cut.
+           Fading it says "there is more to the left" without a scrollbar. */
+        -webkit-mask-image: linear-gradient(to right, transparent 0, #000 16px);
+                mask-image: linear-gradient(to right, transparent 0, #000 16px);
+      }
+      .overlay[data-preview] .preview { display: block; }
+      .overlay[data-status="recording"][data-preview] { width: 320px; }
+      /* Held: the last line stays readable but stops tracking. Dimming it is
+         the only thing separating "no longer updating" from "stopped working",
+         which look identical on a line that simply sits there. */
+      .overlay[data-preview="held"] .preview { opacity: 0.5; }
+
+      /* Outcome: a moment of feedback once the text has landed, or not.
+         Same 28px footprint as idle, so nothing moves on the way out. */
+      .overlay[data-status="done"] {
+        padding: 0;
+        border-color: rgba(34, 197, 94, 0.55);
+        box-shadow: 0 0 16px rgba(34, 197, 94, 0.22);
+      }
+      .overlay[data-status="error"] {
+        padding: 0;
+        border-color: rgba(239, 68, 68, 0.6);
+        box-shadow: 0 0 16px rgba(239, 68, 68, 0.25);
+      }
+
+      .badge { display: none; width: 14px; height: 14px; flex-shrink: 0; }
+      .badge path { fill: none; stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+      .badge-done path  { stroke: #22c55e; }
+      .badge-error path { stroke: #ef4444; }
+
+      .overlay[data-status="done"]  .logo,
+      .overlay[data-status="error"] .logo { display: none; }
+      .overlay[data-status="done"]  .badge-done  { display: block; }
+      .overlay[data-status="error"] .badge-error { display: block; }
+
+      @media (prefers-reduced-motion: reduce) { .badge { animation: none; } }
     </style>
   </head>
   <body>
@@ -154,6 +206,9 @@
         <div class="wave-bar"></div>
       </div>
       <div class="dots"><span></span><span></span><span></span></div>
+      <svg class="badge badge-done" viewBox="0 0 24 24"><path d="M4 12.5l5.5 5.5L20 7"/></svg>
+      <svg class="badge badge-error" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      <span class="preview"></span>
       <span class="status-label">...</span>
     </div>
 
@@ -217,11 +272,86 @@
         // overlay gone for good, turning a default setting into a dead feature.
         if (await hideWhenIdle()) await win.hide();
 
+        // A badge outlives the "idle" that follows the result, so the outcome
+        // is readable instead of a single frame. While one is up, `idle` is
+        // deferred to the timer below rather than applied twice.
+        // Set synchronously, before any await. The `idle` that follows the
+        // result event would otherwise reach its guard while showOutcome is
+        // still suspended on its first IPC call, and erase the badge.
+        let badgeActive = false;
+        let badgeTimer = null;
+
+        // Live preview. The engine reads the recording as it goes and sends
+        // what it heard; each reading replaces the line rather than extending
+        // it, because the transcriber revises earlier words as it gets more
+        // context. The timing, the back-pressure and the cutoff all live in the
+        // engine now, so the native host gets the same behaviour for free.
+        const preview = overlay.querySelector('.preview');
+        const PREVIEW_WIDTH = 320;
+        let previewWidened = false;
+
+        function clearPreview() {
+          preview.textContent = '';
+          previewWidened = false;
+          overlay.removeAttribute('data-preview');
+        }
+
+        await listen('transcription-partial', async (event) => {
+          // A reading that lands after the key came up has nothing to say about
+          // a pill that is already transcribing or resting.
+          if (overlay.getAttribute('data-status') !== 'recording') return;
+          const { text, held } = event.payload || {};
+          if (!text) return;
+          preview.textContent = text;
+          overlay.setAttribute('data-preview', held ? 'held' : 'on');
+          if (!previewWidened) {
+            previewWidened = true;
+            await win.setSize(new LogicalSize(PREVIEW_WIDTH, 28));
+            await snapToPosition(win, position, PREVIEW_WIDTH);
+          }
+          // Follow the newest words; the CSS fades off what scrolls past.
+          preview.scrollLeft = preview.scrollWidth;
+        });
+
+        async function settleIdle() {
+          overlay.setAttribute('data-status', 'idle');
+          overlay.querySelector('.status-label').textContent = '';
+          await win.setSize(new LogicalSize(28, 28));
+          await snapToPosition(win, position, 28);
+          if (await hideWhenIdle()) await win.hide();
+          else await win.show();
+        }
+
+        async function showOutcome(kind, holdMs) {
+          badgeActive = true;
+          if (badgeTimer) clearTimeout(badgeTimer);
+          overlay.setAttribute('data-status', kind);
+          overlay.querySelector('.status-label').textContent = '';
+          // Same footprint as idle, so the overlay does not jump on its way out.
+          await win.setSize(new LogicalSize(28, 28));
+          await snapToPosition(win, position, 28);
+          await win.show();
+          badgeTimer = setTimeout(() => {
+            badgeTimer = null;
+            badgeActive = false;
+            settleIdle().catch(() => {});
+          }, holdMs);
+        }
+
         await listen('recording-state', async (event) => {
           const status = event.payload;
+          // Before the badge guard below returns: whatever else this event
+          // means, a status that is not "recording" retires the preview.
+          if (status !== 'recording') clearPreview();
+          // The result event arrives just before this `idle`. Let the badge's
+          // own timer close it out; clobbering it here would erase the outcome
+          // in the same frame it appeared.
+          if (status === 'idle' && badgeActive) return;
+          if (badgeTimer) { clearTimeout(badgeTimer); badgeTimer = null; }
+          badgeActive = false;
           overlay.setAttribute('data-status', status);
           overlay.querySelector('.status-label').textContent = status === 'transcribing' ? 'Working' : '';
-          const w = status === 'recording' ? 82 : status === 'transcribing' ? 72 : 28;
+          const w = status === 'recording' ? 82 : status === 'transcribing' ? 100 : 28;
           await win.setSize(new LogicalSize(w, 28));
           await snapToPosition(win, position, w);
           // Size and position first, then reveal: showing before the resize
@@ -233,6 +363,12 @@
             await win.show();
           }
         });
+
+        // Both events already existed for the settings window; the overlay just
+        // never listened. Failure gets the longer hold -- it is the one worth
+        // catching, and the text is still on the clipboard either way.
+        await listen('transcription-result', () => { showOutcome('done', 1200).catch(() => {}); });
+        await listen('transcription-error',  () => { showOutcome('error', 2200).catch(() => {}); });
 
         overlay.addEventListener('pointerdown', async (e) => {
           if (e.button !== 0) return;

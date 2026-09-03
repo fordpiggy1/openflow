@@ -32,6 +32,18 @@ pub struct Settings {
     secrets: SecretStore,
 }
 
+/// The live-preview decision, split out from the store so the rule can be read
+/// and tested on its own. Anything that is not the literal "true" or "false"
+/// falls back to the endpoint: a half-written setting must never be what starts
+/// billing a hosted provider every 800 ms.
+pub fn live_preview_allowed(setting: Option<&str>, provider: &Provider) -> bool {
+    match setting {
+        Some("true") => true,
+        Some("false") => false,
+        _ => provider.is_custom(),
+    }
+}
+
 impl Settings {
     pub fn new(db: Database, secrets: SecretStore) -> Self {
         Self { db, secrets }
@@ -158,6 +170,18 @@ impl Settings {
 
     pub fn format_enabled(&self) -> bool {
         self.flag_on_by_default("format_enabled")
+    }
+
+    /// Whether a recording should be previewed as it is spoken.
+    ///
+    /// Unset means yes for a self-hosted endpoint, where a preview costs a LAN
+    /// round trip, and no for a hosted one, where it bills for one every
+    /// 800 ms. Set either way, the user's choice stands.
+    pub fn live_preview(&self) -> bool {
+        live_preview_allowed(
+            self.db.get_setting("live_preview").as_deref(),
+            &self.provider(),
+        )
     }
 
     pub fn stt_model(&self) -> Option<String> {
@@ -303,6 +327,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openflow-settings-{}", uuid::Uuid::new_v4()));
         let db = Database::new(dir.clone()).expect("a scratch database");
         Settings::new(db, SecretStore::new(dir))
+    }
+
+    #[test]
+    fn live_preview_defaults_to_the_endpoint_that_is_free_to_ask() {
+        let lan = Provider::from_str("custom:http://192.168.1.2:8882/v1");
+        let hosted = Provider::from_str("groq");
+        assert!(lan.is_custom());
+
+        // Unset: on for the LAN box, off for anything that bills per request.
+        assert!(live_preview_allowed(None, &lan));
+        assert!(!live_preview_allowed(None, &hosted));
+
+        // Set: the user's choice wins for either kind of endpoint.
+        assert!(live_preview_allowed(Some("true"), &hosted));
+        assert!(!live_preview_allowed(Some("false"), &lan));
+
+        // Anything else is not a yes.
+        assert!(!live_preview_allowed(Some(""), &hosted));
+        assert!(!live_preview_allowed(Some("yes"), &hosted));
     }
 
     #[test]
