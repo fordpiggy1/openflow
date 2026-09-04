@@ -1563,10 +1563,20 @@ mod tests {
             )
             .expect("a history write that failed must not take the take with it");
 
+        // One warning for the write, named as such. Not an equality against the
+        // whole list: the insertion below it is the other thing that reports
+        // rather than raises, and on a platform with no way to insert -- a
+        // headless Linux CI runner, where `type_text` falls through to
+        // `xdotool` and finds none -- it correctly adds a second, unremedied
+        // one. That is the behaviour under test working twice over.
         assert_eq!(
-            problems.iter().map(|p| p.remedy).collect::<Vec<_>>(),
-            [Some(Remedy::History)],
-            "the user is told, and told where the setting for it lives"
+            problems
+                .iter()
+                .filter(|problem| problem.remedy == Some(Remedy::History))
+                .count(),
+            1,
+            "the user is told, and told where the setting for it lives: {:?}",
+            problems
         );
         assert_eq!(
             engine
