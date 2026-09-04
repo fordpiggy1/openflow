@@ -1051,24 +1051,36 @@ impl Engine {
     /// Delete one row, and stop offering its text to the re-copy hotkey.
     ///
     /// The slot holds text rather than an id, because a take is remembered
-    /// whether or not it was saved, so the row going away is the one being held
-    /// exactly when the two texts match. What replaces it is the newest row that
-    /// survives -- the seed `Engine::new` starts from -- so the hotkey after a
-    /// delete says the same thing as the hotkey after a restart.
+    /// whether or not it was saved -- so it can be holding something that is in
+    /// no row at all. Text alone is therefore not identity: two rows can say
+    /// the same thing, and deleting the older of them must not move a slot that
+    /// is holding the newer. The row has to be the newest one *and* say what
+    /// the slot says. What replaces it is the newest row that survives, which
+    /// is the seed `Engine::new` starts from, so the hotkey after a delete says
+    /// the same thing as the hotkey after a restart.
     pub fn delete_transcription(&self, id: &str) -> Result<(), String> {
-        let deleted = self.settings.db().get_transcription(id)?.map(recopy_text);
+        let held = self.settings.db().get_transcription(id)?.map(recopy_text);
+        let was_newest = self
+            .settings
+            .db()
+            .get_history(1)?
+            .into_iter()
+            .next()
+            .is_some_and(|newest| newest.id == id);
         self.settings.db().delete_transcription(id)?;
-        if let Some(deleted) = deleted {
-            let newest = self
-                .settings
-                .db()
-                .get_history(1)?
-                .into_iter()
-                .next()
-                .map(recopy_text);
-            if let Ok(mut last) = self.last_transcription.lock() {
-                if last.as_deref() == Some(deleted.as_str()) {
-                    *last = newest;
+
+        // Past this line the row is gone, so nothing below may turn the delete
+        // into an error or skip the event: a caller told the delete failed
+        // leaves a list on screen that no longer matches the database. A read
+        // that fails here costs the user a stale re-copy slot until the next
+        // launch, which is the smaller of the two.
+        if was_newest && held.is_some() {
+            if let Ok(rows) = self.settings.db().get_history(1) {
+                let newest = rows.into_iter().next().map(recopy_text);
+                if let Ok(mut last) = self.last_transcription.lock() {
+                    if last.as_deref() == held.as_deref() {
+                        *last = newest;
+                    }
                 }
             }
         }
@@ -1265,6 +1277,40 @@ mod tests {
                 .expect("the slot")
                 .as_deref(),
             Some("a take nobody saved")
+        );
+    }
+
+    /// Two takes can say the same thing, and then the slot's text no longer
+    /// names which row it came from. Deleting an older row that happens to
+    /// match must not hand the user a different take's text -- the row has to
+    /// be the newest one as well as the matching one.
+    #[test]
+    fn deleting_an_older_row_that_reads_the_same_leaves_the_slot_alone() {
+        let engine = scratch_engine();
+        let db = engine.settings().db();
+        db.save_transcription(&stored_take("old", "same words", "2026-01-01T00:00:00Z"))
+            .expect("save the older take");
+        db.save_transcription(&stored_take(
+            "new",
+            "something else",
+            "2026-01-02T00:00:00Z",
+        ))
+        .expect("save the newer take");
+        // What the user just dictated, with history saving off: in no row.
+        *engine.last_transcription.lock().expect("the slot") = Some("same words".to_string());
+
+        engine
+            .delete_transcription("old")
+            .expect("delete the older take");
+
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            Some("same words"),
+            "an older row that only reads the same is not the take being held"
         );
     }
 
