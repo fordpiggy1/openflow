@@ -137,6 +137,13 @@ impl PluginManager {
         std::fs::write(plugin_dir.join("manifest.json"), manifest_json)
             .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
+        // Installing over a plugin the user had enabled would otherwise leave
+        // the old `.enabled` marker standing over new code, and the next hook
+        // would run that code -- a subprocess with the user's privileges --
+        // without anyone having enabled it. Enabling is the user's decision to
+        // take again, about the thing they just installed.
+        self.disable_plugin(&manifest.id)?;
+
         Ok(PluginInfo {
             manifest,
             enabled: false,
@@ -362,6 +369,56 @@ mod tests {
         assert!(validate_plugin_id("../escape").is_err());
         assert!(validate_relative_path("../run.sh").is_err());
         assert!(validate_plugin_id("clean-plugin_2").is_ok());
+    }
+
+    /// Reinstalling over a plugin the user had enabled must not hand the new
+    /// code the old permission. The marker is what the hook runner reads, so
+    /// leaving it in place would run a freshly installed executable at the next
+    /// dictation with nobody having said yes to it.
+    #[test]
+    fn installing_over_an_enabled_plugin_lands_disabled() {
+        let root =
+            std::env::temp_dir().join(format!("openflow-plugin-test-{}", uuid::Uuid::new_v4()));
+        let manager = PluginManager {
+            plugins_dir: root.clone(),
+        };
+        let manifest_json = r#"{
+            "id": "reinstalled",
+            "name": "Reinstalled",
+            "version": "2.0.0",
+            "description": "Replaces a version the user had enabled",
+            "hooks": ["after_transcribe"],
+            "entrypoint": "run.sh"
+        }"#;
+
+        let first = manager
+            .install_plugin(manifest_json)
+            .expect("first install");
+        assert!(!first.enabled);
+        manager
+            .enable_plugin("reinstalled")
+            .expect("the user enables it");
+        assert!(manager.list_plugins()[0].enabled);
+
+        let reinstalled = manager
+            .install_plugin(manifest_json)
+            .expect("install over the enabled copy");
+
+        assert!(
+            !reinstalled.enabled,
+            "the returned value has to be true of what is on disk"
+        );
+        assert!(
+            !root.join("reinstalled").join(".enabled").exists(),
+            "the old permission cannot survive the code it was granted to"
+        );
+        assert!(!manager.list_plugins()[0].enabled);
+        assert!(
+            manager.get_enabled_hooks("after_transcribe").is_empty(),
+            "the newly written plugin must not run at the next hook"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove plugin fixture");
     }
 
     #[test]
