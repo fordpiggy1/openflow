@@ -934,12 +934,20 @@ impl SettingsPage {
     /// Keep "Same for cleanup" away from a transcription provider that cannot
     /// run the cleanup pass, and show why rather than failing later.
     ///
-    /// Called from `reload` as well as on a change. This screen is the only
-    /// route into the broken state, so it is also the only route out of it: an
-    /// install that chose Deepgram before opens Settings and comes out working.
-    /// Without the repair the cleanup row would go on displaying a provider the
+    /// Called from `reload` as well as on a change, so that a database written
+    /// before this existed is brought into the same shape as one written after
+    /// it. Without that, the cleanup row would go on displaying a provider the
     /// engine does not use, because an unset `formatting_provider` reads back
     /// as the transcription one.
+    ///
+    /// What this does not do is make a keyless install able to dictate. It
+    /// stops Deepgram being handed a pass it refuses; the pass then goes to the
+    /// row's own provider, and if that one has no key `format_text` fails there
+    /// instead. That is the same shape the wizard already lands in
+    /// (`onboarding.rs::save` writes `formatting_provider` from a list Deepgram
+    /// is filtered out of, and its first entry is Groq), and the reason it
+    /// costs the whole take rather than just the cleanup is one `?` in
+    /// `engine.rs`. That is a product decision and it is filed separately.
     fn apply_cleanup_capability(&self) -> Result<(), String> {
         let ivars = self.ivars();
         let controls = &ivars.controls;
