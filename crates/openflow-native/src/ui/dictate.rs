@@ -25,7 +25,7 @@
 //! the Dictate page takes first responder when it comes forward so the key
 //! reaches the button without a Tab first.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -174,6 +174,10 @@ pub struct DictateIvars {
     /// The full text behind the truncated card, so clicking it copies all of
     /// what was said rather than what fits.
     last: RefCell<Option<String>>,
+    /// What the page is currently showing. Kept because the idle copy depends
+    /// on settings as well as on state, so `load` has to redraw the state it is
+    /// already in rather than assume it is idle.
+    state: Cell<RecordingState>,
 }
 
 define_class!(
@@ -241,6 +245,7 @@ impl DictatePage {
             view,
             controls,
             last: RefCell::new(None),
+            state: Cell::new(RecordingState::Idle),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -283,8 +288,10 @@ impl DictatePage {
             .controls
             .hint
             .setStringValue(&NSString::from_str(&format!(
-                "{} works from any app  ·  {} pastes again",
-                record, recopy
+                "{} works from any app  ·  {} {} again",
+                record,
+                recopy,
+                insertion_verb(settings)
             )));
 
         let newest = ivars
@@ -309,6 +316,10 @@ impl DictatePage {
                     .setStringValue(&NSString::from_str(""));
             }
         }
+
+        // The panel copy names the insert method too, so redraw whatever state
+        // the page is in rather than leaving yesterday's sentence up.
+        self.set_state(ivars.state.get());
     }
 
     /// Show `text` on the result card, with `caption` above it.
@@ -332,6 +343,8 @@ impl DictatePage {
     /// folds it: the pipeline never emits it, and inventing a fourth panel here
     /// would be inventing a state the engine does not have.
     pub fn set_state(&self, state: RecordingState) {
+        self.ivars().state.set(state);
+        let idle_body = idle_body(self.ivars().engine.settings());
         let controls = &self.ivars().controls;
         let (eyebrow, title, body, action, enabled, cancel) = match state {
             RecordingState::Recording => (
@@ -353,7 +366,7 @@ impl DictatePage {
             RecordingState::Idle => (
                 "Ready when you are",
                 "Hold to speak",
-                "Release when you\u{2019}re done. OpenFlow cleans it up and pastes it for you.",
+                idle_body.as_str(),
                 "Hold to record",
                 true,
                 false,
@@ -384,6 +397,33 @@ fn preview_of(text: &str) -> String {
 /// The binding for `action` as the recorder spells it. Same helper Settings
 /// uses, kept separate rather than shared because the two screens are allowed
 /// to disagree about what to say when nothing is bound.
+/// "pastes" or "types", because they are not the same promise. Paste sends Cmd+V
+/// and takes the clipboard with it; Type sends the characters and never touches
+/// it. The Settings page spells the difference out one screen away, so the main
+/// screen should not tell every user it pastes.
+fn insertion_verb(settings: &openflow_core::settings::Settings) -> &'static str {
+    match settings.insert_method() {
+        openflow_core::insert::InsertMethod::Paste => "pastes",
+        openflow_core::insert::InsertMethod::Type => "types",
+    }
+}
+
+/// What the idle panel promises will happen when the key comes up.
+///
+/// Both halves of it are settings: cleanup can be off, and the text can be
+/// typed rather than pasted. The line was fixed copy that claimed both, so on a
+/// machine with Smart cleanup off and Insert text by set to Type -- a
+/// combination the Settings page offers on purpose -- the first sentence a user
+/// reads on the main screen described someone else's setup.
+fn idle_body(settings: &openflow_core::settings::Settings) -> String {
+    let verb = insertion_verb(settings);
+    if settings.format_enabled() {
+        format!("Release when you\u{2019}re done. OpenFlow cleans it up and {verb} it for you.")
+    } else {
+        format!("Release when you\u{2019}re done. OpenFlow {verb} it for you.")
+    }
+}
+
 fn binding_text(settings: &openflow_core::settings::Settings, action: &str) -> String {
     settings
         .shortcut(action)
