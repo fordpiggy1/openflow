@@ -1834,4 +1834,41 @@ device, then hold Option+V to dictate"
             );
         }
     }
+    /// The id list both popups keep is positional: index 0 is the empty
+    /// string, then one id per device, and `write` turns the selected index
+    /// straight back into an id. So `microphone_items` is not free to change
+    /// how many rows it returns -- one extra or one fewer and the selection
+    /// silently saves a different microphone than the one on screen, or the
+    /// empty string.
+    ///
+    /// This became worth holding when Settings' `reload_microphones` became
+    /// the second caller: it builds the same id list, so a change made for one
+    /// popup now moves the other.
+    #[test]
+    fn the_item_list_stays_the_same_length_as_the_id_list() {
+        for count in 0..4 {
+            let devices: Vec<AudioDevice> = (0..count)
+                .map(|n| device(&format!("Microphone {n}"), n == 0))
+                .collect();
+
+            // Exactly what both callers build alongside the items.
+            let mut ids = vec![String::new()];
+            ids.extend(devices.iter().map(|d| d.id.clone()));
+
+            let items = microphone_items(&devices);
+            assert_eq!(
+                items.len(),
+                ids.len(),
+                "{count} device(s): the popup shows {items:?} against ids {ids:?}, \
+so a selection maps to the wrong device"
+            );
+            for (index, id) in ids.iter().enumerate().skip(1) {
+                assert!(
+                    items[index].starts_with(&devices[index - 1].name),
+                    "row {index} shows {:?} but would save {id:?}",
+                    items[index]
+                );
+            }
+        }
+    }
 }
