@@ -1591,63 +1591,70 @@ mod tests {
     }
 
     /// A remedy is decided by which call failed, never by reading the message.
-    /// This drives the real pipeline against a stand-in endpoint that refuses
-    /// the take, so the failure travels the whole way out rather than being
-    /// constructed by the test.
+    /// This drives the real pipeline and asserts on what comes out the far end,
+    /// so the mapping is proved where it is applied rather than restated.
+    ///
+    /// Nothing here touches the network, and that is deliberate rather than
+    /// convenient. `transcribe` keeps one `reqwest::Client` for the life of the
+    /// process, while every test that needs `async` builds a runtime of its own
+    /// and drops it: the pool and its timers belong to whichever runtime used
+    /// the client first, so a later test can wait on a connection that nothing
+    /// is left to drive. An earlier version of this test served a 503 from a
+    /// loopback stand-in, passed here, and hung for the full thirty minutes of
+    /// the CI job's timeout on Linux -- a different core count is a different
+    /// test order.
+    ///
+    /// Local only refuses a hosted provider before a request is built, which
+    /// leaves a provider failure that cannot reach a socket. Which of the two
+    /// refusals arrives depends on the machine: with no Groq key in the
+    /// keychain it is "No API key set. Add one in Settings." from
+    /// `ensure_api_key`, and with one it is the Local only guard one line
+    /// later. `SecretStore` is keyed by service name rather than by app
+    /// directory, so a scratch `Settings` reads the real keychain and a
+    /// developer with a key takes the second path. Both are raised inside the
+    /// same `transcribe_audio` call, so the same remedy is under test either
+    /// way -- which is why the assertion is on the remedy and not the message.
     #[test]
-    fn a_provider_that_refuses_the_take_points_at_the_provider_settings() {
-        use std::io::{Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a stand-in endpoint");
-        let port = listener.local_addr().expect("its address").port();
-        let served = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("the upload");
-            let mut buffer = vec![0u8; 65536];
-            let read = stream.read(&mut buffer).expect("read the request");
-            let body = b"{\"error\":\"model is not loaded\"}";
-            let _ = stream.write_all(
-                format!(
-                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                )
-                .as_bytes(),
-            );
-            let _ = stream.write_all(body);
-            String::from_utf8_lossy(&buffer[..read]).into_owned()
-        });
+    fn a_failure_on_the_provider_path_points_at_the_provider_settings() {
+        // Everything that writes the process-wide flag takes turns; see the
+        // note on the mutex itself.
+        let _guard = crate::transcribe::tests::LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
 
         let engine = scratch_engine();
         let db = engine.settings().db();
-        db.set_setting("provider", &format!("custom:http://127.0.0.1:{port}/v1"))
-            .expect("the endpoint");
+        db.set_setting("provider", "groq")
+            .expect("a hosted provider");
+        db.set_setting("local_only", "true")
+            .expect("no take leaves");
         // Isolate the transcription call: with cleanup on, a second provider
         // call would be the one under test.
         db.set_setting("format_enabled", "false")
             .expect("no cleanup");
 
-        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
         let failure = match runtime.block_on(engine.run_pipeline(
             b"RIFF....WAVEfmt ".to_vec(),
             "test".to_string(),
             CancellationToken::new(),
         )) {
             Err(failure) => failure,
-            Ok(_) => panic!("the stand-in endpoint answered 503, so this cannot succeed"),
+            Ok(_) => panic!("Local only refuses a hosted provider, so this cannot succeed"),
         };
 
-        assert!(
-            served
-                .join()
-                .expect("the stand-in endpoint")
-                .starts_with("POST /v1/audio/transcriptions "),
-            "the take has to have reached the provider for this to be its failure"
-        );
         assert_eq!(
             failure.remedy,
             Some(Remedy::Providers),
-            "a provider that refused the take sends the user to the providers"
+            "a take the provider never took sends the user to the providers: {}",
+            failure.message
         );
         assert_eq!(Remedy::Providers.target(), "providers");
+
+        crate::transcribe::set_local_only(false);
     }
 
     #[test]
