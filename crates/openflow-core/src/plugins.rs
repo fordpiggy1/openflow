@@ -134,15 +134,22 @@ impl PluginManager {
         std::fs::create_dir_all(&plugin_dir)
             .map_err(|e| format!("Failed to create plugin dir: {}", e))?;
 
+        // Before the new code, not after. Installing over a plugin the user had
+        // enabled would otherwise leave the old `.enabled` marker standing over
+        // it, and the next hook would run it -- a subprocess with the user's
+        // privileges -- without anyone having enabled it. Enabling is the
+        // user's decision to take again, about the thing they just installed.
+        //
+        // Order matters for the failure as much as for the success. Writing
+        // first and then failing to remove the marker returns an error while
+        // leaving new code enabled on disk, and leaves a window in which a hook
+        // starting on another thread reads the new manifest as still permitted.
+        // This way a failure leaves a plugin disabled, which is the side that
+        // costs the user a click rather than a decision they never made.
+        self.disable_plugin(&manifest.id)?;
+
         std::fs::write(plugin_dir.join("manifest.json"), manifest_json)
             .map_err(|e| format!("Failed to write manifest: {}", e))?;
-
-        // Installing over a plugin the user had enabled would otherwise leave
-        // the old `.enabled` marker standing over new code, and the next hook
-        // would run that code -- a subprocess with the user's privileges --
-        // without anyone having enabled it. Enabling is the user's decision to
-        // take again, about the thing they just installed.
-        self.disable_plugin(&manifest.id)?;
 
         Ok(PluginInfo {
             manifest,
@@ -419,6 +426,59 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("remove plugin fixture");
+    }
+
+    /// Installing is two steps, and the order decides what a failure leaves
+    /// behind. If the marker cannot be removed, the new executable's manifest
+    /// must not already be on disk under the old permission -- otherwise the
+    /// call reports failure while the thing it was refusing to enable is
+    /// enabled.
+    #[test]
+    #[cfg(unix)]
+    fn an_install_that_cannot_disable_does_not_land_the_new_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("openflow-plugin-order-{}", uuid::Uuid::new_v4()));
+        let manager = PluginManager {
+            plugins_dir: root.clone(),
+        };
+        let manifest_of = |version: &str| {
+            format!(
+                r#"{{"id":"pinned","name":"Pinned","version":"{}","description":"d","hooks":["after_transcribe"],"entrypoint":"run.sh"}}"#,
+                version
+            )
+        };
+        manager
+            .install_plugin(&manifest_of("2.0.0"))
+            .expect("first install");
+        manager
+            .enable_plugin("pinned")
+            .expect("the user enables it");
+
+        let plugin_dir = root.join("pinned");
+        let original = std::fs::metadata(&plugin_dir).expect("stat").permissions();
+        std::fs::set_permissions(&plugin_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("lock the folder");
+        // A process that ignores directory permissions -- root -- would make
+        // this test assert nothing, so check the premise rather than assume it.
+        let unremovable = std::fs::remove_file(plugin_dir.join(".enabled")).is_err();
+
+        let outcome = manager.install_plugin(&manifest_of("3.0.0"));
+        let on_disk = std::fs::read_to_string(plugin_dir.join("manifest.json")).expect("manifest");
+
+        std::fs::set_permissions(&plugin_dir, original).expect("unlock the folder");
+        std::fs::remove_dir_all(&root).expect("remove plugin fixture");
+
+        if !unremovable {
+            return;
+        }
+        assert!(outcome.is_err(), "the install could not be made safe");
+        assert!(
+            on_disk.contains("2.0.0"),
+            "new code must not land while the old permission still stands: {}",
+            on_disk
+        );
     }
 
     #[test]

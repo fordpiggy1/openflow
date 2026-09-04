@@ -673,6 +673,29 @@ mod tests {
         assert_eq!(settings.local_idle_minutes(), DEFAULT_LOCAL_IDLE_MINUTES);
     }
 
+    /// The guard is armed from the same answer at construction, and that branch
+    /// is reachable in the case that matters most: the store was already
+    /// unreadable before this process ever asked it anything.
+    #[test]
+    fn a_store_that_cannot_answer_at_startup_arms_the_guard() {
+        let _serialized = crate::transcribe::tests::LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::transcribe::set_local_only(false);
+
+        let dir = std::env::temp_dir().join(format!("openflow-settings-{}", uuid::Uuid::new_v4()));
+        let db = Database::new(dir.clone()).expect("a scratch database");
+        crate::db::tests::poison_the_connection_lock(&db);
+        let settings = Settings::new(db, SecretStore::new(dir));
+
+        assert!(
+            crate::transcribe::local_only(),
+            "a store that could not be read at startup has not said the guard is off"
+        );
+        assert!(settings.local_only());
+        crate::transcribe::set_local_only(false);
+    }
+
     /// A blank voice model or voice means "the provider's own default", not an
     /// empty model name on the wire.
     #[test]
