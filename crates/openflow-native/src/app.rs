@@ -231,14 +231,14 @@ impl App {
             EngineEvent::TranscriptionPartial(partial) => {
                 self.overlay.set_partial(&partial.text, partial.held)
             }
-            EngineEvent::TranscriptionWarning(warning) => self.notify("OpenFlow", &warning),
+            EngineEvent::TranscriptionWarning(warning) => self.notify("OpenFlow", &warning.message),
             // Report it and stop there. The engine decides when the pill rests,
             // through `emit_idle_if_quiescent`, which only says "idle" once no
             // capture is running and no job is left. Forcing idle here would
             // blank the pill mid-recording whenever a previous take failed
             // while the user was already holding the key down again.
             EngineEvent::TranscriptionError(error) => {
-                self.notify("OpenFlow could not finish", &error);
+                self.notify("OpenFlow could not finish", &error.message);
                 self.overlay.show_outcome(Outcome::Error);
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
