@@ -988,13 +988,28 @@ impl Engine {
         }
     }
 
-    /// Re-insert one history row, for the tray's recents list.
-    pub fn paste_transcription(&self, id: &str) {
-        if let Ok(Some(t)) = self.settings.db().get_transcription(id) {
-            let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
-            let _ = paste_to_clipboard(text, self.settings.insert_method(), ClipboardPolicy::Keep);
-            self.emit(EngineEvent::RecopySuccess("Copied!".to_string()));
+    /// Re-insert one history row, for the tray's recents list and the History
+    /// window. Answers with the problem when there was one.
+    ///
+    /// Copying and pasting fail separately: under `Keep` the text can be sitting
+    /// on the clipboard while macOS refuses the keystroke, and that error is the
+    /// only sentence that tells the user about Accessibility. A host that shows
+    /// nothing of its own can ignore the answer, since the same message goes out
+    /// as an event.
+    pub fn paste_transcription(&self, id: &str) -> Option<String> {
+        let problem = match self.settings.db().get_transcription(id) {
+            Ok(Some(t)) => {
+                let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
+                paste_to_clipboard(text, self.settings.insert_method(), ClipboardPolicy::Keep).err()
+            }
+            Ok(None) => Some("That transcription is no longer in history.".to_string()),
+            Err(error) => Some(error),
+        };
+        match problem.clone() {
+            None => self.emit(EngineEvent::RecopySuccess("Copied!".to_string())),
+            Some(problem) => self.emit(EngineEvent::TranscriptionWarning(problem)),
         }
+        problem
     }
 
     // ── History ───────────────────────────────────────────
@@ -1067,17 +1082,38 @@ impl Engine {
 mod tests {
     use super::*;
 
-    /// An engine over a throwaway database, with an events sink that drops
-    /// everything and a spawner nothing uses.
-    fn scratch_engine() -> Arc<Engine> {
-        struct Discard;
-        impl EngineEvents for Discard {
-            fn emit(&self, _event: EngineEvent) -> Result<(), String> {
-                Ok(())
-            }
+    /// The events a test cares about, rendered to one line each so a test can
+    /// say what the user would have been shown.
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl EngineEvents for Recorder {
+        fn emit(&self, event: EngineEvent) -> Result<(), String> {
+            let line = match event {
+                EngineEvent::RecopySuccess(message) => format!("success: {}", message),
+                EngineEvent::TranscriptionWarning(message) => format!("warning: {}", message),
+                _ => return Ok(()),
+            };
+            self.0.lock().expect("the event log").push(line);
+            Ok(())
         }
+    }
+
+    /// An engine over a throwaway database, with a spawner nothing uses, beside
+    /// the log of what it told its host.
+    fn scratch_engine_and_events() -> (Arc<Engine>, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
         let dir = std::env::temp_dir().join(format!("openflow-engine-{}", uuid::Uuid::new_v4()));
-        Engine::new(dir, Arc::new(Discard), Box::new(|_| {})).expect("a scratch engine")
+        let engine = Engine::new(
+            dir,
+            Arc::new(Recorder(Arc::clone(&events))),
+            Box::new(|_| {}),
+        )
+        .expect("a scratch engine");
+        (engine, events)
+    }
+
+    fn scratch_engine() -> Arc<Engine> {
+        scratch_engine_and_events().0
     }
 
     fn stored_take(id: &str, text: &str, created_at: &str) -> Transcription {
@@ -1206,6 +1242,25 @@ mod tests {
                 .expect("the slot")
                 .as_deref(),
             Some("a take nobody saved")
+        );
+    }
+
+    /// The tray and the History window both offer a row the database may no
+    /// longer have. Claiming a paste that never happened is the one answer that
+    /// leaves the user hunting for text that was never inserted.
+    #[test]
+    fn re_inserting_a_row_that_is_gone_says_so_instead_of_claiming_success() {
+        let (engine, events) = scratch_engine_and_events();
+
+        let problem = engine.paste_transcription("a row nobody has");
+
+        assert_eq!(
+            problem.as_deref(),
+            Some("That transcription is no longer in history.")
+        );
+        assert_eq!(
+            events.lock().expect("the event log").as_slice(),
+            ["warning: That transcription is no longer in history.".to_string()]
         );
     }
 
