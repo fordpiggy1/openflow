@@ -907,7 +907,7 @@ impl Engine {
         let transcription = Transcription {
             id: uuid::Uuid::new_v4().to_string(),
             raw_text,
-            formatted_text: Some(formatted.clone()),
+            formatted_text: Some(formatted),
             provider: provider_str,
             duration_ms,
             context_type: None,
@@ -915,6 +915,27 @@ impl Engine {
             language,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
+        self.finish_take(&cancellation, transcription)
+    }
+
+    /// Write the take down and put it where the user is typing: the two steps
+    /// that cannot be taken back.
+    ///
+    /// The cancellation check belongs here and not only in the `select!`s
+    /// above, because the plugin hooks between them are blocking calls. A
+    /// cancel that arrives while one is running is not noticed until it
+    /// returns, and a hook is given five seconds before it is killed -- 2.5 s
+    /// measured against a hook that sleeps for two. Cancelling in that window
+    /// used to leave the take on disk and pasted into whatever the user had
+    /// stopped it from reaching.
+    fn finish_take(
+        &self,
+        cancellation: &CancellationToken,
+        transcription: Transcription,
+    ) -> Result<(Transcription, Option<String>), String> {
+        if cancellation.is_cancelled() {
+            return Err("Transcription cancelled".to_string());
+        }
 
         // Saving is opt-out, and an optional retention window trims old rows as we go.
         if self.settings.save_history() {
@@ -923,19 +944,21 @@ impl Engine {
                 let _ = self.settings.db().prune_older_than(days);
             }
         }
+        let text = transcription
+            .formatted_text
+            .as_deref()
+            .unwrap_or(&transcription.raw_text)
+            .to_string();
         {
             let mut last = self
                 .last_transcription
                 .lock()
                 .map_err(|_| "Clipboard history is unavailable".to_string())?;
-            *last = Some(formatted);
+            *last = Some(text.clone());
         }
 
         let paste_warning = paste_to_clipboard(
-            transcription
-                .formatted_text
-                .as_deref()
-                .unwrap_or(&transcription.raw_text),
+            &text,
             self.settings.insert_method(),
             self.settings.clipboard_policy(),
         )
@@ -1261,6 +1284,46 @@ mod tests {
         assert_eq!(
             events.lock().expect("the event log").as_slice(),
             ["warning: That transcription is no longer in history.".to_string()]
+        );
+    }
+
+    /// A cancel is only seen where something looks for it, and the last look
+    /// used to be before the plugin hooks -- which block for as long as five
+    /// seconds. By the time one returns the take is one step from the disk and
+    /// one step from the user's editor, and a cancelled take may take neither.
+    ///
+    /// The take carries no text on purpose: if this ever regresses, the
+    /// insertion it would then attempt has nothing to type into whatever window
+    /// happens to be focused while the suite runs.
+    #[test]
+    fn a_cancelled_take_is_neither_saved_nor_inserted() {
+        let engine = scratch_engine();
+        engine
+            .settings()
+            .db()
+            .set_setting("insert_method", "type")
+            .expect("an insertion with nothing to insert");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let outcome = engine.finish_take(
+            &cancellation,
+            stored_take("cancelled", "", "2026-01-01T00:00:00Z"),
+        );
+
+        assert_eq!(outcome.err().as_deref(), Some("Transcription cancelled"));
+        assert!(
+            engine.history(10).expect("history").is_empty(),
+            "a cancelled take must not be on disk"
+        );
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            None,
+            "a cancelled take must not be one keystroke away either"
         );
     }
 
