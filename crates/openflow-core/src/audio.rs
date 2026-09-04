@@ -413,6 +413,20 @@ fn audio_device_id(name: &str, occurrence: usize) -> String {
 /// recording *slot* after a lost key-up and does not stop this buffer filling.
 const MAX_CAPTURE_SAMPLES: usize = 48_000 * 60 * 20;
 
+/// What the user is told when a take ended at [`MAX_CAPTURE_SAMPLES`].
+///
+/// It names no duration, because the ceiling has none: the same constant is 20
+/// minutes on the built-in microphone and 10 on a 96 kHz interface, so a figure
+/// here would be wrong on half the machines that see this line.
+///
+/// It says *end* rather than "part", because which part is lost is the one
+/// thing the user cannot guess. Frames are dropped as they arrive rather than
+/// rotated out, so what survives is the opening of the take -- the reverse of
+/// what a person who has watched a full disk fill would assume.
+pub const CAPTURE_CEILING_WARNING: &str =
+    "This recording reached its length limit, so the end of it was not captured. \
+Everything spoken before that point is still here.";
+
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -1219,5 +1233,60 @@ mod tests {
         assert_eq!(mix_frame_to_mono(&[0.0_f32, 1.0_f32]), Some(0.5));
         assert_eq!(mix_frame_to_mono(&[1.0_f32, 0.0_f32]), Some(0.5));
         assert_eq!(mix_frame_to_mono::<f32>(&[]), None);
+    }
+    /// The ceiling is a frame count, so the wall-clock length it allows is a
+    /// property of the device: 20 minutes at 48 kHz, 21:46 at 44.1, 10:00 on a
+    /// 96 kHz interface. A figure in the message would therefore be wrong on
+    /// whichever machines are not the one it was written on -- which is why
+    /// `CAPTURE_CEILING_WARNING` names none, and why that is worth holding.
+    ///
+    /// Faked this before trusting it: the first draft asserted the string did
+    /// not contain "minutes", which "20 min" and "1200 seconds" both walk
+    /// straight past. Digits are the thing that cannot be smuggled.
+    #[test]
+    fn the_ceiling_message_names_no_duration() {
+        assert!(
+            !CAPTURE_CEILING_WARNING.chars().any(|c| c.is_ascii_digit()),
+            "the ceiling moves with the sample rate, so a number here is \
+wrong on some machine: {:?}",
+            CAPTURE_CEILING_WARNING
+        );
+    }
+
+    /// What survives is the *opening* of the take: frames are dropped as they
+    /// arrive rather than rotated out, so the message has to name the end. A
+    /// line that said the start was lost would send the user looking for the
+    /// wrong half of what they said, so the two claims are pinned together
+    /// here -- the behaviour is re-measured rather than assumed, because the
+    /// wording is only correct while the dropping stays this way round.
+    #[test]
+    fn the_ceiling_message_says_which_end_was_lost() {
+        let samples = Mutex::new(Vec::new());
+        let level = AtomicU32::new(0);
+        let truncated = AtomicBool::new(false);
+        let limit = 4;
+
+        handle_capture_buffer(
+            &[1.0f32, 2.0, 3.0, 4.0],
+            1,
+            &samples,
+            &level,
+            &truncated,
+            limit,
+        );
+        handle_capture_buffer(&[5.0f32, 6.0], 1, &samples, &level, &truncated, limit);
+
+        assert!(truncated.load(Ordering::Relaxed), "the ceiling was reached");
+        assert_eq!(
+            *samples.lock().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            "the opening is what survives, so the end is what is missing"
+        );
+        assert!(
+            CAPTURE_CEILING_WARNING.contains("the end of it was not captured"),
+            "the message has to name the end, because that is the half the \
+user cannot infer: {:?}",
+            CAPTURE_CEILING_WARNING
+        );
     }
 }
