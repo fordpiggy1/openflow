@@ -175,6 +175,12 @@ pub fn recording_slot_free(slot: &Option<Instant>) -> bool {
     }
 }
 
+/// What the re-copy slot holds for a history row: the cleaned-up text when the
+/// take was cleaned up, and the raw transcript otherwise.
+fn recopy_text(item: Transcription) -> String {
+    item.formatted_text.unwrap_or(item.raw_text)
+}
+
 /// Everything a reading of a recording in progress needs from settings.
 ///
 /// Resolved once when the capture starts and moved into the preview task, so a
@@ -250,7 +256,7 @@ impl Engine {
             .get_history(1)?
             .into_iter()
             .next()
-            .map(|item| item.formatted_text.unwrap_or(item.raw_text));
+            .map(recopy_text);
 
         // Built for every launch, started for none: an idle supervisor is a
         // mutex and no threads, and building it here means the Settings screen
@@ -1004,8 +1010,30 @@ impl Engine {
         self.settings.db().get_transcription(id)
     }
 
+    /// Delete one row, and stop offering its text to the re-copy hotkey.
+    ///
+    /// The slot holds text rather than an id, because a take is remembered
+    /// whether or not it was saved, so the row going away is the one being held
+    /// exactly when the two texts match. What replaces it is the newest row that
+    /// survives -- the seed `Engine::new` starts from -- so the hotkey after a
+    /// delete says the same thing as the hotkey after a restart.
     pub fn delete_transcription(&self, id: &str) -> Result<(), String> {
+        let deleted = self.settings.db().get_transcription(id)?.map(recopy_text);
         self.settings.db().delete_transcription(id)?;
+        if let Some(deleted) = deleted {
+            let newest = self
+                .settings
+                .db()
+                .get_history(1)?
+                .into_iter()
+                .next()
+                .map(recopy_text);
+            if let Ok(mut last) = self.last_transcription.lock() {
+                if last.as_deref() == Some(deleted.as_str()) {
+                    *last = newest;
+                }
+            }
+        }
         self.emit(EngineEvent::HistoryChanged);
         Ok(())
     }
@@ -1038,6 +1066,33 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine over a throwaway database, with an events sink that drops
+    /// everything and a spawner nothing uses.
+    fn scratch_engine() -> Arc<Engine> {
+        struct Discard;
+        impl EngineEvents for Discard {
+            fn emit(&self, _event: EngineEvent) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("openflow-engine-{}", uuid::Uuid::new_v4()));
+        Engine::new(dir, Arc::new(Discard), Box::new(|_| {})).expect("a scratch engine")
+    }
+
+    fn stored_take(id: &str, text: &str, created_at: &str) -> Transcription {
+        Transcription {
+            id: id.to_string(),
+            raw_text: text.to_string(),
+            formatted_text: Some(text.to_string()),
+            provider: "test".to_string(),
+            duration_ms: Some(1_000),
+            context_type: None,
+            window_title: None,
+            language: None,
+            created_at: created_at.to_string(),
+        }
+    }
 
     #[test]
     fn recording_slot_frees_itself_after_the_watchdog_window() {
@@ -1074,6 +1129,84 @@ mod tests {
         assert!(should_hold(interval + Duration::from_millis(1), interval));
         // A LAN 1.7B at 20 s of audio, the case this exists for.
         assert!(should_hold(Duration::from_secs(2), interval));
+    }
+
+    /// Ctrl+Shift+V pastes the text the engine is holding, not the history
+    /// table, so deleting the newest row has to move the slot on. Re-seeding
+    /// from what is left is what launch does, and it keeps the shortcut alive.
+    #[test]
+    fn deleting_the_row_the_recopy_slot_holds_moves_it_to_the_next_one() {
+        let engine = scratch_engine();
+        let db = engine.settings().db();
+        db.save_transcription(&stored_take(
+            "older",
+            "the older take",
+            "2026-01-01T00:00:00Z",
+        ))
+        .expect("save the older take");
+        db.save_transcription(&stored_take(
+            "newer",
+            "the newest take",
+            "2026-01-02T00:00:00Z",
+        ))
+        .expect("save the newest take");
+        *engine.last_transcription.lock().expect("the slot") = Some("the newest take".to_string());
+
+        engine
+            .delete_transcription("newer")
+            .expect("delete the newest take");
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            Some("the older take"),
+            "deleting the held row must not leave its text one keystroke away"
+        );
+
+        engine
+            .delete_transcription("older")
+            .expect("delete the last take");
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            None,
+            "with no rows left there is nothing to re-copy"
+        );
+    }
+
+    /// With history saving off the slot holds a take that is in no row at all.
+    /// Deleting somebody else's row must not hand the user that row's text.
+    #[test]
+    fn deleting_a_row_the_recopy_slot_is_not_holding_leaves_it_alone() {
+        let engine = scratch_engine();
+        engine
+            .settings()
+            .db()
+            .save_transcription(&stored_take(
+                "saved",
+                "a saved take",
+                "2026-01-01T00:00:00Z",
+            ))
+            .expect("save a take");
+        *engine.last_transcription.lock().expect("the slot") =
+            Some("a take nobody saved".to_string());
+
+        engine
+            .delete_transcription("saved")
+            .expect("delete the saved take");
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            Some("a take nobody saved")
+        );
     }
 
     #[test]
