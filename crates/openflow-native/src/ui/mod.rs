@@ -559,3 +559,41 @@ pub fn wire(control: &NSControl, target: &AnyObject, action: objc2::runtime::Sel
         control.setAction(Some(action));
     }
 }
+
+/// Text measurement, so a string that does not fit its box fails a test instead
+/// of waiting to be noticed in a screenshot.
+///
+/// Two of those shipped: a 148.8pt label in a 132pt column, and a 607pt sentence
+/// drawn on one line in a 468pt row. Neither is visible in the code, neither
+/// breaks a build, and both were found by driving the built app. They are
+/// arithmetic, though -- and AppKit does this arithmetic off the main thread,
+/// with no `NSApplication`, which is what lets the checks be `cargo test`.
+///
+/// The fonts are read from the same constructors [`label`] and [`note`] use, so
+/// a change there cannot leave the measurements behind.
+#[cfg(test)]
+pub(crate) mod metrics {
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSFont, NSFontAttributeName, NSStringDrawing};
+    use objc2_foundation::{NSDictionary, NSString};
+
+    fn width(text: &str, font: &NSFont) -> f64 {
+        let font: &AnyObject = font;
+        let attributes = NSDictionary::from_slices(&[unsafe { NSFontAttributeName }], &[font]);
+        let string = NSString::from_str(text);
+        unsafe { string.sizeWithAttributes(Some(&attributes)) }.width
+    }
+
+    /// How wide `text` draws at the font [`super::label`] gives a row label.
+    pub(crate) fn label_width(text: &str) -> f64 {
+        width(
+            text,
+            &NSFont::systemFontOfSize(NSFont::smallSystemFontSize()),
+        )
+    }
+
+    /// How wide `text` draws at the font [`super::note`] gives a caption.
+    pub(crate) fn note_width(text: &str) -> f64 {
+        width(text, &NSFont::systemFontOfSize(10.0))
+    }
+}
