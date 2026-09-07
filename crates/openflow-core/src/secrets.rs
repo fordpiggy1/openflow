@@ -421,3 +421,107 @@ fn validate_account(account: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The account names this app actually stores.
+    const REAL: &[&str] = &["api_key", "formatting_api_key", "tts_api_key"];
+
+    /// The gate every credential name goes through, on every platform.
+    ///
+    /// It is the only thing between an account name and a filename on Windows,
+    /// where a secret is `<app_dir>/secrets/<account>.dpapi` -- and this file
+    /// had no tests at all, so what it rejects was written down nowhere except
+    /// in itself.
+    ///
+    /// Measured while forging this: of the two guards `validate_account` runs,
+    /// **the character whitelist is the load-bearing one**. Deleting the
+    /// `Path::components` check leaves every case here passing, because nothing
+    /// containing `/`, `\` or `.` survives the whitelist to reach it, and no
+    /// input could be constructed that only the components check catches. So
+    /// the edit to be afraid of in this function is loosening the whitelist;
+    /// the components check is the belt behind the braces. This test asserts
+    /// the property -- a name is not a path -- rather than which guard enforces
+    /// it, which is why it still holds if either is rewritten.
+    #[test]
+    fn a_credential_name_is_a_name_and_not_a_path() {
+        for name in REAL {
+            assert!(
+                validate_account(name).is_ok(),
+                "{name} is a name this app stores and has to be accepted"
+            );
+        }
+        for bad in [
+            "",
+            "..",
+            "../escape",
+            "..\\escape",
+            "/etc/passwd",
+            "C:\\Windows\\System32\\config",
+            "sub/dir",
+            "sub\\dir",
+            ".",
+            "with space",
+            "with.dot",
+            "with-dash",
+            "naïve",
+            "nul\0byte",
+        ] {
+            assert!(
+                validate_account(bad).is_err(),
+                "{bad:?} was accepted as a credential name, and on Windows that \
+                 is a filename"
+            );
+        }
+        assert!(validate_account(&"a".repeat(64)).is_ok(), "64 is the limit");
+        assert!(
+            validate_account(&"a".repeat(65)).is_err(),
+            "65 is past the limit"
+        );
+    }
+
+    /// Every name the gate accepts lands inside the secrets directory.
+    ///
+    /// Windows only, because `secret_path` is: on macOS and Linux the store is
+    /// the OS keychain or Secret Service and there is no filename to escape
+    /// from. **Which is the point.** This assertion is about the one platform
+    /// that turns a credential name into a path, and until the CI job beside
+    /// this ran, it was a test that existed and never executed anywhere.
+    ///
+    /// Joined and compared rather than eyeballed: `Path::join` with an absolute
+    /// or `..`-bearing component silently discards the prefix, which is exactly
+    /// the failure `validate_account` exists to stop and exactly the failure a
+    /// human reading the code does not see.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn an_accepted_name_cannot_leave_the_secrets_directory() {
+        let app_dir = std::env::temp_dir().join("openflow-secrets-test");
+        let store = SecretStore::new(app_dir.clone());
+        let secrets = app_dir.join("secrets");
+        for name in REAL {
+            let path = store.secret_path(name).expect("a real account name");
+            assert!(
+                path.starts_with(&secrets),
+                "{name} resolved to {path:?}, outside {secrets:?}"
+            );
+            assert_eq!(
+                path.parent(),
+                Some(secrets.as_path()),
+                "{name} resolved into a subdirectory of the secrets folder"
+            );
+            assert_eq!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("dpapi"),
+                "{name} did not resolve to a DPAPI blob"
+            );
+        }
+        for bad in ["..", "../escape", "..\\escape", "C:\\Windows\\System32"] {
+            assert!(
+                store.secret_path(bad).is_err(),
+                "{bad:?} produced a path instead of being refused"
+            );
+        }
+    }
+}

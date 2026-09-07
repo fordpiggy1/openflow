@@ -1868,6 +1868,7 @@ server.serve_forever()
     /// How many sidecars from this fixture are running right now. Each fixture
     /// writes its script into its own uuid directory, so the path is unique to
     /// this test.
+    #[cfg(unix)]
     fn live_sidecars(script: &Path) -> usize {
         let needle = script.display().to_string();
         let Ok(output) = Command::new("/bin/ps").args(["-A", "-o", "args="]).output() else {
@@ -1890,17 +1891,17 @@ server.serve_forever()
         condition()
     }
 
+    #[cfg(unix)]
+    /// Whether a pid is still a live process.
+    ///
+    /// This used to carry a `#[cfg(not(unix))]` arm returning a hardcoded
+    /// `false`, which is not "no" -- it is "this probe cannot answer". Every
+    /// `assert!(alive(pid))` above it failed on Windows by construction, saying
+    /// nothing whatever about the sidecar. The arm is gone and the tests that
+    /// use it are unix-only, which is the honest version of the same fact.
     fn alive(pid: u32) -> bool {
-        #[cfg(unix)]
         // SAFETY: signal 0 tests for existence and sends nothing.
-        unsafe {
-            libc::kill(pid as libc::pid_t, 0) == 0
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = pid;
-            false
-        }
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
     /// A spawned sidecar becomes ready, on a loopback port, and the host is
@@ -1939,6 +1940,12 @@ server.serve_forever()
     }
 
     /// A sidecar that dies on its own comes back, with a new process.
+    /// `#[cfg(unix)]` because both halves of it are: the probes below read
+    /// process liveness through signals, and `terminate` -- which is what this
+    /// asserts the effect of -- is an empty function on Windows. Measured on a
+    /// `windows-latest` runner before gating it, rather than assumed: this
+    /// failed there on `alive`, which returns a hardcoded `false` off unix.
+    #[cfg(unix)]
     #[test]
     fn a_crashed_runner_is_restarted() {
         let Some(fixture) = fixture() else {
@@ -2052,6 +2059,12 @@ server.serve_forever()
 
     /// Dropping the supervisor kills the sidecar. Nothing else does it on the
     /// quit path, and 2.5 GB of weights must not survive the app.
+    /// `#[cfg(unix)]` because both halves of it are: the probes below read
+    /// process liveness through signals, and `terminate` -- which is what this
+    /// asserts the effect of -- is an empty function on Windows. Measured on a
+    /// `windows-latest` runner before gating it, rather than assumed: this
+    /// failed there on `alive`, which returns a hardcoded `false` off unix.
+    #[cfg(unix)]
     #[test]
     fn dropping_the_supervisor_kills_the_sidecar() {
         let Some(fixture) = fixture() else {
@@ -2127,6 +2140,12 @@ server.serve_forever()
     /// second spawned a second sidecar, the first's pid was overwritten, its
     /// monitor saw a generation mismatch and did nothing, and that process went
     /// on to load a model and hold 1 to 2.5 GB until the app quit.
+    /// `#[cfg(unix)]` because both halves of it are: the probes below read
+    /// process liveness through signals, and `terminate` -- which is what this
+    /// asserts the effect of -- is an empty function on Windows. Measured on a
+    /// `windows-latest` runner before gating it, rather than assumed: this
+    /// failed there on `alive`, which returns a hardcoded `false` off unix.
+    #[cfg(unix)]
     #[test]
     fn a_prewarm_and_a_start_together_spawn_one_sidecar() {
         let Some(fixture) = fixture() else {
@@ -2183,6 +2202,12 @@ server.serve_forever()
     /// because it is the last thing standing between a supervisor bug and a
     /// 2.5 GB process nobody holds the pid of, and `launch` is driven directly
     /// here rather than through the guard that is meant to prevent it.
+    /// `#[cfg(unix)]` because both halves of it are: the probes below read
+    /// process liveness through signals, and `terminate` -- which is what this
+    /// asserts the effect of -- is an empty function on Windows. Measured on a
+    /// `windows-latest` runner before gating it, rather than assumed: this
+    /// failed there on `alive`, which returns a hardcoded `false` off unix.
+    #[cfg(unix)]
     #[test]
     fn a_launch_that_replaces_a_live_sidecar_kills_it() {
         let Some(fixture) = fixture() else {
