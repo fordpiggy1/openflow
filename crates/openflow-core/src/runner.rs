@@ -487,6 +487,31 @@ impl LocalRunner {
         });
     }
 
+    /// A setup step that gives up must not leave the runner busy.
+    ///
+    /// `is_busy()` covers `Installing` and `Downloading`, and `ui/settings.rs`
+    /// reads it to decide that Install is disabled and Stop is enabled. Several
+    /// of the `?`s in the steps below return before anything has set a resting
+    /// phase -- a directory that cannot be created, a child that will not spawn
+    /// at all -- and `run_runner_step` in the window discards the error, so the
+    /// page stayed busy for the rest of the session with nothing saying why.
+    ///
+    /// Only a phase that is still busy is touched. The ones that already mean
+    /// something -- `Failed` from a non-zero exit, `MissingPython`, `Stopped`
+    /// -- are left as they are, and so is a stop the user asked for:
+    /// `stop()` bumps the generation before it publishes `Stopped`, so a step
+    /// refusing on the generation can arrive here while the phase is still
+    /// `Installing`, and settling it would turn the user's own Stop into a
+    /// failure.
+    fn settle(&self, outcome: Result<(), String>) -> Result<(), String> {
+        if let Err(message) = &outcome {
+            if message != SETUP_STOPPED && self.status().phase.is_busy() {
+                self.set_phase(RunnerPhase::Failed, message);
+            }
+        }
+        outcome
+    }
+
     fn note(&self, line: &str) {
         let mut inner = self.lock();
         if inner.log.len() == LOG_LINES {
@@ -577,6 +602,14 @@ impl LocalRunner {
     /// without downloading anything, so pressing Install twice is free and a
     /// half-built venv is repaired by pressing it again.
     pub fn install(&self) -> Result<(), String> {
+        self.settle(self.install_steps())
+    }
+
+    /// Build the virtualenv and install the packages.
+    ///
+    /// Reached only through [`Self::install`], which is what lands the phase
+    /// when one of these steps gives up.
+    fn install_steps(&self) -> Result<(), String> {
         // Captured once, before the first child, and checked by every one of
         // them: a stop that lands between the venv and the pip install has to
         // stop the install, not just the child that happened to be running.
@@ -661,6 +694,14 @@ impl LocalRunner {
 
     /// Fetch the weights for the configured model. Blocking.
     pub fn download(&self) -> Result<(), String> {
+        self.settle(self.download_steps())
+    }
+
+    /// Fetch the model weights.
+    ///
+    /// Reached only through [`Self::download`], which is what lands the phase
+    /// when one of these steps gives up.
+    fn download_steps(&self) -> Result<(), String> {
         let generation = self.setup_generation();
         if !self.installed_now() {
             return Err(
@@ -2371,5 +2412,104 @@ server.serve_forever()
             runner.status().resident_bytes
         );
         runner.stop();
+    }
+
+    /// `settle` is the boundary that keeps a failed setup step from leaving the
+    /// window with no way forward, and it has to be narrow: three of these four
+    /// cases are ones it must not touch.
+    #[test]
+    fn a_step_that_gives_up_while_busy_lands_somewhere_the_window_can_act_on() {
+        fn runner_at(phase: RunnerPhase) -> (Arc<LocalRunner>, PathBuf) {
+            let directory =
+                std::env::temp_dir().join(format!("openflow-runner-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).expect("a temp directory");
+            let events: Arc<dyn EngineEvents> = Arc::new(Recorder::default());
+            let runner = LocalRunner::new(directory.clone(), events, "fast");
+            runner.set_phase(phase, "mid-step");
+            (runner, directory)
+        }
+
+        // Busy plus a failure: the case the window could not recover from.
+        let (runner, directory) = runner_at(RunnerPhase::Installing);
+        let outcome = runner.settle(Err("Could not create /x: read-only".to_string()));
+        let status = runner.status();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(outcome, Err("Could not create /x: read-only".to_string()));
+        assert_eq!(status.phase, RunnerPhase::Failed);
+        assert!(
+            !status.phase.is_busy(),
+            "Install stays disabled and Stop stays enabled while this is busy"
+        );
+        assert_eq!(
+            status.detail, "Could not create /x: read-only",
+            "the reason has to reach the page, not just the busy flag"
+        );
+
+        // A stop the user asked for. `stop()` bumps the generation before it
+        // publishes `Stopped`, so this arrives while the phase is still busy --
+        // and settling it would report the user's own Stop as a failure.
+        let (runner, directory) = runner_at(RunnerPhase::Installing);
+        let outcome = runner.settle(Err(SETUP_STOPPED.to_string()));
+        let phase = runner.status().phase;
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(outcome, Err(SETUP_STOPPED.to_string()));
+        assert_eq!(
+            phase,
+            RunnerPhase::Installing,
+            "a stop reports itself; stop() publishes the resting phase"
+        );
+
+        // A phase that already says something true is not overwritten.
+        let (runner, directory) = runner_at(RunnerPhase::MissingPython);
+        let _ = runner.settle(Err("no python".to_string()));
+        let phase = runner.status().phase;
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(phase, RunnerPhase::MissingPython);
+
+        // And success is never a failure.
+        let (runner, directory) = runner_at(RunnerPhase::Installing);
+        let outcome = runner.settle(Ok(()));
+        let phase = runner.status().phase;
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(phase, RunnerPhase::Installing);
+    }
+
+    /// End to end: whatever `install()` gives up on, it does not give up busy.
+    ///
+    /// `venv_dir()` is `<app_dir>/runner/venv`, so an ordinary *file* at
+    /// `<app_dir>/runner` makes `create_dir_all` for the venv's parent fail. A
+    /// file rather than a permission bit on purpose: mode tricks behave
+    /// differently under root and would stop proving anything in a container.
+    ///
+    /// The assertion is the invariant rather than one phase, because which
+    /// failure this reaches depends on the machine: with no Python 3.10+ it
+    /// stops earlier, at `MissingPython`, which is equally not busy. It
+    /// discriminates wherever a qualifying Python exists -- every CI runner,
+    /// and every machine where pressing Install means anything at all.
+    #[test]
+    fn an_install_that_gives_up_never_leaves_the_runner_busy() {
+        let directory =
+            std::env::temp_dir().join(format!("openflow-runner-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(directory.join("runner"), b"not a directory")
+            .expect("a file where the runner directory would go");
+        let events: Arc<dyn EngineEvents> = Arc::new(Recorder::default());
+        let runner = LocalRunner::new(directory.clone(), events, "fast");
+
+        let outcome = runner.install();
+        let status = runner.status();
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert!(
+            outcome.is_err(),
+            "the venv's parent cannot be created, so this cannot succeed"
+        );
+        assert!(
+            !status.phase.is_busy(),
+            "install() returned an error the window discards, and left the page busy: {:?} ({})",
+            status.phase,
+            status.detail
+        );
     }
 }
