@@ -42,8 +42,8 @@ use crate::overlay;
 use crate::ui::card::{Card, Flipped, GAP, MARGIN, PADDING};
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::{
-    button, combo, label, note, popup, secure_field, switch_control, text_field, text_view, wire,
-    Form, ROW,
+    allow_wrapping, button, combo, label, note, popup, secure_field, switch_control, text_field,
+    text_view, wire, Form, ROW,
 };
 
 /// The height of the swappable transcription panel on the Providers tab.

@@ -82,6 +82,81 @@ pub struct PreviewAgreement {
     pub preview: String,
 }
 
+/// Where a failure can be acted on, in the vocabulary [`EngineEvent::Navigate`]
+/// already speaks.
+///
+/// A remedy is decided by *which call failed*, never by reading the message.
+/// The strings the pipeline produces are written for a person, and a host that
+/// matched on them would break the first time one was reworded; the call site,
+/// on the other hand, knows exactly what it was doing. That is also why this is
+/// a small closed set rather than a page name: a failure whose remedy is not
+/// one of these carries `None`, and an offer to fix something that opens a page
+/// with nothing to change on it is worse than no offer at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remedy {
+    /// The input device, and the permission to use it.
+    Microphone,
+    /// Where takes are transcribed and cleaned up, and the keys for it.
+    Providers,
+    /// The installed plugins and their hooks.
+    Plugins,
+    /// Saving takes, and how long they are kept.
+    History,
+}
+
+impl Remedy {
+    /// The [`EngineEvent::Navigate`] target that opens it.
+    pub fn target(self) -> &'static str {
+        match self {
+            Self::Microphone => "general",
+            Self::Providers => "providers",
+            Self::Plugins => "plugins",
+            Self::History => "privacy",
+        }
+    }
+}
+
+/// Something that went wrong, and where the user can do something about it.
+///
+/// `From<String>` exists so that the many `?`s on the pipeline keep working and
+/// arrive with no remedy: the default is to claim nothing. A remedy is added
+/// deliberately, at a call site that knows what it was asking for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub message: String,
+    pub remedy: Option<Remedy>,
+}
+
+impl Failure {
+    /// A failure with somewhere to go.
+    pub fn at(message: impl Into<String>, remedy: Remedy) -> Self {
+        Self {
+            message: message.into(),
+            remedy: Some(remedy),
+        }
+    }
+
+    /// A failure with nowhere useful to send the user.
+    pub fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            remedy: None,
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::plain(message)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self::plain(message)
+    }
+}
+
 /// Everything the engine tells its host about.
 pub enum EngineEvent {
     RecordingState(RecordingState),
@@ -89,8 +164,8 @@ pub enum EngineEvent {
     /// A reading of the recording in progress. Never the transcript of record:
     /// nothing is saved, formatted or typed on the strength of one.
     TranscriptionPartial(PartialTranscript),
-    TranscriptionWarning(String),
-    TranscriptionError(String),
+    TranscriptionWarning(Failure),
+    TranscriptionError(Failure),
     RecopySuccess(String),
     /// The history table changed, so anything showing recents is stale. Not a
     /// user-facing event; the Tauri host rebuilds the tray menu on it.
@@ -501,9 +576,9 @@ impl Engine {
     /// the auto-repeat of a held key, so it is ignored rather than refused.
     pub fn hotkey_pressed(self: &Arc<Self>) {
         let Ok(mut recording) = self.recording.lock() else {
-            self.emit(EngineEvent::TranscriptionError(
-                "Recording state is unavailable".to_string(),
-            ));
+            self.emit(EngineEvent::TranscriptionError(Failure::plain(
+                "Recording state is unavailable",
+            )));
             return;
         };
         if recording_slot_free(&recording) {
@@ -512,7 +587,10 @@ impl Engine {
             if let Err(e) = self.recorder.start(device) {
                 eprintln!("Recording start failed: {}", e);
                 *recording = None;
-                self.emit(EngineEvent::TranscriptionError(e));
+                self.emit(EngineEvent::TranscriptionError(Failure::at(
+                    e,
+                    Remedy::Microphone,
+                )));
                 return;
             }
             self.emit_state(RecordingState::Recording);
@@ -751,7 +829,10 @@ impl Engine {
             self.emit(EngineEvent::HistoryChanged);
         }
         self.emit_idle_if_quiescent();
-        result
+        // This caller is awaited rather than notified, so it keeps its plain
+        // string: whoever is holding the future is already looking at it, and
+        // has no badge or tooltip to decide the shape of.
+        result.map_err(|failure| failure.message)
     }
 
     /// The hold-to-talk release. Nobody is waiting on a return value, so the
@@ -759,9 +840,9 @@ impl Engine {
     pub fn hotkey_released(self: &Arc<Self>) {
         let wav_bytes = {
             let Ok(mut recording) = self.recording.lock() else {
-                self.emit(EngineEvent::TranscriptionError(
-                    "Recording state is unavailable".to_string(),
-                ));
+                self.emit(EngineEvent::TranscriptionError(Failure::plain(
+                    "Recording state is unavailable",
+                )));
                 return;
             };
             if recording.is_none() {
@@ -773,19 +854,31 @@ impl Engine {
             result
         };
 
+        // These two report *after* settling the state, and so does the
+        // pipeline below. A failure is announced to a host that decides how to
+        // show it from the state it last heard about, and until this point that
+        // state is still `Recording`: the capture has ended -- `ended_capturing`
+        // has run and the slot is free -- but nothing has said so yet. Reporting
+        // first left the badge suppressed as though a capture were still
+        // running, and left the message to be overwritten by the settling that
+        // followed it. Measured on the tray tooltip at 15 ms sampling: the text
+        // of a failed take never appeared at all.
         let wav_bytes = match wav_bytes {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.emit(EngineEvent::TranscriptionError(error));
                 self.emit_idle_if_quiescent();
+                self.emit(EngineEvent::TranscriptionError(Failure::at(
+                    error,
+                    Remedy::Microphone,
+                )));
                 return;
             }
         };
         let (request_id, cancellation) = match self.register_transcription_job() {
             Ok(job) => job,
             Err(error) => {
-                self.emit(EngineEvent::TranscriptionError(error));
                 self.emit_idle_if_quiescent();
+                self.emit(EngineEvent::TranscriptionError(Failure::plain(error)));
                 return;
             }
         };
@@ -794,10 +887,14 @@ impl Engine {
         let engine = Arc::clone(self);
         let take_bytes = wav_bytes.len();
         (self.spawn)(Box::pin(async move {
-            match engine
+            let outcome = engine
                 .run_pipeline(wav_bytes, request_id, cancellation)
-                .await
-            {
+                .await;
+            // Settle first, report second; see the note above the two early
+            // exits. The job is out of the registry by here, so this settles
+            // rather than doing nothing.
+            engine.emit_idle_if_quiescent();
+            match outcome {
                 Ok(transcription) => {
                     let agreement = engine.weigh_preview(&transcription.raw_text, take_bytes);
                     engine.emit(EngineEvent::TranscriptionResult(transcription));
@@ -806,9 +903,8 @@ impl Engine {
                         engine.emit(EngineEvent::PreviewAgreement(agreement));
                     }
                 }
-                Err(e) => engine.emit(EngineEvent::TranscriptionError(e)),
+                Err(failure) => engine.emit(EngineEvent::TranscriptionError(failure)),
             }
-            engine.emit_idle_if_quiescent();
         }));
     }
 
@@ -859,15 +955,15 @@ impl Engine {
         wav_bytes: Vec<u8>,
         request_id: String,
         cancellation: CancellationToken,
-    ) -> Result<Transcription, String> {
+    ) -> Result<Transcription, Failure> {
         let result = self.run_pipeline_inner(cancellation, wav_bytes).await;
         if let Ok(mut active) = self.transcription_jobs.lock() {
             active.remove(&request_id);
         }
         match result {
-            Ok((transcription, paste_warning)) => {
-                if let Some(warning) = paste_warning {
-                    self.emit(EngineEvent::TranscriptionWarning(warning));
+            Ok((transcription, problems)) => {
+                for problem in problems {
+                    self.emit(EngineEvent::TranscriptionWarning(problem));
                 }
                 Ok(transcription)
             }
@@ -879,7 +975,7 @@ impl Engine {
         &self,
         cancellation: CancellationToken,
         wav_bytes: Vec<u8>,
-    ) -> Result<(Transcription, Option<String>), String> {
+    ) -> Result<(Transcription, Vec<Failure>), Failure> {
         self.arm_local_only();
         let duration_ms = wav_duration_ms(&wav_bytes);
 
@@ -903,20 +999,23 @@ impl Engine {
         } else {
             // Empty is valid for a self-hosted endpoint; transcribe_audio
             // rejects it for every hosted provider.
-            self.settings.api_key()?.unwrap_or_default()
+            self.settings
+                .api_key()
+                .map_err(|e| Failure::at(e, Remedy::Providers))?
+                .unwrap_or_default()
         };
 
         // Where this take is transcribed. The local runner is an ordinary
         // OpenAI-compatible endpoint on loopback with no key, so nothing below
         // this line knows the difference.
         let (stt_provider, stt_key, stt_model, provider_str) = tokio::select! {
-            _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
-            resolved = self.stt_endpoint(&remote_provider, &remote_key, &remote_provider_name) => resolved?,
+            _ = cancellation.cancelled() => return Err(Failure::plain("Transcription cancelled")),
+            resolved = self.stt_endpoint(&remote_provider, &remote_key, &remote_provider_name) => resolved.map_err(|e| Failure::at(e, Remedy::Providers))?,
         };
 
         let raw_text = tokio::select! {
-            _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
-            result = transcribe::transcribe_audio(wav_bytes, &stt_key, language.as_deref(), &stt_provider, stt_model.as_deref(), dictionary.as_deref()) => result?,
+            _ = cancellation.cancelled() => return Err(Failure::plain("Transcription cancelled")),
+            result = transcribe::transcribe_audio(wav_bytes, &stt_key, language.as_deref(), &stt_provider, stt_model.as_deref(), dictionary.as_deref()) => result.map_err(|e| Failure::at(e, Remedy::Providers))?,
         };
         // The dictionary as a deterministic replacement, once, before anything
         // else reads the text. The local runner needs it because Qwen ignores
@@ -936,9 +1035,10 @@ impl Engine {
                     provider: Some(provider_str.clone()),
                     language: language.clone(),
                 },
-            )?
+            )
+            .map_err(|e| Failure::at(e, Remedy::Plugins))?
             .raw_text
-            .ok_or("Plugin removed the transcription text")?;
+            .ok_or_else(|| Failure::at("Plugin removed the transcription text", Remedy::Plugins))?;
 
         let mut formatted = if format_enabled {
             let (fmt_provider, fmt_key) = if same_provider {
@@ -953,7 +1053,8 @@ impl Engine {
                 // different server, hosted or on the LAN, never receives it.
                 let fk = self
                     .settings
-                    .formatting_api_key()?
+                    .formatting_api_key()
+                    .map_err(|e| Failure::at(e, Remedy::Providers))?
                     .filter(|key| !key.trim().is_empty())
                     .or_else(|| {
                         speech::same_endpoint(&fmt_provider, &remote_provider)
@@ -963,8 +1064,8 @@ impl Engine {
                 (fmt_provider, fk)
             };
             tokio::select! {
-                _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
-                result = transcribe::format_text(&raw_text, &fmt_key, None, &fmt_provider, chat_model.as_deref()) => result?,
+                _ = cancellation.cancelled() => return Err(Failure::plain("Transcription cancelled")),
+                result = transcribe::format_text(&raw_text, &fmt_key, None, &fmt_provider, chat_model.as_deref()) => result.map_err(|e| Failure::at(e, Remedy::Providers))?,
             }
         } else {
             raw_text.clone()
@@ -979,9 +1080,10 @@ impl Engine {
                     provider: Some(provider_str.clone()),
                     language: language.clone(),
                 },
-            )?
+            )
+            .map_err(|e| Failure::at(e, Remedy::Plugins))?
             .formatted_text
-            .ok_or("Plugin removed the formatted text")?;
+            .ok_or_else(|| Failure::at("Plugin removed the formatted text", Remedy::Plugins))?;
 
         let transcription = Transcription {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1011,16 +1113,37 @@ impl Engine {
         &self,
         cancellation: &CancellationToken,
         transcription: Transcription,
-    ) -> Result<(Transcription, Option<String>), String> {
+    ) -> Result<(Transcription, Vec<Failure>), Failure> {
         if cancellation.is_cancelled() {
-            return Err("Transcription cancelled".to_string());
+            return Err(Failure::plain("Transcription cancelled"));
         }
+        let mut problems = Vec::new();
 
         // Saving is opt-out, and an optional retention window trims old rows as we go.
+        //
+        // A write that fails is reported and stepped over, not raised. By this
+        // line the user has spoken, waited, and had the audio uploaded; the
+        // text exists and this is the last chance to hand it over. Raising here
+        // returned it to nobody -- not the clipboard, not the editor, not even
+        // the re-copy slot, which still held the *previous* take -- and handed
+        // the user a sentence about SQLite instead of the one they had just
+        // said. The two conditions that reach it are ordinary: a database file
+        // the user can read but not write ("attempt to write a readonly
+        // database"), and the other build of the app holding the write lock
+        // past the five-second busy timeout ("database is locked", measured at
+        // 5.29 s). It is also what the line below has always done with a paste
+        // it could not complete.
         if self.settings.save_history() {
-            self.settings.db().save_transcription(&transcription)?;
-            if let Some(days) = self.settings.history_retention_days() {
-                let _ = self.settings.db().prune_older_than(days);
+            match self.settings.db().save_transcription(&transcription) {
+                Ok(()) => {
+                    if let Some(days) = self.settings.history_retention_days() {
+                        let _ = self.settings.db().prune_older_than(days);
+                    }
+                }
+                Err(problem) => problems.push(Failure::at(
+                    format!("This take was not saved to history. {}", problem),
+                    Remedy::History,
+                )),
             }
         }
         let text = transcription
@@ -1032,18 +1155,21 @@ impl Engine {
             let mut last = self
                 .last_transcription
                 .lock()
-                .map_err(|_| "Clipboard history is unavailable".to_string())?;
+                .map_err(|_| Failure::plain("Clipboard history is unavailable"))?;
             *last = Some(text.clone());
         }
 
-        let paste_warning = paste_to_clipboard(
+        if let Some(problem) = paste_to_clipboard(
             &text,
             self.settings.insert_method(),
             self.settings.clipboard_policy(),
         )
-        .err();
+        .err()
+        {
+            problems.push(Failure::plain(problem));
+        }
 
-        Ok((transcription, paste_warning))
+        Ok((transcription, problems))
     }
 
     // ── Insertion ─────────────────────────────────────────
@@ -1109,7 +1235,7 @@ impl Engine {
         };
         match problem.clone() {
             None => self.emit(EngineEvent::RecopySuccess("Copied!".to_string())),
-            Some(problem) => self.emit(EngineEvent::TranscriptionWarning(problem)),
+            Some(problem) => self.emit(EngineEvent::TranscriptionWarning(Failure::plain(problem))),
         }
         problem
     }
@@ -1231,7 +1357,9 @@ mod tests {
         fn emit(&self, event: EngineEvent) -> Result<(), String> {
             let line = match event {
                 EngineEvent::RecopySuccess(message) => format!("success: {}", message),
-                EngineEvent::TranscriptionWarning(message) => format!("warning: {}", message),
+                EngineEvent::TranscriptionWarning(problem) => {
+                    format!("warning: {}", problem.message)
+                }
                 _ => return Ok(()),
             };
             self.0.lock().expect("the event log").push(line);
@@ -1463,7 +1591,10 @@ mod tests {
             stored_take("cancelled", "", "2026-01-01T00:00:00Z"),
         );
 
-        assert_eq!(outcome.err().as_deref(), Some("Transcription cancelled"));
+        assert_eq!(
+            outcome.err().map(|failure| failure.message).as_deref(),
+            Some("Transcription cancelled")
+        );
         assert!(
             engine.history(10).expect("history").is_empty(),
             "a cancelled take must not be on disk"
@@ -1477,6 +1608,169 @@ mod tests {
             None,
             "a cancelled take must not be one keystroke away either"
         );
+    }
+
+    /// A take reaches the end of the pipeline having been spoken, waited for
+    /// and uploaded. Writing it to history is the first of the two irreversible
+    /// steps, and the one that can fail on an ordinary machine: a database file
+    /// the user can read but not write answers "attempt to write a readonly
+    /// database", and the other build of the app holding the write lock answers
+    /// "database is locked" after the five-second busy timeout.
+    ///
+    /// Raising there returned the text to nobody. Not the clipboard, not the
+    /// editor, and not the re-copy slot -- which went on holding the *previous*
+    /// take, so the re-copy hotkey handed back the wrong words. What the user
+    /// got instead was a sentence about SQLite.
+    ///
+    /// The take carries no text for the same reason the cancellation test does:
+    /// if this regresses into an insertion, there is nothing to type into
+    /// whatever window happens to be focused while the suite runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_take_that_cannot_be_written_down_is_still_handed_over() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openflow-readonly-{}", uuid::Uuid::new_v4()));
+        {
+            let db = Database::new(dir.clone()).expect("a scratch database");
+            db.set_setting("insert_method", "type")
+                .expect("an insertion with nothing to insert");
+        }
+        let path = dir.join("openflow.db");
+        let mut perms = std::fs::metadata(&path)
+            .expect("the database file")
+            .permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&path, perms).expect("make it read-only");
+
+        // The bit means nothing to root, and a suite running as root would
+        // otherwise assert the opposite of what it set up.
+        let refuses_writes = Database::new(dir.clone())
+            .expect("a read-only database still opens")
+            .save_transcription(&stored_take("probe", "", "2026-01-01T00:00:00Z"))
+            .is_err();
+        if !refuses_writes {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let engine = Engine::new(
+            dir.clone(),
+            Arc::new(Recorder(Arc::clone(&events))),
+            Box::new(|_| {}),
+        )
+        .expect("an engine over a read-only database still starts");
+
+        let (_, problems) = engine
+            .finish_take(
+                &CancellationToken::new(),
+                stored_take("kept", "", "2026-01-01T00:00:00Z"),
+            )
+            .expect("a history write that failed must not take the take with it");
+
+        // One warning for the write, named as such. Not an equality against the
+        // whole list: the insertion below it is the other thing that reports
+        // rather than raises, and on a platform with no way to insert -- a
+        // headless Linux CI runner, where `type_text` falls through to
+        // `xdotool` and finds none -- it correctly adds a second, unremedied
+        // one. That is the behaviour under test working twice over.
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|problem| problem.remedy == Some(Remedy::History))
+                .count(),
+            1,
+            "the user is told, and told where the setting for it lives: {:?}",
+            problems
+        );
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            Some(""),
+            "the take still reaches the slot the re-copy hotkey reads"
+        );
+        assert!(
+            engine.history(10).expect("history").is_empty(),
+            "and it really was not written down"
+        );
+
+        let mut perms = std::fs::metadata(&path)
+            .expect("the database file")
+            .permissions();
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(&path, perms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remedy is decided by which call failed, never by reading the message.
+    /// This drives the real pipeline and asserts on what comes out the far end,
+    /// so the mapping is proved where it is applied rather than restated.
+    ///
+    /// Nothing here touches the network, and that is deliberate rather than
+    /// convenient. `transcribe` keeps one `reqwest::Client` for the life of the
+    /// process, while every test that needs `async` builds a runtime of its own
+    /// and drops it: the pool and its timers belong to whichever runtime used
+    /// the client first, so a later test can wait on a connection that nothing
+    /// is left to drive. An earlier version of this test served a 503 from a
+    /// loopback stand-in, passed here, and hung for the full thirty minutes of
+    /// the CI job's timeout on Linux -- a different core count is a different
+    /// test order.
+    ///
+    /// Local only refuses a hosted provider before a request is built, which
+    /// leaves a provider failure that cannot reach a socket. Which of the two
+    /// refusals arrives depends on the machine: with no Groq key in the
+    /// keychain it is "No API key set. Add one in Settings." from
+    /// `ensure_api_key`, and with one it is the Local only guard one line
+    /// later. `SecretStore` is keyed by service name rather than by app
+    /// directory, so a scratch `Settings` reads the real keychain and a
+    /// developer with a key takes the second path. Both are raised inside the
+    /// same `transcribe_audio` call, so the same remedy is under test either
+    /// way -- which is why the assertion is on the remedy and not the message.
+    #[test]
+    fn a_failure_on_the_provider_path_points_at_the_provider_settings() {
+        // Everything that writes the process-wide flag takes turns; see the
+        // note on the mutex itself.
+        let _guard = crate::transcribe::tests::LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let engine = scratch_engine();
+        let db = engine.settings().db();
+        db.set_setting("provider", "groq")
+            .expect("a hosted provider");
+        db.set_setting("local_only", "true")
+            .expect("no take leaves");
+        // Isolate the transcription call: with cleanup on, a second provider
+        // call would be the one under test.
+        db.set_setting("format_enabled", "false")
+            .expect("no cleanup");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let failure = match runtime.block_on(engine.run_pipeline(
+            b"RIFF....WAVEfmt ".to_vec(),
+            "test".to_string(),
+            CancellationToken::new(),
+        )) {
+            Err(failure) => failure,
+            Ok(_) => panic!("Local only refuses a hosted provider, so this cannot succeed"),
+        };
+
+        assert_eq!(
+            failure.remedy,
+            Some(Remedy::Providers),
+            "a take the provider never took sends the user to the providers: {}",
+            failure.message
+        );
+        assert_eq!(Remedy::Providers.target(), "providers");
+
+        crate::transcribe::set_local_only(false);
     }
 
     #[test]
