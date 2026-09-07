@@ -28,6 +28,23 @@ jobs:
       - run: npm run check
       - run: npm run audit:dependencies
 
+  macos-tests:
+    name: macOS tests
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      # `rust` runs the same command on Linux, where `openflow-native` is
+      # `cfg(target_os = "macos")` down to an empty main -- so its tests have
+      # never run anywhere but a contributor's own Mac. This is the job that
+      # runs them. It is not a duplicate of `rust`: on this runner the same
+      # command has 77 more tests to find.
+      - run: cargo test --workspace
+
   rust:
     name: Rust quality checks
     runs-on: ubuntu-22.04
