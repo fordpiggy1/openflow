@@ -623,13 +623,29 @@ sleep 60\n";
             .parse()
             .expect("a pid");
         let alive = |pid: i32| pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
-        // Reap and clean up before asserting, so a failure does not also leave
-        // the process this test is complaining about running.
+        let heartbeat = plugin_dir.join("heartbeat");
+        let beat = std::fs::read_to_string(&heartbeat).ok();
+
+        // Whether it is still *working* is the question, and it is asked with
+        // the heartbeat rather than with the pid, because a pid answers
+        // `kill(pid, 0)` for as long as it is a zombie. The helper's parent is
+        // the plugin, which this just killed, so between the signal and the
+        // reparenting there is a window where the pid is still there and the
+        // process is not. That window made the first version of this test fail
+        // on the Linux runner and pass here, which is the worst kind of test.
+        // A zombie writes no files.
+        std::thread::sleep(Duration::from_millis(700));
+        let beat_again = std::fs::read_to_string(&heartbeat).ok();
+
+        // And then the pid, polled rather than sampled, for the same reason.
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while alive(helper) && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let still_running = alive(helper);
         if still_running {
             unsafe { libc::kill(helper, libc::SIGKILL) };
         }
-        let beat = plugin_dir.join("heartbeat").exists();
         let read = |name: &str| {
             std::fs::read_to_string(plugin_dir.join(name))
                 .unwrap_or_default()
@@ -645,9 +661,14 @@ sleep 60\n";
              what the timeout kills: {outcome:?}"
         );
         assert!(
-            beat,
+            beat.is_some(),
             "the helper never ran, so \"the helper is dead\" would pass on a \
              fixture that started nothing"
+        );
+        assert_eq!(
+            beat, beat_again,
+            "the hook reported a timeout and the process the plugin started \
+             carried on working through it"
         );
         assert!(
             !still_running,
