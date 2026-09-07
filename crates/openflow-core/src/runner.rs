@@ -84,6 +84,12 @@ const BACKOFF: [Duration; MAX_RESTARTS] = [
 /// Lines of the sidecar's stderr kept for diagnosing a failure.
 const LOG_LINES: usize = 40;
 
+/// What an install or download reports when the user stopped it.
+///
+/// Not routed through [`RunnerPhase::Failed`]: a stop is the outcome the user
+/// asked for, and `stop` has already written the line they read.
+const SETUP_STOPPED: &str = "Setup was stopped.";
+
 // ── Models ────────────────────────────────────────────────
 
 /// One offered model, with the cost the Settings screen shows next to it. The
@@ -270,6 +276,21 @@ struct Inner {
     /// The repo whose weights have been proven present, for the same reason.
     /// Cleared by `download` and by a model change in `configure`.
     model_verified: Option<String>,
+    /// The pid of the install or download child that is running right now.
+    ///
+    /// Separate from `pid` because these are not the sidecar: `python -m venv`
+    /// and a 600 MB `pip install` are spawned by `run_with_progress`, which
+    /// owns the `Child` while it blocks reading its output. Same reason as the
+    /// sidecar, then, for holding only the pid and stopping it by signal. Held
+    /// here because `stop` is on a different thread from the install and had
+    /// nothing to signal without it: pressing Stop during a download left pip
+    /// running to completion.
+    setup_pid: Option<u32>,
+    /// Bumped on every stop, so a setup step knows the user asked for it to
+    /// end. One install is several children in a row, and this is what makes a
+    /// stop stick across the rest of them rather than killing one and letting
+    /// the next start.
+    setup_generation: u64,
 }
 
 pub struct LocalRunner {
@@ -308,6 +329,8 @@ impl LocalRunner {
                 starting: false,
                 installed_verified: false,
                 model_verified: None,
+                setup_pid: None,
+                setup_generation: 0,
             }),
         })
     }
@@ -464,6 +487,31 @@ impl LocalRunner {
         });
     }
 
+    /// A setup step that gives up must not leave the runner busy.
+    ///
+    /// `is_busy()` covers `Installing` and `Downloading`, and `ui/settings.rs`
+    /// reads it to decide that Install is disabled and Stop is enabled. Several
+    /// of the `?`s in the steps below return before anything has set a resting
+    /// phase -- a directory that cannot be created, a child that will not spawn
+    /// at all -- and `run_runner_step` in the window discards the error, so the
+    /// page stayed busy for the rest of the session with nothing saying why.
+    ///
+    /// Only a phase that is still busy is touched. The ones that already mean
+    /// something -- `Failed` from a non-zero exit, `MissingPython`, `Stopped`
+    /// -- are left as they are, and so is a stop the user asked for:
+    /// `stop()` bumps the generation before it publishes `Stopped`, so a step
+    /// refusing on the generation can arrive here while the phase is still
+    /// `Installing`, and settling it would turn the user's own Stop into a
+    /// failure.
+    fn settle(&self, outcome: Result<(), String>) -> Result<(), String> {
+        if let Err(message) = &outcome {
+            if message != SETUP_STOPPED && self.status().phase.is_busy() {
+                self.set_phase(RunnerPhase::Failed, message);
+            }
+        }
+        outcome
+    }
+
     fn note(&self, line: &str) {
         let mut inner = self.lock();
         if inner.log.len() == LOG_LINES {
@@ -554,6 +602,18 @@ impl LocalRunner {
     /// without downloading anything, so pressing Install twice is free and a
     /// half-built venv is repaired by pressing it again.
     pub fn install(&self) -> Result<(), String> {
+        self.settle(self.install_steps())
+    }
+
+    /// Build the virtualenv and install the packages.
+    ///
+    /// Reached only through [`Self::install`], which is what lands the phase
+    /// when one of these steps gives up.
+    fn install_steps(&self) -> Result<(), String> {
+        // Captured once, before the first child, and checked by every one of
+        // them: a stop that lands between the venv and the pip install has to
+        // stop the install, not just the child that happened to be running.
+        let generation = self.setup_generation();
         // Re-prove it: the point of pressing Install on a broken venv is that
         // the cached answer is the thing being doubted.
         self.lock().installed_verified = false;
@@ -581,6 +641,7 @@ impl LocalRunner {
             self.run_with_progress(
                 Command::new(&python).arg("-m").arg("venv").arg(&venv),
                 RunnerPhase::Installing,
+                generation,
             )?;
         }
         self.set_phase(
@@ -596,6 +657,7 @@ impl LocalRunner {
                 .arg(format!("mlx-audio=={MLX_AUDIO_VERSION}"))
                 .arg("huggingface_hub"),
             RunnerPhase::Installing,
+            generation,
         )?;
         if !self.installed_now() {
             let message = "The Python environment installed but mlx-audio will not import. Remove the runner folder in the app's data directory and try again.".to_string();
@@ -632,6 +694,15 @@ impl LocalRunner {
 
     /// Fetch the weights for the configured model. Blocking.
     pub fn download(&self) -> Result<(), String> {
+        self.settle(self.download_steps())
+    }
+
+    /// Fetch the model weights.
+    ///
+    /// Reached only through [`Self::download`], which is what lands the phase
+    /// when one of these steps gives up.
+    fn download_steps(&self) -> Result<(), String> {
+        let generation = self.setup_generation();
         if !self.installed_now() {
             return Err(
                 "Install the Python environment first, then download the model.".to_string(),
@@ -651,20 +722,53 @@ impl LocalRunner {
                 &repo,
             ]),
             RunnerPhase::Downloading,
+            generation,
         )?;
         self.lock().model_verified = Some(repo.clone());
         self.set_phase(RunnerPhase::Stopped, &format!("{repo} is downloaded."));
         Ok(())
     }
 
+    /// The stop counter the setup children are measured against.
+    fn setup_generation(&self) -> u64 {
+        self.lock().setup_generation
+    }
+
     /// Run a child to completion, publishing its output as progress.
-    fn run_with_progress(&self, command: &mut Command, phase: RunnerPhase) -> Result<(), String> {
-        let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("PYTHONUNBUFFERED", "1")
-            .spawn()
-            .map_err(|error| format!("Could not start Python: {}", error))?;
+    ///
+    /// `generation` is the value [`LocalRunner::setup_generation`] had when the
+    /// step began. A stop bumps it, and this refuses to spawn once it is stale
+    /// -- which is how a Stop pressed between two children of one install stops
+    /// the install rather than only the child that was running.
+    fn run_with_progress(
+        &self,
+        command: &mut Command,
+        phase: RunnerPhase,
+        generation: u64,
+    ) -> Result<(), String> {
+        // The spawn and the pid are recorded under one lock, and the generation
+        // is re-checked inside it, for the same reason `launch` does it: `stop`
+        // takes the same lock, so it either runs entirely before this (and the
+        // check refuses to spawn) or entirely after (and it sees the pid).
+        // Outside the lock there is a window in which `stop` finds no pid to
+        // kill because there is not one yet, and pip goes on downloading
+        // 600 MB after the user pressed Stop.
+        let mut child = {
+            let mut inner = self.lock();
+            if inner.setup_generation != generation {
+                return Err(SETUP_STOPPED.to_string());
+            }
+            let child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env("PYTHONUNBUFFERED", "1")
+                .spawn()
+                // No `set_phase` here: the lock is held, and taking it twice is
+                // a deadlock. The caller reports the failure.
+                .map_err(|error| format!("Could not start Python: {}", error))?;
+            inner.setup_pid = Some(child.id());
+            child
+        };
 
         // stderr on its own thread: pip and the hub both write progress there,
         // and reading one pipe to the end while the other fills its buffer is
@@ -688,20 +792,39 @@ impl LocalRunner {
                     continue;
                 }
                 self.note(&line);
+                // Keep draining the pipe, but stop publishing: a straggler line
+                // that arrives after a stop would otherwise write "Installing
+                // mlx-audio..." over the "Stopped." the user just asked for.
+                if self.setup_generation() != generation {
+                    continue;
+                }
                 self.update(|status| {
                     status.phase = phase;
                     status.detail = progress_line(&line);
                 });
             }
         }
-        let status = child
-            .wait()
-            .map_err(|error| format!("Python did not finish: {}", error))?;
+        let wait = child.wait();
+        let stopped = {
+            let mut inner = self.lock();
+            // Only if it is still ours: a stop took it before signalling it.
+            if inner.setup_pid == Some(child.id()) {
+                inner.setup_pid = None;
+            }
+            inner.setup_generation != generation
+        };
+        let status = wait.map_err(|error| format!("Python did not finish: {}", error))?;
         let errors = errors
             .and_then(|handle| handle.join().ok())
             .unwrap_or_default();
         for line in &errors {
             self.note(line);
+        }
+        // Before the exit status, because a stopped child exits on a signal and
+        // "Setting up on-device transcription failed: exit code None" is not
+        // what pressing Stop means.
+        if stopped {
+            return Err(SETUP_STOPPED.to_string());
         }
         if status.success() {
             return Ok(());
@@ -1209,17 +1332,30 @@ impl LocalRunner {
         }
     }
 
-    /// Stop the sidecar and do not restart it. Safe to call when nothing is
-    /// running, and safe to call twice.
+    /// Stop the sidecar, and any install or download in flight, and do not
+    /// restart anything. Safe to call when nothing is running, and safe to call
+    /// twice.
+    ///
+    /// The setup children are killed too because the Stop button is live during
+    /// an install (`local_stop` is enabled whenever the phase is busy), and a
+    /// Stop that left a 600 MB `pip install` running would also re-enable
+    /// Install -- a second pip in the same half-built venv.
     pub fn stop(&self) {
-        let pid = {
+        let (pid, setup) = {
             let mut inner = self.lock();
             inner.generation += 1;
+            // Bumped under the same lock the spawn takes, so a setup step is
+            // either already spawned (and its pid is here) or has not spawned
+            // yet (and will refuse to, seeing a generation it does not own).
+            inner.setup_generation += 1;
             inner.restarts.clear();
             // Nothing is in flight after a stop, whoever claimed it.
             inner.starting = false;
-            inner.pid.take()
+            (inner.pid.take(), inner.setup_pid.take())
         };
+        if let Some(pid) = setup {
+            terminate(pid);
+        }
         if let Some(pid) = pid {
             terminate(pid);
         }
@@ -1235,18 +1371,25 @@ impl LocalRunner {
 }
 
 impl Drop for LocalRunner {
-    /// A sidecar holding 2.5 GB of weights must not outlive the app. The child
-    /// also watches for its parent disappearing, which covers the app being
-    /// SIGKILLed, but this is the ordinary path.
+    /// A sidecar holding 2.5 GB of weights must not outlive the app, and
+    /// neither must an install. The sidecar also watches for its parent
+    /// disappearing, which covers the app being SIGKILLed, but this is the
+    /// ordinary path.
     fn drop(&mut self) {
-        let pid = {
+        let (pid, setup) = {
             let mut inner = self
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             inner.generation += 1;
-            inner.pid.take()
+            inner.setup_generation += 1;
+            (inner.pid.take(), inner.setup_pid.take())
         };
+        // A pip download is the same kind of orphan as a loaded sidecar: it
+        // holds the venv the next launch will try to build into.
+        if let Some(pid) = setup {
+            terminate(pid);
+        }
         if let Some(pid) = pid {
             terminate(pid);
         }
@@ -2056,6 +2199,119 @@ server.serve_forever()
         assert!(LocalRunner::missing_python_message().contains("3.10"));
     }
 
+    /// Stop during an install kills the install.
+    ///
+    /// The install's children -- `python -m venv`, then a 600 MB `pip install`
+    /// -- are spawned by `run_with_progress`, never by `launch`, so they were
+    /// never in `inner.pid` and `stop` had nothing to signal. Measured before
+    /// the fix with this same stand-in: the child was still on the process
+    /// table ten seconds after `stop` returned, while the window said
+    /// "Stopped." and the Install button was live again.
+    ///
+    /// A shell that publishes its own pid and then becomes a long sleep stands
+    /// in for pip. What is being measured is whether the process this
+    /// supervisor started is still there, not what it was doing, and the pid
+    /// comes from the child rather than from the supervisor because before the
+    /// fix the supervisor did not know it -- which was the bug.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_setup_step_kills_the_child_it_started() {
+        let directory =
+            std::env::temp_dir().join(format!("openflow-runner-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        let pid_file = directory.join("child.pid");
+        let recorder = Arc::new(Recorder::default());
+        let events: Arc<dyn EngineEvents> = recorder.clone();
+        let runner = LocalRunner::new(directory.clone(), events, "fast");
+        let generation = runner.setup_generation();
+
+        // `exec` so the pid published is the pid of the process that lives.
+        let script = format!("echo $$ > '{}'; exec sleep 600", pid_file.display());
+        let worker = {
+            let runner = Arc::clone(&runner);
+            std::thread::spawn(move || {
+                runner.run_with_progress(
+                    Command::new("/bin/sh").arg("-c").arg(&script),
+                    RunnerPhase::Installing,
+                    generation,
+                )
+            })
+        };
+        assert!(
+            wait_for(Duration::from_secs(20), || published_pid(&pid_file)
+                .is_some()),
+            "the stand-in setup child never published its pid"
+        );
+        let pid = published_pid(&pid_file).expect("the stand-in's pid");
+
+        runner.stop();
+        let gone = wait_for(Duration::from_secs(10), || !alive(pid));
+        if !gone {
+            // Do not leave the orphan behind for the rest of the suite.
+            // SAFETY: a pid this test's own supervisor spawned.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let outcome = worker.join().expect("the setup thread");
+        let phase = runner.status().phase;
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert!(gone, "stop() left the setup child {pid} running");
+        assert_eq!(
+            outcome,
+            Err(SETUP_STOPPED.to_string()),
+            "a stopped step reports the stop, not a Python failure"
+        );
+        assert_eq!(
+            phase,
+            RunnerPhase::Stopped,
+            "a stop the user asked for must not land in the status as a failure"
+        );
+    }
+
+    /// The pid the stand-in wrote, once the write has finished.
+    #[cfg(unix)]
+    fn published_pid(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// And the stop sticks for the rest of the install.
+    ///
+    /// One install is `python -m venv` and then `pip install`. Killing the
+    /// first child is only half of it: without this check the second one would
+    /// spawn a moment later and download 600 MB into a venv the user has
+    /// already stopped.
+    ///
+    /// The stand-in exits by itself rather than sleeping, deliberately: a
+    /// regression here has to fail this test, not hang it. It leaves a file
+    /// behind, so "did it run" is answered by the filesystem afterwards
+    /// instead of by catching it while it lives.
+    #[cfg(unix)]
+    #[test]
+    fn a_setup_step_that_starts_after_a_stop_never_spawns() {
+        let directory =
+            std::env::temp_dir().join(format!("openflow-runner-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        let evidence = directory.join("the-child-ran");
+        let recorder = Arc::new(Recorder::default());
+        let events: Arc<dyn EngineEvents> = recorder.clone();
+        let runner = LocalRunner::new(directory.clone(), events, "fast");
+
+        // The generation an install captures before its first child.
+        let generation = runner.setup_generation();
+        runner.stop();
+        let script = format!("> '{}'", evidence.display());
+        let outcome = runner.run_with_progress(
+            Command::new("/bin/sh").arg("-c").arg(&script),
+            RunnerPhase::Installing,
+            generation,
+        );
+        let ran = evidence.exists();
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert!(!ran, "the step spawned a child after the stop");
+        assert_eq!(outcome, Err(SETUP_STOPPED.to_string()));
+    }
+
     /// The script has to be findable from a test binary, or the E2E path below
     /// cannot run and neither can a `cargo run` build.
     #[test]
@@ -2156,5 +2412,104 @@ server.serve_forever()
             runner.status().resident_bytes
         );
         runner.stop();
+    }
+
+    /// `settle` is the boundary that keeps a failed setup step from leaving the
+    /// window with no way forward, and it has to be narrow: three of these four
+    /// cases are ones it must not touch.
+    #[test]
+    fn a_step_that_gives_up_while_busy_lands_somewhere_the_window_can_act_on() {
+        fn runner_at(phase: RunnerPhase) -> (Arc<LocalRunner>, PathBuf) {
+            let directory =
+                std::env::temp_dir().join(format!("openflow-runner-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).expect("a temp directory");
+            let events: Arc<dyn EngineEvents> = Arc::new(Recorder::default());
+            let runner = LocalRunner::new(directory.clone(), events, "fast");
+            runner.set_phase(phase, "mid-step");
+            (runner, directory)
+        }
+
+        // Busy plus a failure: the case the window could not recover from.
+        let (runner, directory) = runner_at(RunnerPhase::Installing);
+        let outcome = runner.settle(Err("Could not create /x: read-only".to_string()));
+        let status = runner.status();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(outcome, Err("Could not create /x: read-only".to_string()));
+        assert_eq!(status.phase, RunnerPhase::Failed);
+        assert!(
+            !status.phase.is_busy(),
+            "Install stays disabled and Stop stays enabled while this is busy"
+        );
+        assert_eq!(
+            status.detail, "Could not create /x: read-only",
+            "the reason has to reach the page, not just the busy flag"
+        );
+
+        // A stop the user asked for. `stop()` bumps the generation before it
+        // publishes `Stopped`, so this arrives while the phase is still busy --
+        // and settling it would report the user's own Stop as a failure.
+        let (runner, directory) = runner_at(RunnerPhase::Installing);
+        let outcome = runner.settle(Err(SETUP_STOPPED.to_string()));
+        let phase = runner.status().phase;
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(outcome, Err(SETUP_STOPPED.to_string()));
+        assert_eq!(
+            phase,
+            RunnerPhase::Installing,
+            "a stop reports itself; stop() publishes the resting phase"
+        );
+
+        // A phase that already says something true is not overwritten.
+        let (runner, directory) = runner_at(RunnerPhase::MissingPython);
+        let _ = runner.settle(Err("no python".to_string()));
+        let phase = runner.status().phase;
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(phase, RunnerPhase::MissingPython);
+
+        // And success is never a failure.
+        let (runner, directory) = runner_at(RunnerPhase::Installing);
+        let outcome = runner.settle(Ok(()));
+        let phase = runner.status().phase;
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(phase, RunnerPhase::Installing);
+    }
+
+    /// End to end: whatever `install()` gives up on, it does not give up busy.
+    ///
+    /// `venv_dir()` is `<app_dir>/runner/venv`, so an ordinary *file* at
+    /// `<app_dir>/runner` makes `create_dir_all` for the venv's parent fail. A
+    /// file rather than a permission bit on purpose: mode tricks behave
+    /// differently under root and would stop proving anything in a container.
+    ///
+    /// The assertion is the invariant rather than one phase, because which
+    /// failure this reaches depends on the machine: with no Python 3.10+ it
+    /// stops earlier, at `MissingPython`, which is equally not busy. It
+    /// discriminates wherever a qualifying Python exists -- every CI runner,
+    /// and every machine where pressing Install means anything at all.
+    #[test]
+    fn an_install_that_gives_up_never_leaves_the_runner_busy() {
+        let directory =
+            std::env::temp_dir().join(format!("openflow-runner-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(directory.join("runner"), b"not a directory")
+            .expect("a file where the runner directory would go");
+        let events: Arc<dyn EngineEvents> = Arc::new(Recorder::default());
+        let runner = LocalRunner::new(directory.clone(), events, "fast");
+
+        let outcome = runner.install();
+        let status = runner.status();
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert!(
+            outcome.is_err(),
+            "the venv's parent cannot be created, so this cannot succeed"
+        );
+        assert!(
+            !status.phase.is_busy(),
+            "install() returned an error the window discards, and left the page busy: {:?} ({})",
+            status.phase,
+            status.detail
+        );
     }
 }
