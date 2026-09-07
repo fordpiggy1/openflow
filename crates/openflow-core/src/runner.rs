@@ -14,11 +14,14 @@
 //! - **Interpreter discovery.** Homebrew and python.org locations plus whatever
 //!   `python3` resolves to, filtered to 3.10 or newer. Never bundled, and when
 //!   none is found the state says exactly what to install.
-//! - **Install** (`python -m venv` + `pip install mlx-audio`), about 600 MB, on
-//!   demand, with the installer's own output as progress.
+//! - **Install** (`python -m venv` + `pip install mlx-audio huggingface_hub`),
+//!   about 600 MB, on demand, with the installer's own output as progress. Both
+//!   requirements are exactly pinned; see [`pip_requirements`].
 //! - **Download** (`huggingface_hub.snapshot_download` inside the venv, default
 //!   cache), on demand, with progress. Weights already in the standard cache are
-//!   found rather than fetched again.
+//!   found rather than fetched again. The revision each model was measured at is
+//!   recorded in [`LocalModel::revision`] and reported after a download, but it
+//!   is not yet what the sidecar loads; see the note on that field.
 //! - **Spawn** on a free loopback port, readiness by polling `/health`, restart
 //!   on crash with backoff, `failed` after three restarts inside a minute, and a
 //!   kill on drop and on quit.
@@ -52,6 +55,34 @@ use std::time::{Duration, Instant};
 /// measured on. Pinned: a transcription backend that changes under the user
 /// between launches is not one they can trust.
 pub const MLX_AUDIO_VERSION: &str = "0.5.1";
+
+/// The `huggingface_hub` release the venv is built with.
+///
+/// Pinned for the same reason as [`MLX_AUDIO_VERSION`], and it is this module's
+/// dependency rather than a transitive one: `is_model_present` and the download
+/// step both call `snapshot_download` directly, and `is_installed` imports the
+/// package by name to decide whether the venv is usable at all.
+///
+/// Exactly, not a range. `mlx-audio` 0.5.1 asks for `huggingface_hub>=1.0` --
+/// a floor with no ceiling -- so an exact pin at any 1.x cannot contradict it,
+/// and nothing else in the tree pins the hub either. A `~=` would leave the one
+/// thing the pin exists to stop, a release landing under a user between two
+/// installs of the same build of this app, still able to happen. The cost is
+/// that this number is now a thing a human has to move, which is the same cost
+/// [`MLX_AUDIO_VERSION`] already carries.
+pub const HUGGINGFACE_HUB_VERSION: &str = "1.30.0";
+
+/// What `pip install` is given, in order.
+///
+/// A function rather than a `const` because both entries are formatted, and one
+/// list rather than two `.arg` calls because the property that matters -- no
+/// bare requirement, ever -- is one a test can only state about a whole list.
+pub fn pip_requirements() -> [String; 2] {
+    [
+        format!("mlx-audio=={MLX_AUDIO_VERSION}"),
+        format!("huggingface_hub=={HUGGINGFACE_HUB_VERSION}"),
+    ]
+}
 
 /// The oldest Python `mlx-audio` supports.
 pub const MINIMUM_PYTHON: (u32, u32) = (3, 10);
@@ -105,6 +136,22 @@ pub struct LocalModel {
     pub short_cost: &'static str,
     /// The sentence under the picker.
     pub cost: &'static str,
+    /// The commit on that repo this build was measured against, as the full
+    /// 40-character hash the Hub reports for `main`.
+    ///
+    /// Recorded, and checked after a download, but deliberately *not* passed to
+    /// `snapshot_download` as `revision=`. Two things in this app resolve these
+    /// weights by the default revision `main`: `is_model_present`, and the
+    /// sidecar itself, which calls `mlx_audio`'s `load_model(repo)` with
+    /// `HF_HUB_OFFLINE=1` and no revision. `huggingface_hub` only writes the
+    /// `refs/main` file that those two read when the revision it was handed was
+    /// a branch or a tag -- downloading by bare commit hash writes
+    /// `snapshots/<hash>` and no ref at all. So fetching at a pinned hash here
+    /// would leave every fresh install with weights on disk that the presence
+    /// check reports as missing and the sidecar cannot open. Enforcing the pin
+    /// needs the sidecar to take the revision too, which is a change to
+    /// `runner/runner.py`, not to this file.
+    pub revision: &'static str,
 }
 
 /// Accurate first: it is the default, because it keeps the proper nouns 0.6B
@@ -118,6 +165,7 @@ pub const LOCAL_MODELS: &[LocalModel] = &[
         short_cost: "2.5 GB, 1.0 s",
         cost:
             "About 2.5 GB of memory while loaded, 1.0 s for a 10 s dictation. Keeps product names.",
+        revision: "a8379a2e2f9e313c9292cdf1af4055ab56d50d55",
     },
     LocalModel {
         key: "fast",
@@ -125,6 +173,7 @@ pub const LOCAL_MODELS: &[LocalModel] = &[
         label: "Fast (0.6B)",
         short_cost: "1.0 GB, 0.4 s",
         cost: "About 1.0 GB of memory while loaded, 0.4 s for a 10 s dictation. Weaker on names.",
+        revision: "89e96d92ba34aca20b3e29fb10cc284097d1219f",
     },
 ];
 
@@ -444,6 +493,11 @@ impl LocalRunner {
         model_for(&self.lock().model_key).repo.to_string()
     }
 
+    /// The revision the configured model was measured at.
+    pub fn model_revision(&self) -> &'static str {
+        model_for(&self.lock().model_key).revision
+    }
+
     /// The last lines the sidecar wrote to stderr, for a failure report.
     pub fn log(&self) -> Vec<String> {
         self.lock().log.iter().cloned().collect()
@@ -649,13 +703,7 @@ impl LocalRunner {
             "Installing mlx-audio, about 600 MB...",
         );
         self.run_with_progress(
-            Command::new(self.venv_python())
-                .arg("-m")
-                .arg("pip")
-                .arg("install")
-                .arg("--disable-pip-version-check")
-                .arg(format!("mlx-audio=={MLX_AUDIO_VERSION}"))
-                .arg("huggingface_hub"),
+            &mut pip_install_command(&self.venv_python()),
             RunnerPhase::Installing,
             generation,
         )?;
@@ -680,16 +728,57 @@ impl LocalRunner {
         let repo = self.model_repo();
         self.venv_python().is_file()
             && Command::new(self.venv_python())
-                .args([
-                    "-c",
-                    "import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], local_files_only=True)",
-                    &repo,
-                ])
+                .args(["-c", CACHED_SNAPSHOT_SCRIPT, &repo])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .map(|status| status.success())
                 .unwrap_or(false)
+    }
+
+    /// The commit the cached weights for `repo` actually came from, or `None`
+    /// when there is nothing to read it from -- no venv, no cache entry, or a
+    /// hub that answered with something that is not a snapshot path.
+    ///
+    /// `None` is not a mismatch. Every caller treats it as "no opinion", so a
+    /// machine this cannot interrogate is left alone rather than told its
+    /// weights are wrong.
+    fn cached_revision(&self, repo: &str) -> Option<String> {
+        let python = self.venv_python();
+        if !python.is_file() {
+            return None;
+        }
+        let output = Command::new(python)
+            .args(["-c", CACHED_SNAPSHOT_SCRIPT, repo])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+        snapshot_revision(line).map(str::to_string)
+    }
+
+    /// Land the resting phase for a model that is on disk, saying so when what
+    /// is on disk is not the revision this build was measured against.
+    fn report_downloaded(&self, repo: &str) {
+        let expected = self.model_revision();
+        let actual = self.cached_revision(repo);
+        if let Some(actual) = actual.as_deref() {
+            if actual != expected {
+                // The full hashes go to the log, where they can be copied; the
+                // status line gets the short form, because it has one line.
+                self.note(&format!(
+                    "{repo}: cached revision {actual} is not the {expected} this build was measured against"
+                ));
+            }
+        }
+        self.set_phase(
+            RunnerPhase::Stopped,
+            &download_detail(repo, expected, actual.as_deref()),
+        );
     }
 
     /// Fetch the weights for the configured model. Blocking.
@@ -711,7 +800,7 @@ impl LocalRunner {
         self.lock().model_verified = None;
         let repo = self.model_repo();
         if self.model_present_now() {
-            self.set_phase(RunnerPhase::Stopped, &format!("{repo} is downloaded."));
+            self.report_downloaded(&repo);
             return Ok(());
         }
         self.set_phase(RunnerPhase::Downloading, &format!("Downloading {repo}..."));
@@ -725,7 +814,7 @@ impl LocalRunner {
             generation,
         )?;
         self.lock().model_verified = Some(repo.clone());
-        self.set_phase(RunnerPhase::Stopped, &format!("{repo} is downloaded."));
+        self.report_downloaded(&repo);
         Ok(())
     }
 
@@ -1490,6 +1579,66 @@ fn loopback(port: u16, method: &str, path: &str, timeout: Duration) -> Result<St
     Ok(body.to_string())
 }
 
+/// The one `pip install` this module runs.
+///
+/// Built here rather than inline in `install_steps` so that the argv itself --
+/// not just the list it is built from -- is something a test can read back.
+fn pip_install_command(python: &Path) -> Command {
+    let mut command = Command::new(python);
+    command
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("--disable-pip-version-check")
+        .args(pip_requirements());
+    command
+}
+
+/// Ask the hub where the weights for a repo already are, without the network.
+///
+/// Exits non-zero when they are not cached, which is what makes it a presence
+/// check, and prints the snapshot directory when they are, which is what makes
+/// it a revision read. One script for both so the two answers can never come
+/// from two different questions.
+const CACHED_SNAPSHOT_SCRIPT: &str = "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1], local_files_only=True))";
+
+/// The commit hash a `snapshot_download` path names.
+///
+/// The hub lays its cache out as `<repo folder>/snapshots/<commit hash>`, so
+/// the last component *is* the revision. Anything that is not a 40-character
+/// lowercase hex name is not one: a `local_dir` download, a future layout, or a
+/// line of output that was never a path. Those give `None` rather than a
+/// mismatch, because a name this cannot read is not evidence of anything.
+fn snapshot_revision(path: &str) -> Option<&str> {
+    let name = path.trim().trim_end_matches('/').rsplit('/').next()?;
+    let hex = name.len() == 40
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    hex.then_some(name)
+}
+
+/// The resting line for a model that is on disk.
+///
+/// Says so plainly when the cached revision is the recorded one or unreadable,
+/// and names both when it is not. Short hashes: this is one line under a
+/// picker, and the log has already been given the full pair.
+fn download_detail(repo: &str, expected: &str, actual: Option<&str>) -> String {
+    match actual {
+        Some(actual) if actual != expected => format!(
+            "{repo} is downloaded, at revision {} rather than the {} this build was measured against.",
+            short_revision(actual),
+            short_revision(expected)
+        ),
+        _ => format!("{repo} is downloaded."),
+    }
+}
+
+/// A commit hash cut to the twelve characters a person compares.
+fn short_revision(revision: &str) -> &str {
+    revision.get(..12).unwrap_or(revision)
+}
+
 /// One line of installer output, trimmed to something a label can hold.
 fn progress_line(line: &str) -> String {
     let line = line.trim();
@@ -2173,6 +2322,128 @@ server.serve_forever()
                 model.key
             );
         }
+    }
+
+    /// The venv is built from two requirements and neither may float.
+    ///
+    /// The bare `huggingface_hub` this replaces is the failure this test is
+    /// really about: `mlx-audio` was pinned, so the pin *looked* done, while the
+    /// package this module calls `snapshot_download` on came from whatever the
+    /// index served that afternoon. The assertion is on the shape -- every
+    /// requirement carries `==` -- rather than on the two strings, so a third
+    /// package added later cannot be added bare.
+    #[test]
+    fn the_venv_is_built_from_exactly_pinned_requirements() {
+        let requirements = pip_requirements();
+        let argv: Vec<String> = pip_install_command(Path::new("/venv/bin/python"))
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            requirements,
+            [
+                format!("mlx-audio=={MLX_AUDIO_VERSION}"),
+                format!("huggingface_hub=={HUGGINGFACE_HUB_VERSION}"),
+            ]
+        );
+        for requirement in &requirements {
+            let (name, version) = requirement
+                .split_once("==")
+                .unwrap_or_else(|| panic!("pip is given the unpinned {requirement}"));
+            assert!(!name.is_empty(), "{requirement} names nothing");
+            assert!(
+                !version.is_empty()
+                    && version
+                        .chars()
+                        .all(|character| character.is_ascii_digit() || character == '.'),
+                "{requirement} does not pin a release"
+            );
+            assert!(
+                argv.contains(requirement),
+                "pip is not given {requirement}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|argument| argument == name),
+                "pip is given a bare {name}: {argv:?}"
+            );
+        }
+    }
+
+    /// Every offered model records the commit it was measured at.
+    ///
+    /// A 40-character lowercase hex string, because that is what the Hub reports
+    /// and what `snapshot_download` writes its cache under -- and because the
+    /// thing this guards against is a model added later with the field left as a
+    /// placeholder, a branch name, or a short hash. Distinct, because two
+    /// different repos sharing a revision would mean one was copied from the
+    /// other rather than looked up.
+    #[test]
+    fn every_model_records_the_revision_it_was_measured_at() {
+        for model in LOCAL_MODELS {
+            assert_eq!(
+                snapshot_revision(model.revision),
+                Some(model.revision),
+                "{} needs a full lowercase commit hash, not {:?}",
+                model.key,
+                model.revision
+            );
+        }
+        for (index, model) in LOCAL_MODELS.iter().enumerate() {
+            for other in &LOCAL_MODELS[index + 1..] {
+                assert_ne!(
+                    model.revision, other.revision,
+                    "{} and {} cannot be the same commit",
+                    model.key, other.key
+                );
+            }
+        }
+    }
+
+    /// The revision is read back out of the path the hub prints, and only out of
+    /// a path that really names one.
+    #[test]
+    fn a_snapshot_path_yields_the_commit_it_was_fetched_at() {
+        let revision = "a8379a2e2f9e313c9292cdf1af4055ab56d50d55";
+        assert_eq!(
+            snapshot_revision(&format!(
+                "/Users/x/.cache/huggingface/hub/models--mlx-community--Qwen3-ASR-1.7B-8bit/snapshots/{revision}"
+            )),
+            Some(revision)
+        );
+        assert_eq!(
+            snapshot_revision(&format!("  /cache/snapshots/{revision}/  \n")),
+            Some(revision)
+        );
+        assert_eq!(snapshot_revision("/somewhere/models/main"), None);
+        assert_eq!(snapshot_revision(&revision.to_uppercase()), None);
+        assert_eq!(snapshot_revision(&revision[..12]), None);
+        assert_eq!(snapshot_revision(""), None);
+    }
+
+    /// A download that landed on something other than the recorded revision says
+    /// so, and one that landed on it -- or that cannot be read at all -- does
+    /// not cry wolf.
+    #[test]
+    fn weights_at_an_unrecorded_revision_are_reported_as_such() {
+        let repo = "mlx-community/Qwen3-ASR-1.7B-8bit";
+        let expected = "a8379a2e2f9e313c9292cdf1af4055ab56d50d55";
+        let other = "89e96d92ba34aca20b3e29fb10cc284097d1219f";
+        assert_eq!(
+            download_detail(repo, expected, Some(expected)),
+            format!("{repo} is downloaded.")
+        );
+        assert_eq!(
+            download_detail(repo, expected, None),
+            format!("{repo} is downloaded."),
+            "an unreadable cache is not a mismatch"
+        );
+        let mismatch = download_detail(repo, expected, Some(other));
+        assert!(mismatch.contains(&other[..12]), "{mismatch}");
+        assert!(mismatch.contains(&expected[..12]), "{mismatch}");
+        assert!(
+            !mismatch.contains(other),
+            "the status line carries short hashes, not full ones: {mismatch}"
+        );
     }
 
     /// Discovery must never accept the 3.9 that ships with macOS, and must
