@@ -2099,6 +2099,12 @@ server.serve_forever()
     /// it can only observe that repeated stops during a spawn leave nothing
     /// running, and it would catch a regression over runs rather than
     /// certainly on the next one.
+    /// `#[cfg(unix)]` for the same reason as the tests above, and this one is
+    /// the sharper case: on Windows it was *passing*. Its assertions are all
+    /// `!alive(pid)`, and `alive` returned a hardcoded `false` there, so every
+    /// one of them read "nothing is running" no matter what was running. It was
+    /// green and it proved nothing, which is worse than the four that were red.
+    #[cfg(unix)]
     #[test]
     fn a_stop_during_a_spawn_leaves_no_orphan() {
         let Some(fixture) = fixture() else {
@@ -2826,6 +2832,12 @@ server.serve_forever()
     /// supervisor started is still there, not what it was doing, and the pid
     /// comes from the child rather than from the supervisor because before the
     /// fix the supervisor did not know it -- which was the bug.
+    #[cfg(unix)]
+    /// `#[cfg(unix)]` for the same reason as the tests above, and this one is
+    /// the sharper case: on Windows it was *passing*. Its assertions are all
+    /// `!alive(pid)`, and `alive` returned a hardcoded `false` there, so every
+    /// one of them read "nothing is running" no matter what was running. It was
+    /// green and it proved nothing, which is worse than the four that were red.
     #[cfg(unix)]
     #[test]
     fn stopping_a_setup_step_kills_the_child_it_started() {
