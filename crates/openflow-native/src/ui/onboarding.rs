@@ -71,6 +71,20 @@ const WINDOW_HEIGHT: f64 = STEP_HEIGHT + 140.0;
 const STEP_WIDTH: f64 = 488.0;
 const STEP_HEIGHT: f64 = 461.0;
 
+/// The box the line under the microphone picker gets.
+///
+/// Filled in by `reload_microphones`, so the frame is reserved rather than
+/// fitted: two lines of [`note`] text, because the longest thing this line says
+/// is an enumeration error with the audio thread's own words inside it, and a
+/// label sized to the empty placeholder it is built with would have nowhere to
+/// put one. Nothing clips it -- `allow_wrapping` turns wrapping on and stops
+/// there -- so a third line does not truncate, it draws over the Record
+/// shortcut row underneath. It is a named constant because the arithmetic that
+/// makes two lines enough is a claim about the sentences in
+/// [`microphone_note`], and that claim is asserted rather than remembered; see
+/// `every_microphone_note_fits_the_line_reserved_for_it`.
+const MICROPHONE_NOTE_HEIGHT: f64 = 28.0;
+
 // ── The step machine ──────────────────────────────────────
 
 /// One panel of the wizard.
@@ -1504,11 +1518,7 @@ fn build_preferences(
         0,
     );
     form.add(&refresh);
-    // Filled in by `reload_microphones`, so the frame is reserved rather than
-    // fitted: two lines at 10pt, because the longest thing this says is an
-    // enumeration error with the audio thread's own words inside it, and a
-    // label sized to the empty placeholder would have nowhere to put it.
-    let n = form.control_only(28.0);
+    let n = form.control_only(MICROPHONE_NOTE_HEIGHT);
     let microphone_note = note(mtm, "", n);
     allow_wrapping(&microphone_note, n.size.width);
     form.add(&microphone_note);
@@ -1869,6 +1879,140 @@ so a selection maps to the wrong device"
                     items[index]
                 );
             }
+        }
+    }
+
+    /// The height of one line of [`note`] text at the size `note` sets, which
+    /// is what [`MICROPHONE_NOTE_HEIGHT`] is a multiple of. Pinned by
+    /// `one_line_of_note_text_is_one_note_line` rather than assumed.
+    const NOTE_LINE: f64 = 13.0;
+
+    /// The column the microphone line is laid out in.
+    ///
+    /// `Form::control_only` hands back the form's width less the label column,
+    /// and `build_preferences` builds its form at [`STEP_WIDTH`], so this is
+    /// the same arithmetic the panel does rather than a number copied off it.
+    /// The wizard is a fixed-size sheet, so there is only the one width.
+    fn microphone_note_width() -> f64 {
+        STEP_WIDTH - crate::ui::CONTROL_X
+    }
+
+    /// How many lines `text` takes when wrapped into a column `width` wide, at
+    /// the font [`note`] uses.
+    ///
+    /// AppKit measures text without a main thread and without an
+    /// `NSApplication`, so the one layout question the wizard cannot be asked
+    /// -- step 3 is behind a connection test no test run can pass, and nothing
+    /// short of a real provider key gets a person to this panel -- is
+    /// arithmetic instead. Measured through `NSAttributedString`, which agrees
+    /// to the point with what `wrap` gets from a real `NSTextField`.
+    fn wrapped_lines(text: &str, width: f64) -> usize {
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::{
+            NSAttributedStringNSExtendedStringDrawing, NSFont, NSFontAttributeName,
+            NSStringDrawingOptions,
+        };
+        use objc2_foundation::{NSAttributedString, NSDictionary};
+
+        let font = NSFont::systemFontOfSize(10.0);
+        let font: &AnyObject = &font;
+        let attributes = NSDictionary::from_slices(&[unsafe { NSFontAttributeName }], &[font]);
+        let string = NSString::from_str(text);
+        let attributed = unsafe { NSAttributedString::new_with_attributes(&string, &attributes) };
+        let height = attributed
+            .boundingRectWithSize_options_context(
+                NSSize::new(width, f64::MAX),
+                NSStringDrawingOptions::UsesLineFragmentOrigin,
+                None,
+            )
+            .size
+            .height;
+        (height / NOTE_LINE).round() as usize
+    }
+
+    /// The words the audio thread puts inside the error wording, read out of
+    /// `openflow-core` rather than copied here.
+    ///
+    /// [`microphone_note`] quotes them verbatim -- `list_audio_devices` is
+    /// `Recorder::list_devices` and nothing in between rewrites them -- so a
+    /// longer one written over there is exactly how this box overflows, and a
+    /// copy kept here would go on passing while it did.
+    fn audio_thread_errors() -> Vec<&'static str> {
+        const SOURCE: &str = include_str!("../../../openflow-core/src/audio.rs");
+        let at = SOURCE
+            .find("pub fn list_devices")
+            .expect("openflow-core still enumerates devices through Recorder::list_devices");
+        let body = &SOURCE[at..];
+        let body = &body[..body.find("\n    pub fn ").unwrap_or(body.len())];
+
+        let mut errors = Vec::new();
+        let mut rest = body;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            let (literal, tail) = after.split_at(close);
+            let tail = &tail[1..];
+            if tail.starts_with(".to_string()") {
+                errors.push(literal);
+            }
+            rest = tail;
+        }
+        assert_eq!(
+            errors.len(),
+            2,
+            "the scan found {errors:?}, so it has stopped matching how \
+Recorder::list_devices words its failures"
+        );
+        errors
+    }
+
+    /// [`NOTE_LINE`] has to be what a line of note text actually measures, or
+    /// every line count below is off by whatever it is wrong by.
+    #[test]
+    fn one_line_of_note_text_is_one_note_line() {
+        assert_eq!(
+            wrapped_lines("Ag", microphone_note_width()),
+            1,
+            "a short note is one line, or NOTE_LINE disagrees with the font"
+        );
+    }
+
+    /// The line under the microphone picker has to fit the box reserved for
+    /// it, and this is the only way anyone finds out.
+    ///
+    /// Step 3 of the wizard is behind `can_advance`, which will not open the
+    /// Credentials panel without a connection a test run cannot make, so this
+    /// panel has never been on screen outside a hand-driven session with a
+    /// real key. The reservation was arithmetic done by hand; here it is done
+    /// by AppKit, against the strings [`microphone_note`] actually returns and
+    /// the height [`build_preferences`] actually reserves. Nothing clips this
+    /// label, so a third line is not an ellipsis -- it draws over the Record
+    /// shortcut row below it.
+    #[test]
+    fn every_microphone_note_fits_the_line_reserved_for_it() {
+        let width = microphone_note_width();
+        let reserved = (MICROPHONE_NOTE_HEIGHT / NOTE_LINE).floor() as usize;
+        assert!(
+            reserved >= 1,
+            "{MICROPHONE_NOTE_HEIGHT}pt does not hold a single {NOTE_LINE}pt line"
+        );
+
+        // Every arm of the match, and enough counts to cover the singular, the
+        // plural, and a machine with an unlikely number of inputs.
+        let mut messages: Vec<String> = (0..=16).map(|count| microphone_note(Ok(count))).collect();
+        messages.extend(
+            audio_thread_errors()
+                .into_iter()
+                .map(|error| microphone_note(Err(error))),
+        );
+
+        for message in messages {
+            let lines = wrapped_lines(&message, width);
+            assert!(
+                lines <= reserved,
+                "{lines} lines in {width}pt, but the picker's note reserves \
+{MICROPHONE_NOTE_HEIGHT}pt, which is {reserved}: {message:?}"
+            );
         }
     }
 }
