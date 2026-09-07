@@ -197,6 +197,70 @@ const TAG_TTS_FORMAT: isize = 46;
 
 const TAG_SAVE_HISTORY: isize = 60;
 const TAG_RETENTION: isize = 61;
+/// The dictionary is an `NSTextView` and is not dispatched by tag, but it does
+/// save, so it needs a name in [`TAG_SECTIONS`] like every other control that
+/// can fail.
+const TAG_DICTIONARY: isize = 62;
+
+/// Which card each control sits on, as an index into [`SECTIONS`].
+///
+/// This is what decides where a save failure is written. It used to be one
+/// answer for every control -- `models_status`, the line beside Fetch models --
+/// so turning off Save history on the Privacy card and having the write fail
+/// put the reason 1133pt further up the column, close to two screenfuls out of
+/// sight in a 580pt window. Worse, `models_status` lives inside `remote_box`,
+/// which is hidden whenever the backend is "On this Mac": with that selected
+/// the failure went into a hidden view and the user saw nothing at all.
+///
+/// A tag missing from here falls back to the Providers card, which is the old
+/// behaviour and the only wrong-card case left; the tests below keep the table
+/// complete so that fallback stays unreachable.
+const TAG_SECTIONS: [&[isize]; SECTIONS.len()] = [
+    &[
+        TAG_MICROPHONE,
+        TAG_HOTKEY_RECORD,
+        TAG_HOTKEY_RECOPY,
+        TAG_INSERT_METHOD,
+        TAG_PRESERVE_CLIPBOARD,
+        TAG_OVERLAY_ONLY,
+        TAG_OVERLAY_POSITION,
+        TAG_THEME,
+        TAG_LANGUAGE,
+        TAG_LIVE_PREVIEW,
+    ],
+    &[
+        TAG_BACKEND,
+        TAG_LOCAL_MODEL,
+        TAG_LOCAL_IDLE,
+        TAG_LOCAL_ONLY,
+        TAG_PROVIDER,
+        TAG_PROVIDER_URL,
+        TAG_API_KEY,
+        TAG_STT_MODEL,
+        TAG_SAME_PROVIDER,
+        TAG_FORMATTING_PROVIDER,
+        TAG_FORMATTING_URL,
+        TAG_FORMATTING_KEY,
+        TAG_FORMAT_ENABLED,
+        TAG_CHAT_MODEL,
+        TAG_FETCH_MODELS,
+    ],
+    &[
+        TAG_TTS_ENABLED,
+        TAG_TTS_PROVIDER,
+        TAG_TTS_URL,
+        TAG_TTS_KEY,
+        TAG_TTS_MODEL,
+        TAG_TTS_VOICE,
+        TAG_TTS_FORMAT,
+    ],
+    &[TAG_DICTIONARY, TAG_SAVE_HISTORY, TAG_RETENTION],
+];
+
+/// The card `tag`'s control is on, or `None` for a tag no form claims.
+fn section_of_tag(tag: isize) -> Option<usize> {
+    TAG_SECTIONS.iter().position(|tags| tags.contains(&tag))
+}
 
 /// Everything the window has to read back or write into.
 struct Controls {
@@ -215,6 +279,9 @@ struct Controls {
     /// Whatever the login item needs said about itself: the approval hint, or
     /// the reason a register call was refused. Empty the rest of the time.
     login_status: Retained<NSTextField>,
+    /// Where a General save failure is written. The other three cards already
+    /// had a line of their own; this card reported into the Providers card.
+    general_status: Retained<NSTextField>,
 
     backend: Retained<NSPopUpButton>,
     /// The online-provider rows and the on-this-Mac rows share one frame; the
@@ -241,6 +308,12 @@ struct Controls {
     stt_model: Retained<NSComboBox>,
     chat_model: Retained<NSComboBox>,
     models_status: Retained<NSTextField>,
+    /// Where a Providers save failure is written. Deliberately not
+    /// `models_status` or `local_status`: those two live inside `remote_box`
+    /// and `local_box`, and each is hidden exactly when the other is showing,
+    /// so half the card's failures would land in a hidden view. This one is on
+    /// the card itself and is always on screen with the rows it reports for.
+    provider_status: Retained<NSTextField>,
 
     tts_enabled: Retained<NSSwitch>,
     tts_provider: Retained<NSPopUpButton>,
@@ -587,6 +660,26 @@ impl SettingsPage {
 
     fn set_text(&self, field: &NSTextField, text: &str) {
         field.setStringValue(&NSString::from_str(text));
+    }
+
+    /// The status line a failed write for `tag` belongs in: the one on the card
+    /// the control itself is on.
+    ///
+    /// A save failure is only useful beside the control that caused it. Every
+    /// one of them used to be written into `models_status` instead -- see
+    /// [`TAG_SECTIONS`] for what that cost -- and this is the whole of the
+    /// mapping back.
+    fn status_field(&self, tag: isize) -> &NSTextField {
+        let controls = &self.ivars().controls;
+        match section_of_tag(tag) {
+            Some(0) => &controls.general_status,
+            Some(2) => &controls.voice_status,
+            Some(3) => &controls.history_status,
+            // Providers, and the fallback for a tag no form claims: a new row
+            // is far more likely to be a Providers one than anything else, and
+            // this line is the only one on that card that is never hidden.
+            _ => &controls.provider_status,
+        }
     }
 
     // ── Reading settings into the controls ────────────────
@@ -959,7 +1052,7 @@ impl SettingsPage {
             _ => Ok(()),
         };
         if let Err(error) = result {
-            self.set_text(&controls.models_status, &error);
+            self.set_text(self.status_field(tag), &error);
         }
         // Cheap, and it depends on three different rows (the toggle and the two
         // provider endpoints), so it is re-evaluated after any of them.
@@ -1125,7 +1218,13 @@ impl SettingsPage {
             view.setString(&NSString::from_str(&text));
         }
         self.update_dictionary_count(text.chars().count());
-        let _ = ivars.engine.settings().set("dictionary", text.trim());
+        // Not `let _ =`: this is the one control on the page whose save was
+        // discarded outright, so a full disk or a locked database silently ate
+        // every term the user typed. The dictionary is on the Privacy card, and
+        // so is the line this reports into.
+        if let Err(error) = ivars.engine.settings().set("dictionary", text.trim()) {
+            self.set_text(self.status_field(TAG_DICTIONARY), &error);
+        }
     }
 
     fn update_dictionary_count(&self, used: usize) {
@@ -1174,7 +1273,14 @@ impl SettingsPage {
                 self.field_for(&action)
                     .setTitle(&NSString::from_str(&chord));
             }
-            Some(Err(error)) => self.set_text(&ivars.controls.models_status, &error),
+            Some(Err(error)) => {
+                let tag = if action == "record" {
+                    TAG_HOTKEY_RECORD
+                } else {
+                    TAG_HOTKEY_RECOPY
+                };
+                self.set_text(self.status_field(tag), &error);
+            }
             None => {}
         }
     }
@@ -1594,6 +1700,10 @@ fn build_sections(
     login_status.setMaximumNumberOfLines(2);
     login_status.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
     form.add(&login_status);
+    let n = form.control_only(28.0);
+    let general_status = note(mtm, "", n);
+    allow_wrapping(&general_status, n.size.width);
+    form.add(&general_status);
     let general = form.fit();
 
     // Providers
@@ -1668,6 +1778,10 @@ fn build_sections(
         0,
     );
     form.add(&setup);
+    let n = form.control_only(28.0);
+    let provider_status = note(mtm, "", n);
+    allow_wrapping(&provider_status, n.size.width);
+    form.add(&provider_status);
     let providers = form.fit();
 
     // Voice
@@ -1784,6 +1898,7 @@ fn build_sections(
         live_preview,
         open_at_login,
         login_status,
+        general_status,
         backend,
         remote_box,
         local_box,
@@ -1806,6 +1921,7 @@ fn build_sections(
         stt_model,
         chat_model,
         models_status,
+        provider_status,
         tts_enabled,
         tts_provider,
         tts_url,
@@ -2526,6 +2642,82 @@ mod tests {
         }
     }
 
+    /// A save failure has to be shown on the card the control is on.
+    ///
+    /// The regression this pins: every failure went into `models_status`, the
+    /// line beside Fetch models on the Providers card. Turning off Save history
+    /// on the Privacy card and having the write fail put the reason 1133pt
+    /// further up the column -- close to two screenfuls in the 580pt window --
+    /// and with "On this Mac" selected it went into `remote_box`, which is
+    /// hidden then, so nothing appeared anywhere.
+    #[test]
+    fn a_failed_save_is_reported_on_the_card_its_control_is_on() {
+        let general = section_index("General").unwrap();
+        let providers = section_index("Providers").unwrap();
+        let voice = section_index("Voice").unwrap();
+        let privacy = section_index("Privacy").unwrap();
+
+        for tag in [
+            TAG_MICROPHONE,
+            TAG_HOTKEY_RECORD,
+            TAG_HOTKEY_RECOPY,
+            TAG_INSERT_METHOD,
+            TAG_PRESERVE_CLIPBOARD,
+            TAG_OVERLAY_ONLY,
+            TAG_OVERLAY_POSITION,
+            TAG_THEME,
+            TAG_LANGUAGE,
+            TAG_LIVE_PREVIEW,
+        ] {
+            assert_eq!(
+                section_of_tag(tag),
+                Some(general),
+                "tag {tag} is on General"
+            );
+        }
+        for tag in [
+            TAG_BACKEND,
+            TAG_LOCAL_MODEL,
+            TAG_LOCAL_IDLE,
+            TAG_LOCAL_ONLY,
+            TAG_PROVIDER,
+            TAG_PROVIDER_URL,
+            TAG_API_KEY,
+            TAG_STT_MODEL,
+            TAG_SAME_PROVIDER,
+            TAG_FORMATTING_PROVIDER,
+            TAG_FORMATTING_URL,
+            TAG_FORMATTING_KEY,
+            TAG_FORMAT_ENABLED,
+            TAG_CHAT_MODEL,
+            TAG_FETCH_MODELS,
+        ] {
+            assert_eq!(
+                section_of_tag(tag),
+                Some(providers),
+                "tag {tag} is on Providers"
+            );
+        }
+        for tag in [
+            TAG_TTS_ENABLED,
+            TAG_TTS_PROVIDER,
+            TAG_TTS_URL,
+            TAG_TTS_KEY,
+            TAG_TTS_MODEL,
+            TAG_TTS_VOICE,
+            TAG_TTS_FORMAT,
+        ] {
+            assert_eq!(section_of_tag(tag), Some(voice), "tag {tag} is on Voice");
+        }
+        for tag in [TAG_DICTIONARY, TAG_SAVE_HISTORY, TAG_RETENTION] {
+            assert_eq!(
+                section_of_tag(tag),
+                Some(privacy),
+                "tag {tag} is on Privacy"
+            );
+        }
+    }
+
     /// The repair points the cleanup pass somewhere it can run; it does not get
     /// to overrule a provider the user picked for it.
     #[test]
@@ -2541,6 +2733,68 @@ mod tests {
             !same,
             "the toggle that hands Deepgram the cleanup pass is off"
         );
+    }
+
+    /// Every control the window can fail to save has to be in the table, and in
+    /// exactly one group. A tag left out falls back to the Providers card,
+    /// which is the bug this file just stopped having -- so the omission has to
+    /// be caught here rather than on screen.
+    #[test]
+    fn every_control_that_saves_has_a_card() {
+        // The tags `write` matches on, plus the two that save outside it: the
+        // shortcut buttons go through `finish_recording_hotkey` and the
+        // dictionary through `write_dictionary`.
+        let writes = [
+            TAG_MICROPHONE,
+            TAG_HOTKEY_RECORD,
+            TAG_HOTKEY_RECOPY,
+            TAG_INSERT_METHOD,
+            TAG_PRESERVE_CLIPBOARD,
+            TAG_OVERLAY_ONLY,
+            TAG_OVERLAY_POSITION,
+            TAG_THEME,
+            TAG_LANGUAGE,
+            TAG_LIVE_PREVIEW,
+            TAG_BACKEND,
+            TAG_LOCAL_MODEL,
+            TAG_LOCAL_IDLE,
+            TAG_LOCAL_ONLY,
+            TAG_PROVIDER,
+            TAG_PROVIDER_URL,
+            TAG_API_KEY,
+            TAG_STT_MODEL,
+            TAG_SAME_PROVIDER,
+            TAG_FORMATTING_PROVIDER,
+            TAG_FORMATTING_URL,
+            TAG_FORMATTING_KEY,
+            TAG_FORMAT_ENABLED,
+            TAG_CHAT_MODEL,
+            TAG_TTS_ENABLED,
+            TAG_TTS_PROVIDER,
+            TAG_TTS_URL,
+            TAG_TTS_KEY,
+            TAG_TTS_MODEL,
+            TAG_TTS_VOICE,
+            TAG_TTS_FORMAT,
+            TAG_DICTIONARY,
+            TAG_SAVE_HISTORY,
+            TAG_RETENTION,
+        ];
+        for tag in writes {
+            assert!(
+                section_of_tag(tag).is_some(),
+                "tag {tag} saves but no card claims it, so its failure would be \
+                 reported on the Providers card"
+            );
+        }
+        let listed: Vec<isize> = TAG_SECTIONS.concat();
+        for tag in &listed {
+            assert_eq!(
+                listed.iter().filter(|other| *other == tag).count(),
+                1,
+                "tag {tag} is claimed by two cards"
+            );
+        }
     }
 
     /// The two boolean spellings the settings table understands.

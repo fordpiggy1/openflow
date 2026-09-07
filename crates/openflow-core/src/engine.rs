@@ -803,7 +803,7 @@ impl Engine {
     fn report_truncated_capture(&self, truncated: bool) {
         if truncated {
             self.emit(EngineEvent::TranscriptionWarning(
-                crate::audio::CAPTURE_CEILING_WARNING.to_string(),
+                crate::audio::CAPTURE_CEILING_WARNING.to_string().into(),
             ));
         }
     }
