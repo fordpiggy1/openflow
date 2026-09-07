@@ -37,7 +37,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 
-use openflow_core::engine::{Engine, RecordingState};
+use openflow_core::engine::{Engine, EngineEvent, RecordingState};
 use openflow_core::insert::InsertMethod;
 
 use crate::hotkeys;
@@ -179,6 +179,10 @@ pub struct DictateIvars {
     /// on settings as well as on state, so `load` has to redraw the state it is
     /// already in rather than assume it is idle.
     state: Cell<RecordingState>,
+    /// Set while the card is reporting a failure instead of a transcript, to
+    /// where in the app that failure is answered. The card is the page's
+    /// "what just happened", and what just happened was the failure.
+    problem: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -214,6 +218,15 @@ define_class!(
         /// than at the app they would want the text typed into.
         #[unsafe(method(copyLast:))]
         fn copy_last(&self, _sender: &NSControl) {
+            // While the card is reporting a failure it is the way to the screen
+            // that answers it, not a copy of a transcript that never arrived.
+            let problem = self.ivars().problem.borrow().clone();
+            if let Some(target) = problem {
+                crate::app::with_app(|app| {
+                    app.handle_event(EngineEvent::Navigate(target));
+                });
+                return;
+            }
             let text = self.ivars().last.borrow().clone();
             let Some(text) = text else {
                 return;
@@ -247,6 +260,7 @@ impl DictatePage {
             controls,
             last: RefCell::new(None),
             state: Cell::new(RecordingState::Idle),
+            problem: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -295,6 +309,15 @@ impl DictatePage {
                 insertion_verb(settings.insert_method())
             )));
 
+        // The card is the page's "what just happened", and while a take has
+        // failed that is the failure -- not the take before it. Reloading is
+        // what every navigation into this page does, so without this the
+        // menu-bar item that offers to fix the failure would clear the copy of
+        // it on the way to the screen that answers it.
+        if ivars.problem.borrow().is_some() {
+            return;
+        }
+
         let newest = ivars
             .engine
             .history(1)
@@ -323,9 +346,40 @@ impl DictatePage {
         self.set_state(ivars.state.get());
     }
 
+    /// Report a failure on the result card, and offer the screen that answers
+    /// it. `target` is a [`openflow_core::engine::EngineEvent::Navigate`] name,
+    /// or `None` when there is nowhere useful to go.
+    pub fn set_problem(&self, message: &str, target: Option<&str>) {
+        let ivars = self.ivars();
+        *ivars.problem.borrow_mut() = target.map(str::to_string);
+        ivars
+            .controls
+            .result
+            .setTitle(&NSString::from_str(&preview_of(message)));
+        // Readable either way; clickable only when the click leads somewhere.
+        ivars.controls.result.setEnabled(target.is_some());
+        ivars
+            .controls
+            .result_caption
+            .setStringValue(&NSString::from_str(match target {
+                Some(_) => "That take did not finish \u{2014} click to fix it",
+                None => "That take did not finish",
+            }));
+    }
+
+    /// Put the card back to the last transcript once the failure is answered.
+    pub fn clear_problem(&self) {
+        if self.ivars().problem.borrow().is_none() {
+            return;
+        }
+        *self.ivars().problem.borrow_mut() = None;
+        self.load();
+    }
+
     /// Show `text` on the result card, with `caption` above it.
     pub fn set_last(&self, text: &str, caption: &str) {
         let ivars = self.ivars();
+        *ivars.problem.borrow_mut() = None;
         *ivars.last.borrow_mut() = Some(text.to_string());
         ivars
             .controls
